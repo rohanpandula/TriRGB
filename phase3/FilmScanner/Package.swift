@@ -39,5 +39,10 @@ let package = Package(
             dependencies: ["ScanlightSwift"],
             path: "Tests/ScanlightSwiftTests"
         ),
+        .testTarget(
+            name: "ScanlightAppUITests",
+            dependencies: ["ScanlightApp", "ScanlightSwift"],
+            path: "Tests/ScanlightAppUITests"
+        ),
     ]
 )
