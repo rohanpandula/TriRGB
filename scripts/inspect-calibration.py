@@ -6,6 +6,7 @@ Reports per-channel:
   - Saturation rate (% of pixels at or above clipping threshold)
   - Mean brightness as fraction of full scale
   - Implied tint drift across channels at the corners
+  - Per-channel uniformity (% stddev of smoothed cal / mean)
 
 The decision points are documented in `docs/optical_dry_run.md` § "Per-
 channel narrowband vignette inspection". This script is the quantitative
@@ -42,6 +43,11 @@ FALLOFF_REQUIRED_PCT = 30.0     # above this: optics problem, don't scan
 SATURATION_BAD_PCT = 1.0        # above this: cal frame is over-exposed
 TINT_DRIFT_BAD_PCT = 10.0       # above this: wavelength-dependent vignette is severe
 TINT_DRIFT_FFC_PCT = 3.0        # above this: FFC is required, not optional
+# Uniformity = 100 * std(smoothed_cal_channel) / mean — patchy frames
+# (fingerprint on diffuser, drifted LED, partial obstruction) have high
+# uniformity scores even with low radial falloff.
+UNIFORMITY_CLEAN_PCT = 3.0      # below this: frame is acceptably uniform
+UNIFORMITY_FAIL_PCT = 8.0       # above this: frame is patchy, do not use for FFC
 
 # Patch sizes for center and corner sampling, as a fraction of the
 # shorter image dimension. Center = ~10% of frame; corners = same size.
@@ -61,7 +67,8 @@ class ChannelStats:
     corner_value: float         # mean of the four corner patches
     falloff_pct: float          # 100 × (1 - corner/center)
     saturation_pct: float       # fraction of pixels >= _SATURATION_VALUE
-    full_scale: int             # 65535 for uint16
+    uniformity_pct: float = 0.0  # 100 * std(smoothed) / mean — patchy → high
+    full_scale: int = 65535     # 65535 for uint16
 
     @property
     def mean_fraction(self) -> float:
@@ -74,6 +81,46 @@ def _load_demosaic(path: Path) -> np.ndarray:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "phase2" / "rgb-composite"))
     from rgb_composite import demosaic_linear
     return demosaic_linear(path)
+
+
+def uniformity_score(channel: np.ndarray) -> float:
+    """Return 100 * std(smoothed) / mean for a single-channel cal frame.
+
+    Uses the same box-filter kernel that the FFC pipeline uses
+    (`_box_filter_2d` from `rgb_composite.ffc`, kernel size =
+    max(3, int(min(h, w) * 0.05)) — matching `_SMOOTH_KERNEL_FRAC`).
+
+    A perfectly uniform frame returns ~0%.  A frame with patchy local
+    variation (fingerprint on diffuser, partial obstruction, drifted LED)
+    returns a value proportional to the variation even when the radial
+    falloff appears acceptable.  Thresholds: < UNIFORMITY_CLEAN_PCT (3%)
+    → clean; 3-8% → borderline (FFC required); > UNIFORMITY_FAIL_PCT
+    (8%) → reject.
+
+    Args:
+        channel: HxW numpy array (any numeric dtype).
+
+    Returns:
+        Uniformity score as a float percentage (0–100+).
+
+    Raises:
+        ValueError: if `channel` is not a 2-D array.
+    """
+    if channel.ndim != 2:
+        raise ValueError(f"expected HxW array, got shape {channel.shape}")
+    h, w = channel.shape
+    # Kernel size mirrors production _SMOOTH_KERNEL_FRAC = 0.05 in ffc.py.
+    # We hard-code 0.05 here rather than importing the private constant so
+    # that this script has no hard import dependency on rgb_composite at
+    # module load time (matching the lazy-import pattern used by
+    # _load_demosaic above).
+    _RGB_COMPOSITE_PATH = Path(__file__).resolve().parent.parent / "phase2" / "rgb-composite"
+    sys.path.insert(0, str(_RGB_COMPOSITE_PATH))
+    from rgb_composite.ffc import _box_filter_2d  # noqa: PLC0415
+    kernel = max(3, int(min(h, w) * 0.05))
+    smoothed = _box_filter_2d(channel, kernel)
+    mean_val = float(np.mean(smoothed))
+    return 100.0 * float(np.std(smoothed)) / max(mean_val, 1.0)
 
 
 def _resolve_cal_files(cal_dir: Path) -> tuple[Path, Path, Path]:
@@ -124,6 +171,7 @@ def measure_channel(arr: np.ndarray, channel_label: str) -> ChannelStats:
 
     falloff_pct = 100.0 * (1.0 - corner_value / max(center_value, 1.0))
     saturation_pct = 100.0 * float((arr >= _SATURATION_VALUE).mean())
+    uniformity_pct_val = uniformity_score(arr)
 
     return ChannelStats(
         channel=channel_label,
@@ -132,6 +180,7 @@ def measure_channel(arr: np.ndarray, channel_label: str) -> ChannelStats:
         corner_value=corner_value,
         falloff_pct=falloff_pct,
         saturation_pct=saturation_pct,
+        uniformity_pct=uniformity_pct_val,
         full_scale=full_scale,
     )
 
@@ -179,6 +228,8 @@ def classify(stats: tuple[ChannelStats, ChannelStats, ChannelStats]) -> tuple[st
     # so a hotspot in R + normal vignette in B still shows up as drift).
     tint_drift = max(falloffs) - min(falloffs)
     has_hotspot = any(f < -FALLOFF_USABLE_PCT for f in falloffs)
+    max_uniformity = max(s.uniformity_pct for s in stats)
+    worst_uniformity_channel = max(stats, key=lambda s: s.uniformity_pct).channel
 
     if any(sat > SATURATION_BAD_PCT for sat in saturations):
         return (
@@ -204,7 +255,16 @@ def classify(stats: tuple[ChannelStats, ChannelStats, ChannelStats]) -> tuple[st
             "re-seat the scanlight under the carrier — and re-cal.",
             1,
         )
-    if max_falloff_abs > FALLOFF_USABLE_PCT or tint_drift > TINT_DRIFT_FFC_PCT:
+    if max_uniformity > UNIFORMITY_FAIL_PCT:
+        return (
+            f"FAIL — channel {worst_uniformity_channel} uniformity {max_uniformity:.1f}% "
+            f"exceeds {UNIFORMITY_FAIL_PCT}% threshold (patchy cal frame; likely a "
+            "fingerprint or partial obstruction on the diffuser, or a drifted LED). "
+            "Clean optics, re-seat the Scanlight, and re-capture the cal triplet.",
+            1,
+        )
+    if (max_falloff_abs > FALLOFF_USABLE_PCT or tint_drift > TINT_DRIFT_FFC_PCT
+            or max_uniformity > UNIFORMITY_CLEAN_PCT):
         return (
             f"OK with FFC — moderate vignette (max |falloff| {max_falloff_abs:.1f}%, "
             f"tint drift {tint_drift:.1f}%). Pass this cal dir to "
@@ -222,8 +282,8 @@ def classify(stats: tuple[ChannelStats, ChannelStats, ChannelStats]) -> tuple[st
 def format_report(stats: tuple[ChannelStats, ChannelStats, ChannelStats]) -> str:
     """Pretty-print the per-channel stats as a fixed-width table."""
     lines = [
-        "  ch | mean      | center     | corner     | falloff | saturated",
-        "  ---|-----------|------------|------------|---------|----------",
+        "  ch | mean      | center     | corner     | falloff | saturated | uniform",
+        "  ---|-----------|------------|------------|---------|-----------|--------",
     ]
     for s in stats:
         lines.append(
@@ -232,7 +292,8 @@ def format_report(stats: tuple[ChannelStats, ChannelStats, ChannelStats]) -> str
             f"{s.center_value:10.0f} | "
             f"{s.corner_value:10.0f} | "
             f"{s.falloff_pct:6.1f}% | "
-            f"{s.saturation_pct:7.2f}%"
+            f"{s.saturation_pct:7.2f}% | "
+            f"{s.uniformity_pct:6.2f}%"
         )
     return "\n".join(lines)
 

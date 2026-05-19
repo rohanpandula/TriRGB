@@ -81,7 +81,7 @@ def test_measure_rejects_non_2d():
 
 # ---------- classify ----------
 
-def _stat(channel: str, falloff: float, saturation: float = 0.0):
+def _stat(channel: str, falloff: float, saturation: float = 0.0, uniformity: float = 0.0):
     """Convenience to build a ChannelStats with only the fields classify() reads."""
     return inspect_calibration.ChannelStats(
         channel=channel,
@@ -90,6 +90,7 @@ def _stat(channel: str, falloff: float, saturation: float = 0.0):
         corner_value=50000.0 * (1.0 - falloff / 100.0),
         falloff_pct=falloff,
         saturation_pct=saturation,
+        uniformity_pct=uniformity,
         full_scale=65535,
     )
 
@@ -273,3 +274,66 @@ def test_classify_severe_falloff_either_polarity_fails():
     )
     msg_neg, rc_neg = inspect_calibration.classify(stats_neg)
     assert rc_neg == 1
+
+
+# ---------- uniformity ----------
+
+def test_uniformity_score_uniform_field_near_zero():
+    """A perfectly uniform array has near-zero uniformity score."""
+    arr = np.full((H, W), 40000, dtype=np.uint16)
+    score = inspect_calibration.uniformity_score(arr)
+    assert score < 0.5
+
+
+def test_uniformity_score_patchy_field_nonzero():
+    """A patchy field (sinusoidal variation) has non-zero uniformity score."""
+    base = np.full((H, W), 40000.0, dtype=np.float32)
+    # Add ~15% sinusoidal patchiness to make it cross the 3% boundary
+    yy, xx = np.indices((H, W))
+    patchy = base + 6000.0 * np.sin(yy / 20.0) * np.cos(xx / 20.0)
+    arr = patchy.clip(0, 65535).astype(np.uint16)
+    score = inspect_calibration.uniformity_score(arr)
+    assert score > 3.0
+
+
+def test_classify_uniformity_fail_exit_1():
+    """All three channels uniformity > 8% → exit 1, FAIL message."""
+    stats = (
+        _stat("R", 5.0, uniformity=12.0),
+        _stat("G", 5.0, uniformity=10.0),
+        _stat("B", 5.0, uniformity=9.5),
+    )
+    msg, rc = inspect_calibration.classify(stats)
+    assert rc == 1
+    assert "FAIL" in msg
+    # Either "uniformity" or "non-uniform" — the message wording
+    # confirms the gate that fired
+    assert "uniform" in msg.lower()
+
+
+def test_classify_uniformity_warning_tier_exit_0():
+    """One channel uniformity in 3-8% band → OK with FFC, exit 0."""
+    stats = (
+        _stat("R", 5.0, uniformity=5.0),  # in 3-8 warning band
+        _stat("G", 5.0, uniformity=1.0),
+        _stat("B", 5.0, uniformity=1.0),
+    )
+    msg, rc = inspect_calibration.classify(stats)
+    assert rc == 0
+    assert "OK with FFC" in msg
+
+
+def test_classify_uniformity_independent_of_falloff():
+    """Falloff and tint drift clean, but uniformity > 8% → still exit 1.
+
+    This proves uniformity is an INDEPENDENT gate. If anyone refactors
+    classify() to couple them, this test fails loudly.
+    """
+    stats = (
+        _stat("R", 5.0, uniformity=15.0),  # falloff clean, uniformity FAIL
+        _stat("G", 5.0, uniformity=0.5),
+        _stat("B", 5.0, uniformity=0.5),
+    )
+    msg, rc = inspect_calibration.classify(stats)
+    assert rc == 1
+    assert "FAIL" in msg
