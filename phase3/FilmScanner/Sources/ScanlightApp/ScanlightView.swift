@@ -143,7 +143,7 @@ struct ScanlightView: View {
                 // MARK: Error label
 
                 GroupBox(label: Text("Last Error").font(.headline)) {
-                    Text(viewModel.lastError)
+                    Text(viewModel.lastError.isEmpty ? "—" : viewModel.lastError)
                         .accessibilityIdentifier(AccessibilityID.lastErrorLabel)
                         .accessibilityValue(viewModel.lastError)
                         .foregroundColor(viewModel.lastError.isEmpty ? .secondary : .red)

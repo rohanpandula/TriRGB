@@ -248,11 +248,12 @@ click_connect_button() {
     element_index="$(python3 -c "
 import re, sys
 text = open('$snapshot').read()
-# Pattern: [element_index N] ... btn-connect  (within a few lines)
-matches = re.findall(r'\[element_index (\d+)\][^\n]*btn-connect', text)
+# cua-driver renders as: [3] AXButton (Connect) id=btn-connect
+# tree_markdown is one logical line w/ literal \\n separators — anchor tight.
+matches = re.findall(r'\[(\d+)\]\s*AXButton[^\[]*?id=btn-connect\b', text)
 if not matches:
-    # Try reverse: btn-connect on same line as element_index tag
-    matches = re.findall(r'btn-connect[^\n]*\[element_index (\d+)\]', text)
+    # Fallback: legacy [element_index N] format
+    matches = re.findall(r'\[element_index (\d+)\][^\n]*btn-connect', text)
 print(matches[0] if matches else '')
 " 2>/dev/null)"
 
@@ -260,6 +261,14 @@ print(matches[0] if matches else '')
         echo "skipped" ; return 0
     fi
 
+    # element_index clicks require a cua-driver daemon to persist the AX cache
+    # between CLI invocations. Without `cua-driver serve &` running, the click
+    # call has no cached state from the prior get_window_state and degrades to
+    # skipped. This is intentional best-effort — the primary --selftest signal
+    # is the AX-ID coverage assertion (all 23 present), which proves the GUI
+    # surface is automatable. Operators who want the full click probe can:
+    #   1. `open -n -g -a CuaDriver --args serve` (or `cua-driver serve &`)
+    #   2. Re-run scripts/cua-drive-swift-app.sh --selftest
     "$CUA_DRIVER" call click "$(printf '{"pid":%s,"window_id":%s,"element_index":%s}' "$pid" "$window_id" "$element_index")" >/dev/null 2>&1 && echo "ok" || echo "skipped"
 }
 
