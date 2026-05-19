@@ -14,6 +14,10 @@ let package = Package(
         // an operator can confirm the Swift Scanlight driver talks to real
         // hardware before any UI work depends on it.
         .executable(name: "scanlight-swift-cli", targets: ["ScanlightSwiftCLI"]),
+        // SwiftUI macOS app with full AX-ID coverage. Used by XCTest UI
+        // (Plan 03) and cua-driver harness (Plan 04) for end-to-end
+        // GUI-surface verification without hardware.
+        .executable(name: "scanlight-app", targets: ["ScanlightApp"]),
     ],
     targets: [
         .target(
@@ -24,6 +28,11 @@ let package = Package(
             name: "ScanlightSwiftCLI",
             dependencies: ["ScanlightSwift"],
             path: "Sources/ScanlightSwiftCLI"
+        ),
+        .executableTarget(
+            name: "ScanlightApp",
+            dependencies: ["ScanlightSwift"],
+            path: "Sources/ScanlightApp"
         ),
         .testTarget(
             name: "ScanlightSwiftTests",
