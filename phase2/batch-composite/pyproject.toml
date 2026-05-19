@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "batch-composite"
+version = "0.1.0"
+description = "Walk a roll directory and composite every narrowband-RGB triplet into a 16-bit TIFF."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "rgb-composite",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+batch-composite = "batch_composite.batch:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["batch_composite"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

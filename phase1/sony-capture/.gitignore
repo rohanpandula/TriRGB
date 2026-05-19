@@ -1,0 +1,9 @@
+build/
+
+# Sony Camera Remote SDK is not redistributable. Operator installs it
+# locally; see third_party/sony_sdk/README.md.
+third_party/sony_sdk/app/
+third_party/sony_sdk/external/
+third_party/sony_sdk/cmake/
+third_party/sony_sdk/CMakeLists.txt
+third_party/sony_sdk/README.md

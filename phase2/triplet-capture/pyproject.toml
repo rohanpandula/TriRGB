@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "triplet-capture"
+version = "0.1.0"
+description = "Per-frame R/G/B capture orchestrator. Drives the Scanlight + sony-capture to produce one triplet per pressed button."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "scanlightctl",  # Scanlight class from Phase 1A
+    "flask>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+triplet-capture = "triplet_capture.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["triplet_capture"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

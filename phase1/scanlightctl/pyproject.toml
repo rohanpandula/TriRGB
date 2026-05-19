@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scanlightctl"
+version = "0.1.0"
+description = "Driver and CLI for the Scanlight v4 narrowband-RGB light source (jackw01) over USB CDC serial."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Film Scanner project" }]
+dependencies = [
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+scanlightctl = "scanlight.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scanlight"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

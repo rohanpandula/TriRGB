@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>triplet-capture</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #1a1a1a; color: #eee; padding: 2rem; max-width: 720px; margin: auto;
+  }
+  h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
+  fieldset { border: 1px solid #444; padding: 0.75rem 1rem; margin-bottom: 1rem; }
+  legend { padding: 0 0.4rem; color: #aaa; font-size: 0.85rem; text-transform: uppercase; }
+  label { display: inline-block; min-width: 7em; }
+  input[type=text], input[type=number] {
+    background: #222; color: #eee; border: 1px solid #555;
+    padding: 0.25rem 0.5rem; border-radius: 3px; font-family: inherit;
+  }
+  input[type=number] { width: 5em; }
+  button {
+    font-size: 1.1rem; padding: 0.6rem 1.2rem; margin-right: 0.5rem;
+    background: #2d6cb3; color: white; border: none; border-radius: 4px;
+    cursor: pointer;
+  }
+  button.secondary { background: #555; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #status { padding: 0.75rem; margin-top: 1rem; border-radius: 4px; min-height: 3em; }
+  #status.idle { background: #2a2a2a; }
+  #status.busy { background: #6b4500; }
+  #status.ok   { background: #245524; }
+  #status.err  { background: #6b1a1a; }
+  .row { margin-bottom: 0.4rem; }
+  .frame-readout { font-size: 2rem; font-family: monospace; color: #eee; }
+  small { color: #888; }
+</style>
+</head>
+<body>
+
+<h1>triplet-capture</h1>
+<small>Phase 2 disposable UI. Push <strong>Capture Triplet</strong> per frame. Advance film by hand between frames.</small>
+
+<fieldset>
+  <legend>Roll</legend>
+  <div class="row">
+    <label for="roll_name">Roll name</label>
+    <input type="text" id="roll_name" value="{{ settings.roll_name }}">
+  </div>
+  <div class="row">
+    <label for="frame_number">Frame number</label>
+    <input type="number" id="frame_number" min="1" value="{{ settings.frame_number }}">
+    <span class="frame-readout" id="frame_display">{{ "%03d"|format(settings.frame_number) }}</span>
+  </div>
+  <div class="row">
+    <label for="output_folder">Output folder</label>
+    <input type="text" id="output_folder" value="{{ settings.output_folder }}" style="width: 20em;">
+  </div>
+  <button class="secondary" onclick="saveSettings()">Save</button>
+</fieldset>
+
+<fieldset>
+  <legend>Per-channel levels (0–255)</legend>
+  <div class="row">
+    <label for="level_r">Red</label>
+    <input type="number" id="level_r" min="0" max="255" value="{{ settings.level_r }}">
+  </div>
+  <div class="row">
+    <label for="level_g">Green</label>
+    <input type="number" id="level_g" min="0" max="255" value="{{ settings.level_g }}">
+  </div>
+  <div class="row">
+    <label for="level_b">Blue</label>
+    <input type="number" id="level_b" min="0" max="255" value="{{ settings.level_b }}">
+  </div>
+  <div class="row">
+    <label for="settle_ms">Settle (ms)</label>
+    <input type="number" id="settle_ms" min="0" max="2000" value="{{ settings.settle_ms }}">
+  </div>
+  <button class="secondary" onclick="saveSettings()">Save</button>
+</fieldset>
+
+<button id="btn-capture" onclick="capture(false)">Capture Triplet</button>
+<button class="secondary" id="btn-retake" onclick="capture(true)">Retake current frame</button>
+
+<div id="status" class="idle">ready</div>
+
+<script>
+async function saveSettings() {
+  const body = {
+    roll_name: document.getElementById('roll_name').value,
+    frame_number: parseInt(document.getElementById('frame_number').value, 10),
+    output_folder: document.getElementById('output_folder').value,
+    level_r: parseInt(document.getElementById('level_r').value, 10),
+    level_g: parseInt(document.getElementById('level_g').value, 10),
+    level_b: parseInt(document.getElementById('level_b').value, 10),
+    settle_ms: parseInt(document.getElementById('settle_ms').value, 10),
+  };
+  const r = await fetch('/api/settings', {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const data = await r.json();
+  if (!r.ok) {
+    setStatus('err', data.error || 'settings rejected');
+    return;
+  }
+  setStatus('idle', 'settings saved');
+  syncFromState(data);
+}
+
+async function capture(retake) {
+  setBusy(true);
+  setStatus('busy', retake ? 'retaking…' : 'capturing R, G, B…');
+  const url = '/api/capture' + (retake ? '?retake=1' : '');
+  try {
+    const r = await fetch(url, {method: 'POST'});
+    const data = await r.json();
+    if (data.success) {
+      const files = Object.entries(data.files).map(([k,v]) => `${k}: ${v}`).join('\n');
+      setStatus('ok', `frame ${data.frame_number} done in ${data.duration_s}s\n${files}\nnext frame: ${data.next_frame}`);
+      document.getElementById('frame_number').value = data.next_frame;
+      document.getElementById('frame_display').textContent =
+        String(data.next_frame).padStart(3, '0');
+    } else {
+      setStatus('err', `frame ${data.frame_number} failed: ${data.error}`);
+    }
+  } catch (e) {
+    setStatus('err', 'request failed: ' + e);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function setBusy(busy) {
+  document.getElementById('btn-capture').disabled = busy;
+  document.getElementById('btn-retake').disabled = busy;
+}
+
+function setStatus(cls, msg) {
+  const el = document.getElementById('status');
+  el.className = cls;
+  el.textContent = msg;
+}
+
+function syncFromState(s) {
+  document.getElementById('roll_name').value = s.roll_name;
+  document.getElementById('frame_number').value = s.frame_number;
+  document.getElementById('output_folder').value = s.output_folder;
+  document.getElementById('level_r').value = s.level_r;
+  document.getElementById('level_g').value = s.level_g;
+  document.getElementById('level_b').value = s.level_b;
+  document.getElementById('settle_ms').value = s.settle_ms;
+  document.getElementById('frame_display').textContent =
+    String(s.frame_number).padStart(3, '0');
+}
+</script>
+
+</body>
+</html>
