@@ -164,6 +164,45 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     p.add_argument("--sony-capture", default="sony-capture",
                    help="Path to the sony-capture binary (default: search $PATH).")
+    p.add_argument(
+        "--stream-composite",
+        action="store_true",
+        help=(
+            "Composite each triplet in the background as it completes, so the "
+            "roll is fully composited by the time you capture the last frame "
+            "(no end-of-roll wait). Outputs land in <output>/<roll>/composites/ "
+            "— identical to running batch-composite afterward."
+        ),
+    )
+    p.add_argument(
+        "--composite-format",
+        choices=("tiff", "dng", "both"),
+        default="dng",
+        help="Output format for --stream-composite (default dng).",
+    )
+    p.add_argument(
+        "--composite-workers",
+        type=int,
+        default=4,
+        help="Max concurrent background composites for --stream-composite (default 4).",
+    )
+    p.add_argument(
+        "--ffc-calibration",
+        default=None,
+        help=(
+            "FFC calibration triplet directory (R/G/B blanks). Passed to "
+            "--stream-composite. Omit to skip flat-field correction."
+        ),
+    )
+    p.add_argument(
+        "--camera-model",
+        default=None,
+        help=(
+            "UniqueCameraModel string for the composite DNG (e.g. "
+            "'Sony ILCE-7CR' or 'FUJIFILM GFX100 II') so Lightroom offers the "
+            "matching camera profile. Only used with --stream-composite."
+        ),
+    )
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -205,8 +244,39 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"triplet-capture: could not open Scanlight: {e}", file=sys.stderr)
         return 1
 
+    # Optional streaming compositor: kicks off rgb-composite per triplet as
+    # it completes, so the roll is done by the time the last frame is shot.
+    composite_worker = None
+    on_triplet_complete = None
+    if args.stream_composite:
+        from .composite_worker import CompositeWorker
+
+        composite_worker = CompositeWorker(
+            output_folder / "composites",
+            args.roll_name,
+            max_workers=args.composite_workers,
+            output_format=args.composite_format,
+            ffc_calibration_dir=Path(args.ffc_calibration) if args.ffc_calibration else None,
+            dng_camera_model=args.camera_model,
+        )
+
+        def on_triplet_complete(result):
+            if result.success:
+                composite_worker.submit(result.frame_number, result.files)
+            # Surface any finished composites' failures to the log promptly.
+            for cr in composite_worker.poll():
+                if not cr.ok:
+                    logging.warning("background composite frame %d failed: %s",
+                                    cr.frame_number, cr.error)
+
+        print(
+            f"triplet-capture: streaming composites → {output_folder / 'composites'} "
+            f"({args.composite_format}, {args.composite_workers} workers)",
+            file=sys.stderr,
+        )
+
     try:
-        orch = Orchestrator(scanlight, settings)
+        orch = Orchestrator(scanlight, settings, on_triplet_complete=on_triplet_complete)
         app = create_app(orch)
         print(f"triplet-capture: web UI on http://{args.host}:{args.web_port}",
               file=sys.stderr)
@@ -215,6 +285,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         app.run(host=args.host, port=args.web_port, debug=False, use_reloader=False)
         return 0
     finally:
+        if composite_worker is not None:
+            # Let outstanding composites finish before we exit so the roll is
+            # complete on disk. Logs each result; never raises.
+            for cr in composite_worker.drain():
+                if not cr.ok:
+                    logging.warning("background composite frame %d failed: %s",
+                                    cr.frame_number, cr.error)
+            composite_worker.shutdown(wait=True)
         scanlight.close()
 
 

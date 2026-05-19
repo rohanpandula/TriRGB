@@ -142,37 +142,63 @@ Load film into the Valoi 360. Launch the orchestrator with whichever
 trigger mode matches your physical setup (see PROJECT.md §Hardware
 architecture for the two configurations).
 
-**Configuration A — USB tether, SDK trigger (default):**
+**Configuration B — tether app + Scanlight 3.5mm trigger (recommended default):**
+
+The tether app (Imaging Edge Desktop for Sony, or Lightroom Classic tether
+for Fuji) holds the camera connection and auto-saves each RAW to a watched
+folder. The Scanlight's 3.5mm jack fires the shutter. This works for **both
+the Sony a7CR and the Fuji GFX 100 II** — the orchestrator and inbox watcher
+are camera-agnostic; only the cable adapter differs (Sony Multi vs Fuji
+RR-100 2.5mm, each → 3.5mm TRS).
 
 ```bash
-triplet-capture --roll-name Roll001 --output-folder /Volumes/SSD/Scans
-```
-
-**Configuration B — Wi-Fi tether, Scanlight 3.5mm trigger:**
-
-```bash
-# Start Imaging Edge Desktop first; set its save folder to the path
-# you'll pass below. Then:
+# Start the tether app first; point its save folder at --ied-inbox below.
+# (Sony: Imaging Edge Desktop. Fuji: Lightroom Classic → File → Tether Capture.)
 triplet-capture \
     --roll-name Roll001 \
     --output-folder /Volumes/SSD/Scans \
     --trigger-mode hw \
     --ied-inbox /Volumes/SSD/_ied_inbox \
     --shutter-pulse-ms 100 \
-    --capture-timeout-s 30
+    --capture-timeout-s 30 \
+    --stream-composite \
+    --ffc-calibration ~/.scanlight/calibration/$(date +%Y-%m-%d) \
+    --camera-model "Sony ILCE-7CR"   # or "FUJIFILM GFX100 II"
 ```
+
+**Configuration A — USB tether, Sony SDK trigger (deprecated):**
+
+```bash
+triplet-capture --roll-name Roll001 --output-folder /Volumes/SSD/Scans
+```
+
+> ⚠ The Sony Camera Remote SDK shutter path (`sony-capture`, the default
+> `--trigger-mode sdk`) does NOT reliably produce stills on a7CR firmware
+> ≥ 1.10 with Access Authentication enabled — `CrCommandId_Release` routes
+> to movie capture and writes XAVC instead of ARW. The SDK *connection*
+> (Wi-Fi + Access Auth + RemoteTransfer file pull) works; the still-shutter
+> command does not. Use Configuration B. The SDK path is kept for reference
+> and may be revisited if Sony fixes the firmware behavior.
 
 Either way, opens a web UI. Per frame:
 1. Click "Capture frame NNN" — the scanlight cycles R, G, B; the camera
-   fires three times; three ARWs land in
+   fires three times; three RAWs (ARW or RAF) land in
    `/Volumes/SSD/Scans/Roll001/`.
 2. Manually advance the Valoi to the next frame.
 3. Repeat.
 
-File naming follows
-`{roll_name}_Frame{NNN}_{R|G|B}.ARW`.
+File naming follows `{roll_name}_Frame{NNN}_{R|G|B}.{ARW,RAF}`.
 
 ### 7. Composite the roll
+
+**If you passed `--stream-composite` in step 6, the roll is already composited** —
+each triplet was composited in the background as you shot it, so by the time
+you finished the last frame the `composites/` directory was full. Skip to
+step 8. (Background composites run up to 4 at a time; a failed frame is
+logged but never aborts capture, and you can always re-run `batch-composite`
+to fill gaps.)
+
+**Otherwise, composite the whole roll in one batch pass:**
 
 ```bash
 batch-composite /Volumes/SSD/Scans/Roll001 \
@@ -183,19 +209,28 @@ batch-composite /Volumes/SSD/Scans/Roll001 \
 Walks the roll directory, finds every (R, G, B) triplet, and writes a
 composite per frame to `Roll001/composites/`.
 
-Key flags:
+Key flags (shared by `batch-composite` and the `--stream-composite` path):
 - `--ffc-calibration <dir>` — apply per-channel Flat Field Correction
   using the calibration triplet from step 4. Strongly recommended.
-- `--format <tiff|dng|both>` — output 16-bit linear ProPhoto-RGB as TIFF
-  (legacy), Linear DNG (Lightroom/Capture One treat it as RAW —
-  parametric Develop module works), or both side-by-side.
-- `--workers N` — parallel decode. Default `min(cpu_count, 4)` to keep
-  peak memory bounded; raise on a 32 GB+ Mac.
+- `--format <tiff|dng|both>` (batch) / `--composite-format` (streaming) —
+  16-bit linear ProPhoto-RGB as TIFF (legacy), Linear DNG (Lightroom/Capture
+  One treat it as RAW — parametric Develop module works), or both.
+- `--camera-model "<model>"` — sets the DNG `UniqueCameraModel` tag so LR
+  offers the matching camera profile. `"Sony ILCE-7CR"` or
+  `"FUJIFILM GFX100 II"`.
+- `--workers N` (batch) / `--composite-workers N` (streaming) — parallel
+  decode. Default 4 to keep peak memory bounded; raise on a 32 GB+ Mac.
 
 ### 8. Import to Lightroom
 
 Drag the `composites/` directory into LR. Use **Linear DNG** if you
 generated it — you get the full Develop module before NLP runs.
+
+**Hands-off option:** point Lightroom Classic's Auto Import (File → Auto
+Import → Auto Import Settings) at the `composites/` directory. Combined
+with `--stream-composite` in step 6, composites appear in your LR catalog
+within seconds of each frame being captured — by the time the roll is shot,
+every frame is already imported and waiting for NLP. Zero manual import.
 
 Per the NLP forum, before running the convert:
 - **Camera Profile** → "Linear" or "Adobe Standard" (not Camera-anything).

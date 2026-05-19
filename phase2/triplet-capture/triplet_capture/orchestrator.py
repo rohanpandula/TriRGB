@@ -168,11 +168,21 @@ class Orchestrator:
         sony_capture_runner: Optional[Callable[[str, Path, int], int]] = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        on_triplet_complete: Optional[Callable[["TripletResult"], None]] = None,
     ):
         self._scanlight = scanlight
         self._settings = settings
         self._clock = clock
         self._sleep = sleep
+        # Optional hook fired after a successful (non-retake AND retake)
+        # triplet, with the TripletResult. The app layer wires a
+        # CompositeWorker.submit() here to kick off background compositing
+        # while the operator captures the next frame. Kept as an injected
+        # callback so the orchestrator stays capture-only and has no
+        # dependency on rgb_composite. Exceptions raised by the hook are
+        # swallowed and logged — a compositing failure must never abort the
+        # capture loop.
+        self._on_triplet_complete = on_triplet_complete
         # Track whether the caller passed an explicit runner so that
         # update_settings() can re-pick the right internal runner if the
         # trigger mode changes, without ever overriding a caller-supplied
@@ -284,12 +294,24 @@ class Orchestrator:
             log("frame_advance", next_frame=self._settings.frame_number)
         else:
             log("retake_complete")
-        return TripletResult(
+        result = TripletResult(
             success=True,
             frame_number=s.frame_number,
             files=files,
             duration_s=self._clock() - t_start,
         )
+
+        # Kick off background compositing (if wired) while the operator
+        # captures the next frame. A hook failure must NOT abort the capture
+        # loop — log it and carry on; the operator can always re-run
+        # batch-composite on the roll dir afterward to fill any gaps.
+        if self._on_triplet_complete is not None:
+            try:
+                self._on_triplet_complete(result)
+            except Exception as hook_exc:  # noqa: BLE001
+                log("composite_hook_failed", error=str(hook_exc))
+
+        return result
 
     # ---------------- internals ----------------
 
