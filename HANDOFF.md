@@ -6,6 +6,25 @@ Last updated: 2026-05-13. Built against PROJECT.md and the upstream `jackw01/sca
 
 ---
 
+## For AI agents / automation runners
+
+If you are an AI agent (Claude, Codex) or a CI runner picking this
+project up, your entry point is
+[`docs/automation.md`](docs/automation.md), not this file. That doc
+documents every automatable surface (CLIs, Swift CLI, scripts, the
+Phase 01 SwiftUI app's AX-ID schema), the JSON contract / exit codes
+/ failure modes for each, and the decision matrix for which surface
+to use when. The flat AX-ID list is at
+[`docs/ax-id-reference.md`](docs/ax-id-reference.md).
+
+The rest of this file is for humans bringing the hardware up. It's
+fine to read if you want to understand the deployment history and
+the assumptions that need verification on plug-in day, but the
+contracts you need to drive the system are in
+`docs/automation.md`.
+
+---
+
 ## Status by phase
 
 ### Phase 1 — Plumbing

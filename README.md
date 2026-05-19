@@ -7,6 +7,24 @@ TIFF (or Linear DNG) for inversion in **Negative Lab Pro** or FilmLab.
 **Canonical brief:** [`PROJECT.md`](PROJECT.md) — read first.
 **Resume from HW arrival:** [`HANDOFF.md`](HANDOFF.md).
 **Optical pre-flight:** [`docs/optical_dry_run.md`](docs/optical_dry_run.md).
+**Automation reference:** [`docs/automation.md`](docs/automation.md) — for AI agents and CI runners.
+
+---
+
+## Automating this project
+
+For AI agents (Claude, Codex) and CI runners that need to drive the
+system without human intervention, the written contract lives at
+[`docs/automation.md`](docs/automation.md). It enumerates every
+automatable surface (every CLI, the SwiftUI app's AX-ID schema, the
+Python harness pattern), documents the JSON contract / exit codes /
+failure modes for each, and ships a GUI ↔ CLI mapping table covering
+every case in `AccessibilityIDs.swift`. The flat AX-ID list is at
+[`docs/ax-id-reference.md`](docs/ax-id-reference.md); a consistency
+check keeps it in sync with the Swift source.
+
+The rest of this file is the operator how-to. AI agents should start
+at `docs/automation.md`; humans scanning film should keep reading.
 
 ---
 
