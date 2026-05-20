@@ -244,12 +244,13 @@ final class OrchestratorClient: ObservableObject {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         request.httpBody = try encoder.encode(settings)
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw OrchestratorError.invalidResponse(statusCode: 0)
         }
         guard http.statusCode == 200 else {
-            throw OrchestratorError.invalidResponse(statusCode: http.statusCode)
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
         }
     }
 
@@ -273,7 +274,8 @@ final class OrchestratorClient: ObservableObject {
         }
         // Accept 200 (success) and 500 (failure — TripletOutcome.success == false)
         guard http.statusCode == 200 || http.statusCode == 500 else {
-            throw OrchestratorError.invalidResponse(statusCode: http.statusCode)
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
         }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
