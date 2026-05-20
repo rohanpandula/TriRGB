@@ -298,6 +298,31 @@ def format_report(stats: tuple[ChannelStats, ChannelStats, ChannelStats]) -> str
     return "\n".join(lines)
 
 
+def _channel_verdict(s: "ChannelStats") -> str:
+    """Derive per-channel verdict from a single ChannelStats.
+
+    Rules mirror the overall classify() tiers applied per-channel:
+      fail:       saturation > SATURATION_BAD_PCT
+               OR falloff < -FALLOFF_USABLE_PCT (hotspot)
+               OR abs(falloff) > FALLOFF_REQUIRED_PCT
+               OR uniformity > UNIFORMITY_FAIL_PCT
+      acceptable: abs(falloff) > FALLOFF_USABLE_PCT
+               OR uniformity > UNIFORMITY_CLEAN_PCT
+      clean:      all else
+    """
+    if s.saturation_pct > SATURATION_BAD_PCT:
+        return "fail"
+    if s.falloff_pct < -FALLOFF_USABLE_PCT:
+        return "fail"
+    if abs(s.falloff_pct) > FALLOFF_REQUIRED_PCT:
+        return "fail"
+    if s.uniformity_pct > UNIFORMITY_FAIL_PCT:
+        return "fail"
+    if abs(s.falloff_pct) > FALLOFF_USABLE_PCT or s.uniformity_pct > UNIFORMITY_CLEAN_PCT:
+        return "acceptable"
+    return "clean"
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(
         prog="inspect-calibration",
@@ -310,6 +335,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     p.add_argument("cal_dir", type=Path,
                    help="Calibration directory written by capture-calibration.sh")
+    p.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help=(
+            "Emit JSON to stdout instead of a human-readable report. "
+            "Exit code semantics unchanged: 0 = clean/acceptable, 1 = fail, 2 = error."
+        ),
+    )
     args = p.parse_args(argv)
 
     try:
@@ -320,6 +354,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as e:
         print(f"inspect-calibration: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
+
+    if args.json:
+        channel_results = {}
+        for s in stats:
+            channel_results[s.channel] = {
+                "falloff_pct": round(s.falloff_pct, 2),
+                "uniformity_pct": round(s.uniformity_pct, 2),
+                "verdict": _channel_verdict(s),
+            }
+        verdicts = [v["verdict"] for v in channel_results.values()]
+        overall = "fail" if "fail" in verdicts else ("acceptable" if "acceptable" in verdicts else "clean")
+        import json
+        print(json.dumps({"channels": channel_results, "overall": overall}))
+        return 1 if overall == "fail" else 0
 
     print(f"Calibration directory: {args.cal_dir}")
     print()

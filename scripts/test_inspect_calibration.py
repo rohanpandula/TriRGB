@@ -11,6 +11,7 @@ Run from the repo root:
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -337,3 +338,63 @@ def test_classify_uniformity_independent_of_falloff():
     msg, rc = inspect_calibration.classify(stats)
     assert rc == 1
     assert "FAIL" in msg
+
+
+# ---------- --json output ----------
+
+def test_main_json_output_clean(tmp_path, monkeypatch, capsys):
+    """--json flag emits a valid JSON object; uniform arrays → rc 0."""
+    cal = tmp_path / "cal"
+    cal.mkdir()
+    for name in ("R.ARW", "G.ARW", "B.ARW"):
+        (cal / name).write_bytes(b"\x00")
+
+    def fake_demosaic(path):
+        img = np.zeros((H, W, 3), dtype=np.uint16)
+        ch = {"R": 0, "G": 1, "B": 2}[Path(path).stem.upper()]
+        img[..., ch] = 40000
+        return img
+
+    monkeypatch.setattr(inspect_calibration, "_load_demosaic", fake_demosaic)
+    rc = inspect_calibration.main([str(cal), "--json"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert set(data["channels"].keys()) == {"R", "G", "B"}
+    for ch_data in data["channels"].values():
+        assert "falloff_pct" in ch_data
+        assert "uniformity_pct" in ch_data
+        assert ch_data["verdict"] in ("clean", "acceptable", "fail")
+    assert data["overall"] in ("clean", "acceptable", "fail")
+
+
+def test_main_json_shape_has_required_keys(tmp_path, monkeypatch, capsys):
+    """Structural contract test: top-level and per-channel keys are all present.
+
+    This is the contract CalibrationView's JSONDecoder depends on — if any
+    key name changes, this test breaks before the Swift side breaks.
+    """
+    cal = tmp_path / "cal"
+    cal.mkdir()
+    for name in ("R.ARW", "G.ARW", "B.ARW"):
+        (cal / name).write_bytes(b"\x00")
+
+    def fake_demosaic(path):
+        img = np.zeros((H, W, 3), dtype=np.uint16)
+        ch = {"R": 0, "G": 1, "B": 2}[Path(path).stem.upper()]
+        img[..., ch] = 40000
+        return img
+
+    monkeypatch.setattr(inspect_calibration, "_load_demosaic", fake_demosaic)
+    inspect_calibration.main([str(cal), "--json"])
+    out = capsys.readouterr().out
+    data = json.loads(out)
+
+    # Top-level keys
+    assert "channels" in data
+    assert "overall" in data
+
+    # Per-channel keys — exactly the three required keys
+    for ch in ("R", "G", "B"):
+        ch_data = data["channels"][ch]
+        assert set(ch_data.keys()) == {"falloff_pct", "uniformity_pct", "verdict"}
