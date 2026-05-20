@@ -129,7 +129,17 @@ final class OrchestratorClient: ObservableObject {
     /// - Picks a free localhost port via POSIX `bind(port:0)`.
     /// - Builds a `[String]` argument array (never a shell string — T-05-04).
     /// - Starts the process and polls `GET /api/state` until HTTP 200 (or timeout).
+    ///
+    /// Calling `start()` while already running throws immediately (prevents orphans).
+    /// On startup timeout, the child is SIGTERMed/SIGKILLed before the error is
+    /// re-thrown so a retry never creates an unreachable orphan process.
     func start(settings: ScanSettings) async throws {
+        // Guard against double-start: a second call while running would spawn a
+        // second child and overwrite self.process, orphaning the first one.
+        guard !isRunning, process == nil else {
+            throw OrchestratorError.toolNotFound("already running — call stop() first")
+        }
+
         // 1. Locate the tool
         let toolURL: URL
         do {
@@ -165,8 +175,18 @@ final class OrchestratorClient: ObservableObject {
             }
         }
 
-        // 6. Wait for readiness (will throw OrchestratorError.startupTimeout on failure)
-        try await waitForReady(port: port, timeout: 10.0)
+        // 6. Wait for readiness — on timeout, kill the orphan before rethrowing.
+        // Without this, a failed start() leaves a live child process with no
+        // handle to terminate it, and a retry would spawn a second one.
+        do {
+            try await waitForReady(port: port, timeout: 10.0)
+        } catch {
+            proc.interrupt()   // SIGTERM
+            try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms grace
+            if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+            self.process = nil
+            throw error
+        }
 
         // 7. Mark as running
         isRunning = true
