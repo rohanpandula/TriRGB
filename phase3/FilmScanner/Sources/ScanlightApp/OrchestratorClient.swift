@@ -313,8 +313,9 @@ final class OrchestratorClient: ObservableObject {
             do {
                 let (_, response) = try await session.data(from: url)
                 if (response as? HTTPURLResponse)?.statusCode == 200 { return }
-            } catch let err as URLError where err.code == .cannotConnectToHost {
-                // Normal during startup — retry silently
+            } catch is URLError {
+                // Normal during startup (cannotConnectToHost, networkConnectionLost,
+                // etc.) — retry silently until the timeout deadline
             }
             try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
         }
