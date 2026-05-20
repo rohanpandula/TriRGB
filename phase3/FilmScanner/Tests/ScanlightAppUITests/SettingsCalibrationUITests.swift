@@ -236,6 +236,11 @@ final class SettingsCalibrationUITests: XCTestCase {
     /// R-20: Save Settings calls applyRuntimeSettings when orchestrator is running
     /// → POST /api/settings with levelR/G/B. When not running → no POST.
     ///
+    /// Exercises the ACTUAL wiring: creates a ScanSettingsView with the
+    /// orchestratorClient injected and calls saveSettings() — the same method
+    /// that the Save button action now invokes — to verify the wiring is correct,
+    /// not just the capability of applyRuntimeSettings in isolation.
+    ///
     /// Uses the StubURLProtocol injection pattern from OrchestratorClientTests.
     func testSaveSettingsPushesRuntimeSettings() async throws {
         // Pre-program StubURLProtocol to return HTTP 200 for POST /api/settings
@@ -270,16 +275,15 @@ final class SettingsCalibrationUITests: XCTestCase {
         store.settings.outputFolder = "/tmp/out"
         store.settings.triggerMode = "sdk"
 
-        // Execute the Save Settings action: validate then call applyRuntimeSettings
-        // when orchestrator is running (matches RESEARCH.md Finding 9 — avoids
-        // output_folder asymmetry by using applyRuntimeSettings not updateSettings).
-        store.validationErrors = store.validate()
+        // Create ScanSettingsView with the orchestratorClient injected — this verifies
+        // the wiring (not just calling applyRuntimeSettings directly). Call saveSettings()
+        // which is the exact method the Save button action delegates to.
+        let view = ScanSettingsView(store: store, orchestratorClient: orchestratorClient)
+        await view.saveSettings()
+
+        // Assert: validation passed (no errors after saveSettings())
         XCTAssertTrue(store.validationErrors.isEmpty,
                       "Validation should pass for valid settings, errors: \(store.validationErrors)")
-
-        if store.validationErrors.isEmpty && orchestratorClient.isRunning {
-            try await orchestratorClient.applyRuntimeSettings(store.settings)
-        }
 
         // Assert: POST /api/settings was sent with level fields
         XCTAssertNotNil(StubURLProtocol.lastRequest,
@@ -320,10 +324,7 @@ final class SettingsCalibrationUITests: XCTestCase {
         StubURLProtocol.lastBody = nil
 
         orchestratorClient.isRunning = false
-
-        if store.validationErrors.isEmpty && orchestratorClient.isRunning {
-            try await orchestratorClient.applyRuntimeSettings(store.settings)
-        }
+        await view.saveSettings()
 
         XCTAssertNil(StubURLProtocol.lastRequest,
                      "When orchestrator is not running, Save Settings must not POST to /api/settings")

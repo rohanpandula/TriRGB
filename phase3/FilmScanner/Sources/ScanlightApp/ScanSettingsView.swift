@@ -14,6 +14,10 @@ import SwiftUI
 
 struct ScanSettingsView: View {
     @ObservedObject var store: SettingsStore
+    /// Injected from ScanlightAppMain. Used to push live settings when the
+    /// orchestrator is running (R-20). Not @StateObject here — AppMain owns
+    /// the lifetime.
+    @ObservedObject var orchestratorClient: OrchestratorClient
 
     /// Local state for camera model "Custom…" text entry.
     @State private var customCameraModel: String = ""
@@ -264,7 +268,7 @@ struct ScanSettingsView: View {
                 GroupBox(label: Text("Actions").font(.headline)) {
                     VStack(alignment: .leading, spacing: 4) {
                         Button("Save Settings") {
-                            store.validationErrors = store.validate()
+                            Task { await saveSettings() }
                         }
                         .accessibilityIdentifier(AccessibilityID.settingsSaveBtn)
 
@@ -279,6 +283,27 @@ struct ScanSettingsView: View {
 
             }
             .padding()
+        }
+    }
+
+    // MARK: - Actions
+
+    /// Execute the Save Settings action: validate then push live settings when
+    /// the orchestrator is running (R-20). Async so callers can await the push.
+    /// Exposed as internal (not private) so unit tests can call it directly to
+    /// verify the wiring without launching the app or clicking a SwiftUI button.
+    @MainActor
+    func saveSettings() async {
+        store.validationErrors = store.validate()
+        // R-20: push live settings when the orchestrator is running.
+        // If not running, just store — start() applies them later (Phase 7).
+        if store.validationErrors.isEmpty && orchestratorClient.isRunning {
+            do {
+                try await orchestratorClient.applyRuntimeSettings(store.settings)
+            } catch {
+                store.validationErrors["_runtime"] =
+                    "Failed to push settings: \(error.localizedDescription)"
+            }
         }
     }
 

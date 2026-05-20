@@ -18,6 +18,9 @@
 // can observe isConnected for the serial-port guard (phase 07 delivers the
 // full port-handoff state machine; here we only prevent the double-open).
 //
+// orchestratorClient is @StateObject at the App level so ScanSettingsView
+// can push applyRuntimeSettings when the orchestrator is running (R-20).
+//
 // No business logic lives here — this file only wires View + ViewModel.
 
 import SwiftUI
@@ -28,6 +31,7 @@ struct ScanlightAppMain: App {
     @StateObject private var scanlightViewModel = ScanlightViewModel(
         transportFactory: FakeBridge.makeTransport
     )
+    @StateObject private var orchestratorClient = OrchestratorClient()
 
     var body: some Scene {
         WindowGroup {
@@ -35,7 +39,7 @@ struct ScanlightAppMain: App {
                 ScanlightView(viewModel: scanlightViewModel)
                     .tabItem { Label("Light", systemImage: "lightbulb") }
 
-                ScanSettingsView(store: settingsStore)
+                ScanSettingsView(store: settingsStore, orchestratorClient: orchestratorClient)
                     .tabItem { Label("Settings", systemImage: "gearshape") }
 
                 CalibrationView(store: settingsStore, viewModel: scanlightViewModel)
