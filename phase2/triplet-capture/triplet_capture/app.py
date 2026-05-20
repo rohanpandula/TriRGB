@@ -18,7 +18,7 @@ from scanlight import Scanlight
 from .orchestrator import CaptureSettings, Orchestrator
 
 
-def create_app(orchestrator: Orchestrator) -> Flask:
+def create_app(orchestrator: Orchestrator, composite_worker=None) -> Flask:
     """Build the Flask app around a pre-built Orchestrator.
 
     Passing the orchestrator in (rather than constructing inside) makes
@@ -67,6 +67,25 @@ def create_app(orchestrator: Orchestrator) -> Flask:
             "duration_s": round(result.duration_s, 2),
             "next_frame": orchestrator.settings.frame_number,
         }), (200 if result.success else 500)
+
+    _composite_history: list[dict] = []
+
+    @app.get("/api/composite-status")
+    def get_composite_status():
+        if composite_worker is None:
+            return jsonify({"enabled": False})
+        for cr in composite_worker.poll():
+            _composite_history.append({
+                "frame_number": cr.frame_number,
+                "status": "done" if cr.ok else "failed",
+                "output_path": str(cr.output_path) if cr.output_path else None,
+                "error": cr.error,
+            })
+        return jsonify({
+            "enabled": True,
+            "pending": composite_worker.pending,
+            "results": _composite_history,
+        })
 
     return app
 
@@ -203,6 +222,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             "matching camera profile. Only used with --stream-composite."
         ),
     )
+    p.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Start in headless mode; suppresses the startup browser-launch hint.",
+    )
     args = p.parse_args(argv)
 
     logging.basicConfig(
@@ -277,9 +301,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         orch = Orchestrator(scanlight, settings, on_triplet_complete=on_triplet_complete)
-        app = create_app(orch)
+        app = create_app(orch, composite_worker=composite_worker)
         print(f"triplet-capture: web UI on http://{args.host}:{args.web_port}",
               file=sys.stderr)
+        if args.no_browser:
+            print("triplet-capture: headless mode (--no-browser)", file=sys.stderr)
         # Use Flask's built-in server — disposable tool, no production
         # concerns. `use_reloader=False` so we don't double-open the serial port.
         app.run(host=args.host, port=args.web_port, debug=False, use_reloader=False)
