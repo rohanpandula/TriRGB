@@ -68,4 +68,32 @@ public enum AccessibilityID {
     public static let lastErrorLabel         = "lbl-last-error"
     public static let logScrollView          = "scroll-log"
     public static let clearLogButton         = "btn-clear-log"
+
+    // MARK: - Settings view
+
+    public static let settingsRollNameField      = "field-roll-name"
+    public static let settingsPickOutputBtn      = "btn-pick-output"
+    public static let settingsOutputPathLabel    = "lbl-output-path"
+    public static let settingsTriggerModePicker  = "picker-trigger-mode"
+    public static let settingsPickInboxBtn       = "btn-pick-inbox"
+    public static let settingsInboxPathLabel     = "lbl-inbox-path"
+    public static let settingsLevelRSlider       = "slider-level-r"
+    public static let settingsLevelGSlider       = "slider-level-g"
+    public static let settingsLevelBSlider       = "slider-level-b"
+    public static let settingsSettleStepper      = "stepper-settle-ms"
+    public static let settingsPickFfcBtn         = "btn-pick-ffc"
+    public static let settingsFfcPathLabel       = "lbl-ffc-path"
+    public static let settingsCameraModelPicker  = "picker-camera-model"
+    public static let settingsStreamToggle       = "toggle-stream-composite"
+    public static let settingsCompositeFormat    = "picker-composite-format"
+    public static let settingsSaveBtn            = "btn-save-settings"
+
+    // MARK: - Calibration view
+
+    public static let calCaptureBtn              = "btn-capture-calibration"
+    public static let calVerdictR                = "lbl-cal-verdict-r"
+    public static let calVerdictG                = "lbl-cal-verdict-g"
+    public static let calVerdictB                = "lbl-cal-verdict-b"
+    public static let calOverallLabel            = "lbl-cal-overall"
+    public static let calUseBtn                  = "btn-use-calibration"
 }
