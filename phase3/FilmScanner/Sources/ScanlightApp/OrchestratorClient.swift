@@ -221,18 +221,10 @@ final class OrchestratorClient: ObservableObject {
         do {
             try await waitForReady(port: port, timeout: 10.0)
         } catch {
-            // If the child is still alive (hung — never became ready), terminate it
-            // so a retry can't orphan it. If it already exited on its own (startup
-            // crash → startupFailed), the termination handler already cleared
-            // self.process and there is nothing to kill.
-            if proc.isRunning {
-                proc.interrupt()   // SIGTERM
-                try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms grace
-                if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
-            }
-            // Only clear the shared handle if this launch still owns it — the child
-            // may have died mid-startup, letting a concurrent start() supersede us.
-            if launchGeneration == generation { self.process = nil }
+            // Tear down THIS launch's child (scoped — never the generic stop(),
+            // which acts on the current process and would kill a newer launch's
+            // child if a retry superseded us while waitForReady awaited).
+            await teardownFailedLaunch(proc, generation: generation)
             throw error
         }
 
@@ -252,13 +244,22 @@ final class OrchestratorClient: ObservableObject {
         do {
             try await applyRuntimeSettings(settings)
         } catch {
-            // Orchestrator is up but we couldn't apply the requested levels — shut
-            // it down cleanly rather than leave the caller with default light levels.
-            await stop()
+            // Couldn't apply levels — tear down THIS launch's child (scoped, not the
+            // generic stop(): a retry may have superseded us while the POST awaited).
+            await teardownFailedLaunch(proc, generation: generation)
             throw error
         }
 
-        // 8. Now safe to publish running state.
+        // 8. The child can die during or just after the settings push. Only publish
+        // running state if this launch still owns a LIVE process — otherwise we'd set
+        // isRunning=true for a dead/nil process (the exact stale-true hazard we are
+        // trying to prevent, since the termination handler ran with wasRunning=false).
+        guard launchGeneration == generation, childExitStatus == nil, proc.isRunning else {
+            let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+            let code = childExitStatus ?? (proc.isRunning ? -1 : proc.terminationStatus)
+            await teardownFailedLaunch(proc, generation: generation)
+            throw OrchestratorError.startupFailed(exitCode: code, stderr: stderrText)
+        }
         isRunning = true
         lastError = ""
     }
@@ -496,6 +497,19 @@ final class OrchestratorClient: ObservableObject {
             lastError = "orchestrator exited unexpectedly (code \(status))"
                 + (stderrText.isEmpty ? "" : ": " + stderrText)
         }
+    }
+
+    /// Terminate a SPECIFIC launch's child and clear the shared handle only if this
+    /// launch still owns it. Used by start()'s failure paths instead of the public
+    /// stop() — stop() acts on the *current* process, which a concurrent retry may
+    /// have already replaced with a newer child we must not kill.
+    private func teardownFailedLaunch(_ proc: Process, generation: Int) async {
+        if proc.isRunning {
+            proc.interrupt()   // SIGTERM
+            try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms grace
+            if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+        }
+        if launchGeneration == generation { process = nil }
     }
 
     // MARK: - Private helpers
