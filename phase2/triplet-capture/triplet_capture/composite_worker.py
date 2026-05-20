@@ -24,6 +24,7 @@ This module deliberately mirrors batch_composite's worker contract
 from __future__ import annotations
 
 import logging
+import threading
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -128,6 +129,7 @@ class CompositeWorker:
         self._executor = executor or ProcessPoolExecutor(max_workers=max_workers)
         self._job_fn = job_fn or _composite_job
         self._futures: dict[int, Future] = {}
+        self._lock = threading.Lock()
         self._closed = False
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -161,7 +163,8 @@ class CompositeWorker:
             str(self._ffc) if self._ffc else None,
             self._camera_model,
         )
-        self._futures[frame_number] = fut
+        with self._lock:
+            self._futures[frame_number] = fut
         logger.info("queued composite for frame %d → %s", frame_number, out_path.name)
 
     def poll(self) -> list[CompositeResult]:
@@ -170,22 +173,28 @@ class CompositeWorker:
         Completed futures are removed from the tracking set so a long roll
         doesn't accumulate handles. Call this periodically (e.g., after each
         capture_triplet) to surface failures to the operator promptly.
+
+        Thread-safe: Flask runs with threaded=True by default, so /api/capture
+        and /api/composite-status may call poll() concurrently.
         """
-        done: list[CompositeResult] = []
-        for frame_number in list(self._futures.keys()):
-            fut = self._futures[frame_number]
-            if fut.done():
-                done.append(self._collect(frame_number, fut))
-                del self._futures[frame_number]
+        with self._lock:
+            done: list[CompositeResult] = []
+            for frame_number in list(self._futures.keys()):
+                fut = self._futures[frame_number]
+                if fut.done():
+                    done.append(self._collect(frame_number, fut))
+                    del self._futures[frame_number]
         return done
 
     def drain(self, timeout: Optional[float] = None) -> list[CompositeResult]:
         """Block until every outstanding composite finishes. Returns all
         results. Call at end-of-roll. `timeout` is per-future (seconds).
         """
+        with self._lock:
+            pending = list(self._futures.items())
+            self._futures.clear()
         results: list[CompositeResult] = []
-        for frame_number in list(self._futures.keys()):
-            fut = self._futures.pop(frame_number)
+        for frame_number, fut in pending:
             try:
                 fut.result(timeout=timeout)
             except Exception:  # noqa: BLE001 — _collect re-reads the outcome
@@ -208,7 +217,8 @@ class CompositeWorker:
     @property
     def pending(self) -> int:
         """Number of submitted-but-not-yet-collected jobs."""
-        return len(self._futures)
+        with self._lock:
+            return len(self._futures)
 
     def shutdown(self, *, wait: bool = False) -> None:
         """Tear down the pool. `wait=False` (default) cancels queued jobs and
