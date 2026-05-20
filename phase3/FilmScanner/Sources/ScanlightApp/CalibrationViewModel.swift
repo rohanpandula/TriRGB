@@ -123,6 +123,14 @@ final class CalibrationViewModel: ObservableObject {
             captureProc.terminationHandler = { _ in continuation.resume() }
         }
 
+        // Drain captureStdout unconditionally after the process exits.
+        // capture-calibration.sh currently emits only a few hundred bytes, but if
+        // the script is ever extended to emit larger output, a full pipe buffer
+        // would deadlock the child while Swift waits on the termination handler.
+        // Reading here is safe: the process has already exited (pipe write end is
+        // closed), so readDataToEndOfFile() returns immediately. (WR-02)
+        _ = captureStdout.fileHandleForReading.readDataToEndOfFile()
+
         guard captureProc.terminationStatus == 0 else {
             let errData = captureStderr.fileHandleForReading.readDataToEndOfFile()
             let stderr = String(data: errData, encoding: .utf8) ?? ""
