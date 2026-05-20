@@ -91,11 +91,13 @@ final class SettingsStore: ObservableObject {
         var errors: [String: String] = [:]
 
         // Roll name: non-empty, no whitespace
-        // Python: any(c.isspace() for c in roll_name) — Unicode-aware
-        // Swift mirror: rangeOfCharacter(from: .whitespaces) catches all Unicode whitespace
+        // Python: any(c.isspace() for c in roll_name) — matches \n \r \v \f in addition
+        // to space and tab. Swift mirror must use .whitespacesAndNewlines (not .whitespaces)
+        // so a roll name with a trailing newline (e.g. pasted from clipboard) is rejected
+        // here before it reaches the Python orchestrator. (WR-03)
         if settings.rollName.isEmpty {
             errors["rollName"] = "Roll name is required."
-        } else if settings.rollName.rangeOfCharacter(from: .whitespaces) != nil {
+        } else if settings.rollName.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
             errors["rollName"] = "Roll name must not contain spaces."
         }
 
