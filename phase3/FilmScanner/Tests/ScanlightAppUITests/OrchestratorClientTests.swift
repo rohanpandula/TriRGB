@@ -376,4 +376,63 @@ final class OrchestratorClientTests: XCTestCase {
         XCTAssertEqual(state.rollName, "LiveTest")
         XCTAssertTrue(client.isRunning)
     }
+
+    // MARK: - Test 10: waitForReady fails fast when the child exits during startup
+
+    /// Regression: a child that exits early (bad args / missing dep / import error)
+    /// must make waitForReady throw IMMEDIATELY via startupFailed — not poll the
+    /// full timeout. Simulates the child-dead signal the termination handler sets.
+    func testWaitForReadyFailsFastWhenChildExits() async throws {
+        // No /api/state route → the stub would 404; but the childExitStatus check
+        // at the top of the poll loop must short-circuit before any HTTP anyway.
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        client.childExitStatus = 137  // e.g. SIGKILL-style exit
+
+        let started = Date()
+        do {
+            // 10s timeout — but it must NOT take anywhere near that long.
+            try await client.waitForReady(port: 9999, timeout: 10.0)
+            XCTFail("Expected OrchestratorError.startupFailed to be thrown")
+        } catch OrchestratorError.startupFailed(let exitCode, _) {
+            XCTAssertEqual(exitCode, 137, "Expected the child's exit code to surface")
+        } catch {
+            XCTFail("Wrong error type thrown: \(error)")
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertLessThan(elapsed, 1.0,
+                          "waitForReady must fail fast on child exit, not poll the full timeout (took \(elapsed)s)")
+    }
+
+    // MARK: - Test 11: termination handler clears isRunning when the child dies
+
+    /// Regression: a mid-session child crash must flip isRunning back to false so
+    /// the Phase 7 state machine never reads stale port-ownership state. Uses a
+    /// real, instantly-exiting process (`/usr/bin/true`) and the internal
+    /// installTerminationHandler seam — no orchestrator required.
+    func testTerminationHandlerClearsIsRunningOnChildExit() async throws {
+        let truePath = "/usr/bin/true"
+        guard FileManager.default.isExecutableFile(atPath: truePath) else {
+            throw XCTSkip("\(truePath) not available")
+        }
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.isRunning = true  // pretend a successful start()
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: truePath)
+        client.installTerminationHandler(on: proc)
+        try proc.run()
+
+        // Wait up to 2s for the process to exit and the handler to hop to MainActor.
+        let deadline = Date(timeIntervalSinceNow: 2.0)
+        while client.isRunning && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
+        }
+
+        XCTAssertFalse(client.isRunning,
+                       "terminationHandler must clear isRunning when the child exits")
+        XCTAssertNotNil(client.childExitStatus,
+                        "terminationHandler must record the child's exit status")
+    }
 }

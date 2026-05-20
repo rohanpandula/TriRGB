@@ -22,8 +22,13 @@ import Foundation
 // MARK: - Errors
 
 enum OrchestratorError: Error {
-    /// Process started but never responded to /api/state within the timeout.
+    /// Process started but stayed alive without ever responding to /api/state
+    /// within the timeout (hung server).
     case startupTimeout(stderr: String)
+    /// Process exited before becoming ready — the common startup failure
+    /// (bad args, missing Python dep, import error). Carries the exit code and
+    /// whatever the child wrote to stderr (usually the traceback).
+    case startupFailed(exitCode: Int32, stderr: String)
     /// HTTP request succeeded but the status code was unexpected.
     case invalidResponse(statusCode: Int)
     /// HTTP request returned an error status with a body.
@@ -114,6 +119,14 @@ final class OrchestratorClient: ObservableObject {
     private let session: URLSession
     /// Accumulated stderr output from the child process.
     private var stderrData: Data = Data()
+    /// Non-nil once the child process has exited (set by the termination handler).
+    /// Reset to nil at the top of each start(). Lets waitForReady fail fast
+    /// instead of polling the full timeout when the child dies during startup.
+    internal var childExitStatus: Int32?
+    /// True only while stop() is intentionally terminating the child, so the
+    /// termination handler doesn't surface an "exited unexpectedly" error for a
+    /// shutdown we asked for.
+    private var stopping = false
 
     // MARK: Init
 
@@ -140,6 +153,12 @@ final class OrchestratorClient: ObservableObject {
             throw OrchestratorError.toolNotFound("already running — call stop() first")
         }
 
+        // Reset per-launch state so a prior run's exit status / stderr can't leak
+        // into this launch (which would make waitForReady's fast-fail trip spuriously).
+        childExitStatus = nil
+        stderrData = Data()
+        stopping = false
+
         // 1. Locate the tool
         let toolURL: URL
         do {
@@ -159,6 +178,12 @@ final class OrchestratorClient: ObservableObject {
 
         let stderrPipe = Pipe()
         proc.standardError = stderrPipe
+
+        // Detect the child dying for ANY reason — startup crash, or a mid-scan
+        // crash later. Without this, isRunning goes stale on a crash (the Phase 7
+        // state machine reads it for serial-port ownership) and waitForReady polls
+        // the full timeout after a fast startup failure. Must be set before run().
+        installTerminationHandler(on: proc)
 
         // 4. Launch
         try proc.run()
@@ -181,9 +206,15 @@ final class OrchestratorClient: ObservableObject {
         do {
             try await waitForReady(port: port, timeout: 10.0)
         } catch {
-            proc.interrupt()   // SIGTERM
-            try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms grace
-            if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+            // If the child is still alive (hung — never became ready), terminate it
+            // so a retry can't orphan it. If it already exited on its own (startup
+            // crash → startupFailed), the termination handler already cleared
+            // self.process and there is nothing to kill.
+            if proc.isRunning {
+                proc.interrupt()   // SIGTERM
+                try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms grace
+                if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+            }
             self.process = nil
             throw error
         }
@@ -217,9 +248,11 @@ final class OrchestratorClient: ObservableObject {
     /// that crashes mid-session leaves isRunning=true and a stale process handle,
     /// blocking any subsequent start() call permanently.
     func stop() async {
+        stopping = true
         defer {
             isRunning = false
             process = nil
+            stopping = false
         }
         guard let proc = process else { return }
         guard proc.isRunning else { return }
@@ -333,18 +366,61 @@ final class OrchestratorClient: ObservableObject {
         let url = URL(string: "http://127.0.0.1:\(port)/api/state")!
         let deadline = Date(timeIntervalSinceNow: timeout)
         while Date() < deadline {
+            // Fast-fail: if the child has already exited (set by the termination
+            // handler), stop polling immediately rather than waiting out the full
+            // timeout. The common startup failure — bad args, missing Python dep,
+            // import error — exits in ~0.2s; without this the caller hangs `timeout`s.
+            if let exitCode = childExitStatus {
+                let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+                throw OrchestratorError.startupFailed(exitCode: exitCode, stderr: stderrText)
+            }
             do {
                 let (_, response) = try await session.data(from: url)
                 if (response as? HTTPURLResponse)?.statusCode == 200 { return }
             } catch is URLError {
                 // Normal during startup (cannotConnectToHost, networkConnectionLost,
-                // etc.) — retry silently until the timeout deadline
+                // etc.) — retry silently until the timeout deadline. A genuinely dead
+                // child is caught by the childExitStatus check above, not here.
             }
             try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
         }
-        // Timeout: capture any accumulated stderr
+        // Timeout: child stayed alive but never answered. Capture any stderr.
         let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
         throw OrchestratorError.startupTimeout(stderr: stderrText)
+    }
+
+    /// Install a termination handler on `proc` that reactively clears running
+    /// state the moment the child exits — for ANY reason (startup crash, signal,
+    /// or a mid-scan crash long after start() returned).
+    ///
+    /// Internal (not private) so tests can install it on a trivial short-lived
+    /// process and observe the state flip without spawning the real orchestrator.
+    internal func installTerminationHandler(on proc: Process) {
+        proc.terminationHandler = { [weak self] finished in
+            // Read the exit code on the handler's own queue (it owns `finished`),
+            // then hop to the main actor with only a Sendable Int32.
+            let status = finished.terminationStatus
+            Task { @MainActor in
+                self?.handleChildTermination(status: status)
+            }
+        }
+    }
+
+    /// Runs on the main actor when the child process exits. Clears running state
+    /// so a crashed/exited orchestrator can never leave `isRunning` stale — the
+    /// Phase 7 state machine reads `isRunning` to decide serial-port ownership.
+    private func handleChildTermination(status: Int32) {
+        childExitStatus = status
+        process = nil
+        let wasRunning = isRunning
+        isRunning = false
+        // Surface an error only for an UNEXPECTED exit — not a shutdown we asked
+        // for via stop() (which sets `stopping`).
+        if wasRunning && !stopping && status != 0 {
+            let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+            lastError = "orchestrator exited unexpectedly (code \(status))"
+                + (stderrText.isEmpty ? "" : ": " + stderrText)
+        }
     }
 
     // MARK: - Private helpers
