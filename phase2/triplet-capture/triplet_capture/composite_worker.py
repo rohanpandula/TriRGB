@@ -128,7 +128,14 @@ class CompositeWorker:
         self._camera_model = dng_camera_model
         self._executor = executor or ProcessPoolExecutor(max_workers=max_workers)
         self._job_fn = job_fn or _composite_job
-        self._futures: dict[int, Future] = {}
+        # _futures maps frame_number → (generation, Future). The generation
+        # monotonically increases on each submit() for the same frame so a stale
+        # job that was superseded by a retake can detect it is no longer
+        # canonical and skip overwriting the retake's output.
+        self._futures: dict[int, tuple[int, Future]] = {}
+        # Per-frame submission counter. Incremented on every submit() call for
+        # that frame; used as the generation tag attached to the job.
+        self._frame_gen: dict[int, int] = {}
         self._lock = threading.Lock()
         self._closed = False
         # Full history of every collected result, in completion order. Both
@@ -143,33 +150,57 @@ class CompositeWorker:
         # output_format == "dng" (matches batch-composite's _output_path).
         return self._output_dir / f"{self._roll_name}_Frame{frame_number:03d}.tif"
 
+    def _temp_output_path(self, frame_number: int, generation: int) -> Path:
+        """A unique per-submission temp path. The job writes here; _collect
+        promotes it to the canonical path only when the generation still matches.
+        Using a temp + atomic rename prevents the overwrite race where a stale
+        job finishing last silently clobbers the retake's output.
+
+        Note: composite_triplet may adjust the output suffix (e.g. ".tif" →
+        ".dng") based on output_format. The actual written path is returned by
+        the job as out_str, which we use as the source of the rename in
+        _collect(). We use a unique temp name here to avoid collision with the
+        canonical output path when a retake supersedes an in-flight job.
+        """
+        return self._output_dir / f"{self._roll_name}_Frame{frame_number:03d}_g{generation}.tmp.tif"
+
     def submit(self, frame_number: int, files: dict[str, Path]) -> None:
         """Queue a triplet for background compositing. Non-blocking.
 
         `files` must have 'R', 'G', 'B' keys → final RAW paths (the
         TripletResult.files dict from the orchestrator). Re-submitting the
-        same frame_number replaces the prior pending job (last write wins —
-        matters for retakes).
+        same frame_number (retake) cancels the old job's result: whichever
+        job finishes last will only promote its output if it still owns the
+        current generation — so the retake's result always wins.
         """
         for ch in ("R", "G", "B"):
             if ch not in files:
                 raise ValueError(f"submit() needs R/G/B keys; missing {ch!r}")
-        out_path = self._output_path(frame_number)
         with self._lock:
             if self._closed:
                 raise RuntimeError("CompositeWorker is closed; cannot submit")
+            # Bump the generation for this frame. The stale future is left to
+            # run to completion (we cannot reliably cancel a Future that has
+            # already started), but its _collect() call will see that its
+            # generation no longer matches and will discard its output rather
+            # than promoting the temp file over the retake's canonical output.
+            gen = self._frame_gen.get(frame_number, 0) + 1
+            self._frame_gen[frame_number] = gen
+            temp_path = self._temp_output_path(frame_number, gen)
             fut = self._executor.submit(
                 self._job_fn,
                 str(files["R"]),
                 str(files["G"]),
                 str(files["B"]),
-                str(out_path),
+                str(temp_path),      # job writes to a unique temp path
                 self._output_format,
                 str(self._ffc) if self._ffc else None,
                 self._camera_model,
             )
-            self._futures[frame_number] = fut
-        logger.info("queued composite for frame %d → %s", frame_number, out_path.name)
+            self._futures[frame_number] = (gen, fut)
+        logger.info(
+            "queued composite for frame %d gen %d", frame_number, gen
+        )
 
     def poll(self) -> list[CompositeResult]:
         """Return results for jobs finished since the last poll. Non-blocking.
@@ -184,9 +215,13 @@ class CompositeWorker:
         with self._lock:
             done: list[CompositeResult] = []
             for frame_number in list(self._futures.keys()):
-                fut = self._futures[frame_number]
+                gen, fut = self._futures[frame_number]
                 if fut.done():
-                    done.append(self._collect(frame_number, fut))
+                    done.append(self._collect(
+                        frame_number, gen, fut,
+                        self._frame_gen.get(frame_number, gen),
+                        self._output_path(frame_number),
+                    ))
                     del self._futures[frame_number]
             # Record every collected result so a second poll() caller (the
             # capture-loop logger vs /api/composite-status) can't make the other
@@ -200,36 +235,109 @@ class CompositeWorker:
         """
         with self._lock:
             pending = list(self._futures.items())
+            current_gens = dict(self._frame_gen)
+            canonical_paths = {fn: self._output_path(fn) for fn, _ in pending}
             self._futures.clear()
         results: list[CompositeResult] = []
-        for frame_number, fut in pending:
+        for frame_number, (gen, fut) in pending:
             try:
                 fut.result(timeout=timeout)
             except Exception:  # noqa: BLE001 — _collect re-reads the outcome
                 pass
-            results.append(self._collect(frame_number, fut))
+            results.append(self._collect(
+                frame_number, gen, fut,
+                current_gens.get(frame_number, gen),
+                canonical_paths[frame_number],
+            ))
         # End-of-roll results belong in the history too.
         with self._lock:
             self._history.extend(results)
         return results
 
     @staticmethod
-    def _collect(frame_number: int, fut: Future) -> CompositeResult:
+    def _collect(
+        frame_number: int,
+        job_gen: int,
+        fut: Future,
+        current_gen: int,
+        canonical_path: Path,
+    ) -> CompositeResult:
+        """Collect the result of a finished composite job.
+
+        If the job's generation (job_gen) still matches the frame's current
+        generation (current_gen), atomically rename the temp output to the
+        canonical path. If the generation has been superseded (a retake was
+        submitted after this job started), discard the temp output — the
+        retake's job is the canonical one and should not be overwritten.
+
+        This eliminates the retake overwrite race: regardless of completion
+        order, only the most recently submitted job's output survives.
+
+        `canonical_path` has a `.tif` suffix from _output_path(). Because
+        composite_triplet may switch the suffix (e.g. to `.dng` or leave it
+        `.tif`), we derive the final canonical path's suffix from the actual
+        path the job wrote (`out_str`), replacing only the stem component.
+        Concretely: we rename `<stem>_gN.tmp.<ext>` → `<canonical_stem>.<ext>`.
+        """
         try:
             out_str, err = fut.result(timeout=0)
         except Exception as exc:  # noqa: BLE001 — worker process died hard
             return CompositeResult(frame_number, None, f"{type(exc).__name__}: {exc}")
         if err is not None:
-            logger.warning("composite frame %d failed: %s", frame_number, err)
+            logger.warning("composite frame %d gen %d failed: %s", frame_number, job_gen, err)
             return CompositeResult(frame_number, None, err)
-        logger.info("composite frame %d complete: %s", frame_number, out_str)
-        return CompositeResult(frame_number, Path(out_str) if out_str else None, None)
+
+        if out_str is None:
+            return CompositeResult(frame_number, None, "worker returned None output path")
+
+        # The path the job actually wrote to (the temp path, possibly with a
+        # suffix adjusted by composite_triplet, e.g. ".dng" or ".tif").
+        actual_temp_path = Path(out_str)
+
+        if job_gen != current_gen:
+            # This job has been superseded by a retake. Discard its temp output
+            # so we never overwrite the retake's canonical file.
+            logger.info(
+                "composite frame %d gen %d superseded by gen %d — discarding temp output",
+                frame_number, job_gen, current_gen,
+            )
+            try:
+                actual_temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # Report as superseded (not an error — the retake job will win).
+            return CompositeResult(
+                frame_number, None,
+                f"superseded by retake (gen {job_gen} → {current_gen})",
+            )
+
+        # This is still the canonical generation — atomically promote the temp
+        # file to the canonical output path. Derive the final canonical path
+        # from the suffix of the actual temp output (composite_triplet may
+        # have changed ".tif" → ".dng" based on output_format).
+        final_canonical = canonical_path.with_suffix(actual_temp_path.suffix)
+        try:
+            actual_temp_path.replace(final_canonical)
+        except OSError as exc:
+            return CompositeResult(frame_number, None, f"rename failed: {exc}")
+
+        logger.info(
+            "composite frame %d gen %d complete: %s",
+            frame_number, job_gen, final_canonical,
+        )
+        return CompositeResult(frame_number, final_canonical, None)
 
     @property
     def pending(self) -> int:
         """Number of submitted-but-not-yet-collected jobs."""
         with self._lock:
             return len(self._futures)
+
+    def _current_gen(self, frame_number: int) -> int:
+        """Return the current generation for a frame (used by _collect to check
+        whether a job has been superseded since it was submitted)."""
+        with self._lock:
+            return self._frame_gen.get(frame_number, 0)
 
     @property
     def history(self) -> list[CompositeResult]:

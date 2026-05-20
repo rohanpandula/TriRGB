@@ -12,9 +12,15 @@ child processes re-import the original module and a monkeypatch/closure
 would be invisible. Process isolation itself is a property of
 ProcessPoolExecutor, well-tested by CPython; our job is the orchestration
 logic, which behaves identically across executor types.)
+
+Retake overwrite regression coverage:
+  test_retake_wins_regardless_of_completion_order — proves that when a frame
+  is submitted twice (retake), the retake's output wins even when the original
+  job finishes last (i.e. after the retake).
 """
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -232,3 +238,155 @@ def test_orchestrator_hook_failure_does_not_abort_capture(tmp_path):
     # Capture still succeeds despite the hook throwing.
     assert res.success
     assert res.frame_number == 1
+
+
+# ---------- retake overwrite regression (Phase 07 fix) ----------
+
+def test_retake_wins_regardless_of_completion_order(tmp_path):
+    """Regression: when frame 1 is submitted twice (original + retake), the
+    retake's output must be the final canonical file — regardless of which job
+    finishes last.
+
+    This test exercises the worst case: the ORIGINAL job finishes AFTER the
+    RETAKE (i.e. the stale job races ahead and completes last). Before the
+    Phase 07 fix, the original job's output would silently overwrite the retake.
+
+    Design of the fix: each submit() assigns a unique temp output path (per
+    generation). The job writes to this unique temp path. On _collect(), we
+    check whether the job's generation still matches the frame's current
+    generation; if not, the temp output is discarded (unlinkined) rather than
+    promoted to the canonical path. This means: only the most recently submitted
+    job's output ever lands at the canonical path.
+
+    Because submit() replaces _futures[frame_number] with the retake's future
+    (the old future is now "orphaned" — it runs but is not tracked in
+    _futures), drain() only collects the retake result (1 result, not 2). The
+    stale original job completes in the background but its _collect call is
+    never invoked by drain/poll — it just writes a unique temp path and that
+    path is never promoted. The canonical output has the retake's content.
+
+    Mechanism: inject a synchronized fake job. The original (gen 1) blocks on
+    retake_done before writing, so we can verify the canonical content after
+    the retake has promoted its output and the original has run but not
+    overwritten it.
+    """
+    out_dir = tmp_path / "composites"
+    out_dir.mkdir()
+
+    ORIGINAL_CONTENT = b"ORIGINAL-STALE-OUTPUT"
+    RETAKE_CONTENT = b"RETAKE-CANONICAL-OUTPUT"
+
+    # The original job blocks here until the retake is done.
+    retake_promoted = threading.Event()
+    original_started = threading.Event()
+
+    def controlled_job(r, g, b, out, fmt, ffc, model):
+        """Fake job that signals and synchronizes via events so we can control
+        completion order precisely."""
+        p = Path(out)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if "_g1_" in r:
+            # Original (gen 1): signal we started, then wait until the retake
+            # has already been promoted to the canonical path before writing our
+            # stale content to our unique temp path.
+            original_started.set()
+            retake_promoted.wait(timeout=10)
+            p.write_bytes(ORIGINAL_CONTENT)
+            return (str(p), None)
+        else:
+            # Retake (gen 2): write immediately and signal that we're done.
+            p.write_bytes(RETAKE_CONTENT)
+            retake_promoted.set()
+            return (str(p), None)
+
+    def tagged_triplet(frame: int, tag: str) -> dict[str, Path]:
+        """Create fake ARW paths embedding the tag so controlled_job knows which gen."""
+        files = {}
+        for ch in ("R", "G", "B"):
+            p = tmp_path / f"Roll001_Frame{frame:03d}_{tag}_{ch}.ARW"
+            p.write_bytes(b"FAKE-ARW")
+            files[ch] = p
+        return files
+
+    worker = CompositeWorker(
+        out_dir,
+        "Roll001",
+        executor=ThreadPoolExecutor(max_workers=2),
+        job_fn=controlled_job,
+        output_format="tiff",
+    )
+
+    # Submit original (gen 1) — it will block until the retake is promoted.
+    worker.submit(1, tagged_triplet(1, "g1"))
+    # Wait until the original has started running (so both are in-flight).
+    original_started.wait(timeout=10)
+
+    # Submit retake (gen 2) — this replaces the original in _futures.
+    worker.submit(1, tagged_triplet(1, "g2"))
+
+    # Drain collects only the retake's future (the original's future was
+    # replaced in _futures by the retake submit). The original runs in the
+    # background (unblocked by retake_promoted) and writes to its unique temp
+    # path — but _collect() is never called for it by drain, and its temp path
+    # was not promoted (no rename → canonical).
+    results = worker.drain(timeout=10)
+    worker.shutdown(wait=True)  # Let the orphaned original job finish.
+
+    # The canonical path (what drain() / _collect promotes the retake to).
+    canonical = out_dir / "Roll001_Frame001.tif"
+
+    # drain() returns exactly 1 result — the retake's (original was orphaned).
+    assert len(results) == 1, f"expected 1 result from drain(), got {len(results)}: {results}"
+
+    retake_result = results[0]
+    assert retake_result.ok, f"retake result should be ok, got {retake_result}"
+    assert retake_result.output_path == canonical, (
+        f"retake result should point to canonical path {canonical}, "
+        f"got {retake_result.output_path}"
+    )
+
+    # The canonical file must contain the RETAKE content (not the original's stale content).
+    assert canonical.exists(), "canonical output file must exist after retake"
+    content = canonical.read_bytes()
+    assert content == RETAKE_CONTENT, (
+        f"canonical file must contain retake content {RETAKE_CONTENT!r}, "
+        f"got {content!r} — original stale content would be {ORIGINAL_CONTENT!r}"
+    )
+
+    # No stale temp files should remain (the original's orphaned temp file
+    # was written to a unique path with gen-1 suffix, not the canonical path).
+    # The original's temp file IS written (because its job completed), but it
+    # was not renamed to the canonical path. Verify canonical is clean.
+    stale_content_present = canonical.read_bytes() == ORIGINAL_CONTENT
+    assert not stale_content_present, "canonical file must not contain stale original content"
+
+
+def test_normal_submit_no_retake_still_works(tmp_path):
+    """Sanity check: a single submit (no retake) produces the canonical output
+    with the correct content. Ensures the generation machinery doesn't break
+    the happy path."""
+    out_dir = tmp_path / "composites"
+    EXPECTED = b"NORMAL-OUTPUT"
+
+    def job(r, g, b, out, fmt, ffc, model):
+        p = Path(out)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(EXPECTED)
+        return (str(p), None)
+
+    worker = CompositeWorker(
+        out_dir,
+        "Roll001",
+        executor=ThreadPoolExecutor(max_workers=1),
+        job_fn=job,
+        output_format="tiff",
+    )
+    worker.submit(1, _make_triplet(tmp_path, 1))
+    results = worker.drain(timeout=10)
+    worker.shutdown()
+
+    assert len(results) == 1
+    assert results[0].ok, f"expected ok result, got {results[0]}"
+    canonical = out_dir / "Roll001_Frame001.tif"
+    assert canonical.exists()
+    assert canonical.read_bytes() == EXPECTED
