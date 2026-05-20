@@ -146,24 +146,23 @@ class CompositeWorker:
         same frame_number replaces the prior pending job (last write wins —
         matters for retakes).
         """
-        if self._closed:
-            raise RuntimeError("CompositeWorker is closed; cannot submit")
         for ch in ("R", "G", "B"):
             if ch not in files:
                 raise ValueError(f"submit() needs R/G/B keys; missing {ch!r}")
-
         out_path = self._output_path(frame_number)
-        fut = self._executor.submit(
-            self._job_fn,
-            str(files["R"]),
-            str(files["G"]),
-            str(files["B"]),
-            str(out_path),
-            self._output_format,
-            str(self._ffc) if self._ffc else None,
-            self._camera_model,
-        )
         with self._lock:
+            if self._closed:
+                raise RuntimeError("CompositeWorker is closed; cannot submit")
+            fut = self._executor.submit(
+                self._job_fn,
+                str(files["R"]),
+                str(files["G"]),
+                str(files["B"]),
+                str(out_path),
+                self._output_format,
+                str(self._ffc) if self._ffc else None,
+                self._camera_model,
+            )
             self._futures[frame_number] = fut
         logger.info("queued composite for frame %d → %s", frame_number, out_path.name)
 
