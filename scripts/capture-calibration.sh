@@ -51,10 +51,12 @@ LEVEL_B=200
 
 # Argument parsing — supports --force / -f and per-channel level overrides.
 FORCE=0
+NO_CONFIRM=0
 TARGET=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --force|-f) FORCE=1 ; shift ;;
+        --no-confirm) NO_CONFIRM=1 ; shift ;;
         --help|-h)
             grep -E '^# ' "$0" | head -50 | sed 's/^# \{0,1\}//'
             exit 0
@@ -127,6 +129,8 @@ mkdir -p "$TARGET"
 
 # Operator confirmation. FFC capture with FILM in the holder gives you a
 # garbage calibration that you won't notice until conversions come out wrong.
+# Skipped when --no-confirm is passed (GUI / non-interactive invocation).
+if [[ "$NO_CONFIRM" -eq 0 ]]; then
 cat <<'EOF'
 
 ╔════════════════════════════════════════════════════════════════╗
@@ -149,6 +153,7 @@ if [[ "$CONFIRM" != "blank" ]]; then
     exit 3
 fi
 echo
+fi
 
 # Plausible RAW size band (matches PROJECT.md / smoketest.sh).
 MIN_BYTES=$((40 * 1024 * 1024))
