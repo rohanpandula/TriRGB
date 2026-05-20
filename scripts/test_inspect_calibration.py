@@ -398,3 +398,51 @@ def test_main_json_shape_has_required_keys(tmp_path, monkeypatch, capsys):
     for ch in ("R", "G", "B"):
         ch_data = data["channels"][ch]
         assert set(ch_data.keys()) == {"falloff_pct", "uniformity_pct", "verdict"}
+
+
+def test_json_overall_matches_classify_for_tint_drift(tmp_path, monkeypatch, capsys):
+    """WR-01 regression: JSON overall must equal classify() even when tint drift
+    triggers a FAIL but no individual channel exceeds per-channel fail thresholds.
+
+    Example: R=2%, G=2%, B=20% falloff — each channel verdict is "clean" or
+    "acceptable" individually, but classify() returns FAIL (rc=1) because
+    tint_drift = 18% > TINT_DRIFT_BAD_PCT (10%). The JSON overall must be "fail".
+    """
+    cal = tmp_path / "cal"
+    cal.mkdir()
+    for name in ("R.ARW", "G.ARW", "B.ARW"):
+        (cal / name).write_bytes(b"\x00")
+
+    def fake_demosaic_tint_drift(path):
+        """R center=40000,corner~39200 (~2% falloff); G similar; B center=40000,corner~32000 (~20% falloff)."""
+        img = np.zeros((H, W, 3), dtype=np.uint16)
+        stem = Path(path).stem.upper()
+        ch = {"R": 0, "G": 1, "B": 2}[stem]
+        if stem == "B":
+            # ~20% falloff — individually "acceptable" but causes tint drift ~18%
+            img[..., ch] = _vignetted(center=40000, corner=32000)
+        else:
+            # ~2% falloff — individually "clean"
+            img[..., ch] = _vignetted(center=40000, corner=39200)
+        return img
+
+    monkeypatch.setattr(inspect_calibration, "_load_demosaic", fake_demosaic_tint_drift)
+
+    rc = inspect_calibration.main([str(cal), "--json"])
+    out = capsys.readouterr().out
+    data = json.loads(out)
+
+    # classify() returns rc=1 for tint drift > 10%; JSON overall must agree.
+    assert rc == 1, f"Expected rc=1 for severe tint drift, got rc={rc}"
+    assert data["overall"] == "fail", (
+        f"JSON overall must be 'fail' when classify() returns rc=1 (tint drift), "
+        f"got '{data['overall']}'. Per-channel: {data['channels']}"
+    )
+
+    # Verify the individual per-channel verdicts are NOT all "fail" — this confirms
+    # the FAIL is coming from classify()'s tint-drift gate, not individual channels.
+    per_channel_verdicts = [v["verdict"] for v in data["channels"].values()]
+    assert "fail" not in per_channel_verdicts, (
+        f"No individual channel should be 'fail' in this tint-drift scenario, "
+        f"got {per_channel_verdicts}"
+    )

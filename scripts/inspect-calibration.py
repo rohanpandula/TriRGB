@@ -363,11 +363,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "uniformity_pct": round(s.uniformity_pct, 2),
                 "verdict": _channel_verdict(s),
             }
-        verdicts = [v["verdict"] for v in channel_results.values()]
-        overall = "fail" if "fail" in verdicts else ("acceptable" if "acceptable" in verdicts else "clean")
+        # Use classify() for overall — it includes the cross-channel tint-drift gate
+        # that _channel_verdict() cannot evaluate in isolation (WR-01). Per-channel
+        # verdicts above stay per-channel; overall must match the authoritative
+        # classify() result so the JSON and the text report never disagree.
+        _, json_rc = classify(stats)
+        overall = "fail" if json_rc == 1 else (
+            "acceptable" if any(v["verdict"] == "acceptable" for v in channel_results.values())
+            else "clean"
+        )
         import json
         print(json.dumps({"channels": channel_results, "overall": overall}))
-        return 1 if overall == "fail" else 0
+        return json_rc
 
     print(f"Calibration directory: {args.cal_dir}")
     print()
