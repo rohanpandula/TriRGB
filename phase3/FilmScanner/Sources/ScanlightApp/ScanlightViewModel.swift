@@ -53,6 +53,18 @@ final class ScanlightViewModel: ObservableObject {
     /// Log lines, newest first; capped at 200 entries.
     @Published var logLines: [String] = []
 
+    // MARK: - Port-ownership guard (Phase 07)
+
+    /// Set by ScanCoordinator when transitioning into/out of a scan. When not
+    /// .idle, manual light actions (connect/disconnect/setChannel/pulse) are
+    /// rejected with a clear error rather than racing the orchestrator for the
+    /// serial port (which would cause a double-open and corrupt scans silently).
+    ///
+    /// ScanCoordinator is the ONLY writer of this property. The guard is
+    /// intentionally minimal: it does not prevent disconnect() (which
+    /// ScanCoordinator calls deliberately when starting a scan).
+    var portOwner: PortOwner = .idle
+
     // MARK: - Init
 
     init(transportFactory: @escaping () -> Result<ScanlightTransport, Error>) {
@@ -103,42 +115,49 @@ final class ScanlightViewModel: ObservableObject {
     }
 
     func turnOnRed() {
+        guard guardPortOwner("turnOnRed") else { return }
         attempt("turnOnRed") {
             try scanlight?.setColor(r: Int(redLevel))
         }
     }
 
     func turnOnGreen() {
+        guard guardPortOwner("turnOnGreen") else { return }
         attempt("turnOnGreen") {
             try scanlight?.setColor(g: Int(greenLevel))
         }
     }
 
     func turnOnBlue() {
+        guard guardPortOwner("turnOnBlue") else { return }
         attempt("turnOnBlue") {
             try scanlight?.setColor(b: Int(blueLevel))
         }
     }
 
     func turnOnWhite() {
+        guard guardPortOwner("turnOnWhite") else { return }
         attempt("turnOnWhite") {
             try scanlight?.setColor(w: Int(whiteLevel))
         }
     }
 
     func allOff() {
+        guard guardPortOwner("allOff") else { return }
         attempt("allOff") {
             try scanlight?.off()
         }
     }
 
     func setAllRGB() {
+        guard guardPortOwner("setAllRGB") else { return }
         attempt("setAllRGB") {
             try scanlight?.setColor(r: Int(redLevel), g: Int(greenLevel), b: Int(blueLevel))
         }
     }
 
     func firePulse() {
+        guard guardPortOwner("firePulse") else { return }
         guard let ms = Int(pulseMs),
               (10...2550).contains(ms),
               ms % 10 == 0 else {
@@ -159,6 +178,19 @@ final class ScanlightViewModel: ObservableObject {
 
     private let transportFactory: () -> Result<ScanlightTransport, Error>
     private var scanlight: Scanlight?
+
+    /// Returns false and sets lastError when the port is owned by the scanner.
+    /// Exported as `internal` so ScanCoordinatorTests can call it directly to
+    /// verify the guard rejects actions during a scan without launching the app.
+    @discardableResult
+    internal func guardPortOwner(_ action: String) -> Bool {
+        guard portOwner == .idle else {
+            lastError = "\(action) rejected: port is controlled by active scan"
+            log("error \(action): rejected — portOwner=\(portOwner)")
+            return false
+        }
+        return true
+    }
 
     private func refreshTelemetry() {
         ledTempString = scanlight?.lastTempC.map { String(format: "%.2f °C", $0) } ?? "—"

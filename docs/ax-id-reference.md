@@ -89,6 +89,20 @@ the Swift enum agree.
 | lbl-cal-overall | Overall verdict | label |
 | btn-use-calibration | Use this calibration | button |
 
+### Scan (Phase 07)
+
+| ID constant | Display label | Type/control |
+|---|---|---|
+| btn-start-scan | Start Scan | button |
+| btn-stop-scan | Stop Scan | button |
+| btn-capture-frame | Capture Frame | button |
+| btn-retake-frame | Retake | button |
+| lbl-frame-counter | Frame counter | label |
+| list-frame-status | Frame status list | list |
+| lbl-composite-queue | Composite queue depth | label |
+| lbl-light-locked | Light locked (controlled by scan) | label |
+| btn-reconnect-light | Reconnect Light | button |
+
 To add a new AX-ID, add the constant to `AccessibilityIDs.swift` first, then
 add a row here. The consistency-check script
 (`scripts/check_docs_consistency.py`, or

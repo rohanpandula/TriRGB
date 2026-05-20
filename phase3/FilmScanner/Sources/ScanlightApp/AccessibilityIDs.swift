@@ -96,4 +96,16 @@ public enum AccessibilityID {
     public static let calVerdictB                = "lbl-cal-verdict-b"
     public static let calOverallLabel            = "lbl-cal-overall"
     public static let calUseBtn                  = "btn-use-calibration"
+
+    // MARK: - Scan view (Phase 07)
+
+    public static let scanStartBtn               = "btn-start-scan"
+    public static let scanStopBtn                = "btn-stop-scan"
+    public static let scanCaptureFrameBtn        = "btn-capture-frame"
+    public static let scanRetakeBtn              = "btn-retake-frame"
+    public static let scanFrameCounterLabel      = "lbl-frame-counter"
+    public static let scanFrameStatusList        = "list-frame-status"
+    public static let scanCompositeQueueLabel    = "lbl-composite-queue"
+    public static let scanLightLockedLabel       = "lbl-light-locked"
+    public static let scanReconnectLightBtn      = "btn-reconnect-light"
 }
