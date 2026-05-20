@@ -92,6 +92,12 @@ struct CompositeStatus: Codable {
     var results: [CompositeEntry]?
 }
 
+/// Minimal decode of GET /api/state used only by waitForReady to confirm the
+/// responding server is the child we spawned (it echoes our --ready-nonce).
+private struct ReadyProbe: Codable {
+    var readyNonce: String?
+}
+
 // MARK: - OrchestratorClient
 
 /// Manages the lifetime of a `triplet-capture` child process and exposes its
@@ -180,13 +186,16 @@ final class OrchestratorClient: ObservableObject {
             throw OrchestratorError.toolNotFound(msg)
         }
 
-        // 2. Free port
+        // 2. Free port + a readiness nonce. The nonce lets waitForReady reject a
+        // foreign server that grabbed the port in the bind-probe TOCTOU gap — only
+        // the child we spawned echoes this token back on /api/state.
         let port = findFreePort(fallback: 8765)
+        let readyNonce = UUID().uuidString
 
         // 3. Build process
         let proc = Process()
         proc.executableURL = toolURL
-        proc.arguments = buildArgs(settings: settings, port: port)
+        proc.arguments = buildArgs(settings: settings, port: port, readyNonce: readyNonce)
         proc.environment = ProcessInfo.processInfo.environment
 
         let stderrPipe = Pipe()
@@ -219,7 +228,7 @@ final class OrchestratorClient: ObservableObject {
         // Without this, a failed start() leaves a live child process with no
         // handle to terminate it, and a retry would spawn a second one.
         do {
-            try await waitForReady(port: port, timeout: 10.0)
+            try await waitForReady(port: port, timeout: 10.0, expectedNonce: readyNonce)
         } catch {
             // Tear down THIS launch's child (scoped — never the generic stop(),
             // which acts on the current process and would kill a newer launch's
@@ -429,9 +438,11 @@ final class OrchestratorClient: ObservableObject {
     /// - All other errors are propagated immediately.
     /// - Marked `internal` (not `private`) so tests can invoke it directly with a
     ///   short timeout (e.g. 0.5 s) without spawning a real child process.
-    internal func waitForReady(port: Int, timeout: TimeInterval) async throws {
+    internal func waitForReady(port: Int, timeout: TimeInterval, expectedNonce: String) async throws {
         let url = URL(string: "http://127.0.0.1:\(port)/api/state")!
         let deadline = Date(timeIntervalSinceNow: timeout)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
         while Date() < deadline {
             // Honor cancellation promptly (e.g. the scan was aborted mid-startup)
             // instead of spinning to the timeout.
@@ -445,8 +456,16 @@ final class OrchestratorClient: ObservableObject {
                 throw OrchestratorError.startupFailed(exitCode: exitCode, stderr: stderrText)
             }
             do {
-                let (_, response) = try await session.data(from: url)
-                if (response as? HTTPURLResponse)?.statusCode == 200 { return }
+                let (data, response) = try await session.data(from: url)
+                // Ready only when our spawned child answers 200 AND echoes the
+                // matching nonce. A foreign server that grabbed the port in the
+                // bind-probe TOCTOU gap won't know the nonce, so we keep polling
+                // (until the real child binds and answers, or the deadline elapses).
+                if (response as? HTTPURLResponse)?.statusCode == 200,
+                   let probe = try? decoder.decode(ReadyProbe.self, from: data),
+                   probe.readyNonce == expectedNonce {
+                    return
+                }
             } catch let urlError as URLError {
                 // A cancelled request means start() itself was cancelled — propagate.
                 if urlError.code == .cancelled { throw CancellationError() }
@@ -518,12 +537,13 @@ final class OrchestratorClient: ObservableObject {
     ///
     /// IMPORTANT: This always returns a `[String]` array — NEVER a shell string.
     /// `Process.arguments` does not use a shell, so there is no injection surface (T-05-04).
-    private func buildArgs(settings: ScanSettings, port: Int) -> [String] {
+    private func buildArgs(settings: ScanSettings, port: Int, readyNonce: String) -> [String] {
         var args: [String] = [
             "--roll-name",      settings.rollName,
             "--output-folder",  settings.outputFolder,  // BASE folder; Python appends /rollName
             "--trigger-mode",   settings.triggerMode,
             "--web-port",       "\(port)",
+            "--ready-nonce",    readyNonce,
             "--no-browser",
         ]
         if let inbox = settings.iedInbox {

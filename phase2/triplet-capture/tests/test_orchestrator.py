@@ -289,6 +289,26 @@ def test_flask_routes(settings, tmp_path):
     assert body["next_frame"] == 2
 
 
+def test_ready_nonce_echoed_on_state(settings):
+    """GET /api/state echoes the --ready-nonce so the Swift launcher can confirm
+    it's talking to the orchestrator it spawned (not a foreign server that grabbed
+    the port). Empty string when no nonce was provided."""
+    from triplet_capture.app import create_app
+    light = FakeScanlight()
+    runner, _ = make_runner()
+    orch = Orchestrator(light, settings, sony_capture_runner=runner, sleep=_zero_sleep)
+
+    # With a nonce: echoed verbatim.
+    app = create_app(orch, ready_nonce="nonce-xyz-123")
+    body = app.test_client().get("/api/state").get_json()
+    assert body["ready_nonce"] == "nonce-xyz-123"
+
+    # Without a nonce: empty string (not missing — the field is always present).
+    app2 = create_app(orch)
+    body2 = app2.test_client().get("/api/state").get_json()
+    assert body2["ready_nonce"] == ""
+
+
 def test_flask_invalid_settings_returns_400(settings):
     from triplet_capture.app import create_app
     light = FakeScanlight()

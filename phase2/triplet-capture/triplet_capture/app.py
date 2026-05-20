@@ -18,7 +18,7 @@ from scanlight import Scanlight
 from .orchestrator import CaptureSettings, Orchestrator
 
 
-def create_app(orchestrator: Orchestrator, composite_worker=None) -> Flask:
+def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: str = "") -> Flask:
     """Build the Flask app around a pre-built Orchestrator.
 
     Passing the orchestrator in (rather than constructing inside) makes
@@ -34,7 +34,12 @@ def create_app(orchestrator: Orchestrator, composite_worker=None) -> Flask:
 
     @app.get("/api/state")
     def get_state():
-        return jsonify(_settings_dict(orchestrator.settings))
+        # ready_nonce lets the Swift launcher confirm it's talking to THIS spawned
+        # orchestrator — not a foreign server that grabbed the port in the bind
+        # probe's TOCTOU window. Empty string when launched without --ready-nonce.
+        state = _settings_dict(orchestrator.settings)
+        state["ready_nonce"] = ready_nonce
+        return jsonify(state)
 
     @app.post("/api/settings")
     def post_settings():
@@ -127,6 +132,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--port", help="Scanlight serial port (auto-discovered by default).")
     p.add_argument("--host", default="127.0.0.1", help="Bind address for the web UI.")
     p.add_argument("--web-port", type=int, default=8765)
+    p.add_argument(
+        "--ready-nonce",
+        default="",
+        help=(
+            "Opaque token echoed on GET /api/state as ready_nonce. The Swift "
+            "launcher passes a random value and only treats the server as ready "
+            "when it sees the matching token — so a foreign server that grabbed "
+            "the port in the launcher's bind-probe gap can't falsely satisfy readiness."
+        ),
+    )
     p.add_argument(
         "--trigger-mode",
         choices=("sdk", "hw"),
@@ -306,7 +321,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         orch = Orchestrator(scanlight, settings, on_triplet_complete=on_triplet_complete)
-        app = create_app(orch, composite_worker=composite_worker)
+        app = create_app(orch, composite_worker=composite_worker, ready_nonce=args.ready_nonce)
         print(f"triplet-capture: web UI on http://{args.host}:{args.web_port}",
               file=sys.stderr)
         if args.no_browser:

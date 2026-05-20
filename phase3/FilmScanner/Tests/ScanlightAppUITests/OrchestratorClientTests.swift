@@ -272,7 +272,7 @@ final class OrchestratorClientTests: XCTestCase {
         client.webPort = 9999
 
         do {
-            try await client.waitForReady(port: 9999, timeout: 0.5)
+            try await client.waitForReady(port: 9999, timeout: 0.5, expectedNonce: "test-nonce")
             XCTFail("Expected OrchestratorError.startupTimeout to be thrown")
         } catch OrchestratorError.startupTimeout(let stderr) {
             // Pass: timeout fired correctly.
@@ -392,7 +392,7 @@ final class OrchestratorClientTests: XCTestCase {
         let started = Date()
         do {
             // 10s timeout — but it must NOT take anywhere near that long.
-            try await client.waitForReady(port: 9999, timeout: 10.0)
+            try await client.waitForReady(port: 9999, timeout: 10.0, expectedNonce: "test-nonce")
             XCTFail("Expected OrchestratorError.startupFailed to be thrown")
         } catch OrchestratorError.startupFailed(let exitCode, _) {
             XCTAssertEqual(exitCode, 137, "Expected the child's exit code to surface")
@@ -514,5 +514,48 @@ final class OrchestratorClientTests: XCTestCase {
                      "applyRuntimeSettings must NOT post output_folder (would revert the roll subfolder)")
         XCTAssertNil(decoded["roll_name"],
                      "applyRuntimeSettings must NOT post roll_name")
+    }
+
+    // MARK: - Test 14: waitForReady accepts the matching readiness nonce
+
+    /// The orchestrator we spawned echoes our --ready-nonce on /api/state;
+    /// waitForReady treats a 200 + matching nonce as ready.
+    func testWaitForReadyAcceptsMatchingNonce() async throws {
+        let nonce = "abc-123-ready-nonce"
+        let json = """
+        {"roll_name":"R","frame_number":1,"output_folder":"/tmp","level_r":200,"level_g":200,"level_b":200,"settle_ms":50,"ready_nonce":"\(nonce)"}
+        """.data(using: .utf8)!
+        StubURLProtocol.routes["/api/state"] = (json, 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        // Must return (ready) without throwing — the nonce matches.
+        try await client.waitForReady(port: 9999, timeout: 2.0, expectedNonce: nonce)
+    }
+
+    // MARK: - Test 15: waitForReady rejects a foreign server with a non-matching nonce
+
+    /// Regression for the bind-probe TOCTOU: a DIFFERENT localhost server that
+    /// grabbed the port answers 200 on /api/state but does not know our nonce.
+    /// waitForReady must NOT treat it as ready — it keeps polling until timeout.
+    func testWaitForReadyRejectsForeignServerNonce() async throws {
+        let foreign = """
+        {"roll_name":"R","frame_number":1,"output_folder":"/tmp","level_r":200,"level_g":200,"level_b":200,"settle_ms":50,"ready_nonce":"someone-elses-nonce"}
+        """.data(using: .utf8)!
+        StubURLProtocol.routes["/api/state"] = (foreign, 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        do {
+            try await client.waitForReady(port: 9999, timeout: 0.5, expectedNonce: "my-real-nonce")
+            XCTFail("waitForReady must NOT treat a foreign server (wrong nonce) as ready")
+        } catch OrchestratorError.startupTimeout {
+            // Expected: the nonce never matched, so it timed out instead of
+            // declaring a foreign server ready (no false readiness).
+        } catch {
+            XCTFail("Wrong error type: \(error)")
+        }
     }
 }
