@@ -57,7 +57,8 @@ def create_app(orchestrator: Orchestrator, composite_worker=None) -> Flask:
 
     @app.post("/api/capture")
     def post_capture():
-        retake = bool(request.args.get("retake"))
+        retake_str = request.args.get("retake", "")
+        retake = retake_str.lower() in ("1", "true", "yes")
         result = orchestrator.capture_triplet(retake=retake)
         return jsonify({
             "success": result.success,

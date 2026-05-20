@@ -229,10 +229,15 @@ final class OrchestratorClient: ObservableObject {
 
     /// Trigger a triplet capture.
     ///
-    /// `retake` is appended as a URL query parameter (`?retake=true`/`?retake=false`),
-    /// NOT as a JSON body field. The Python route reads `request.args.get("retake")`.
+    /// `retake` is appended as a URL query parameter (`?retake=true`) only when
+    /// `retake == true`. When false, the param is omitted entirely so the Python
+    /// route's explicit string check (`in ("1", "true", "yes")`) treats absence
+    /// as non-retake — robust against the `bool("false") == True` Python pitfall.
     func captureFrame(retake: Bool) async throws -> TripletOutcome {
-        let url = URL(string: "http://127.0.0.1:\(webPort)/api/capture?retake=\(retake)")!
+        let urlStr = retake
+            ? "http://127.0.0.1:\(webPort)/api/capture?retake=true"
+            : "http://127.0.0.1:\(webPort)/api/capture"
+        let url = URL(string: urlStr)!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         // Empty body — retake is a query param only
