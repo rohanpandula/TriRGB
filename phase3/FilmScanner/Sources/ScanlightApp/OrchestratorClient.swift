@@ -192,6 +192,21 @@ final class OrchestratorClient: ObservableObject {
         isRunning = true
         webPort = port
         lastError = ""
+
+        // 8. Push full settings (levelR/G/B, settleMs, etc.) to the orchestrator
+        // immediately so any capture that fires right after start() uses the
+        // caller's values rather than the Python dataclass defaults (200/200/200,
+        // 50 ms). buildArgs() intentionally omits these fields at spawn time;
+        // this call closes the "capture-before-updateSettings uses defaults" window.
+        do {
+            try await updateSettings(settings)
+        } catch {
+            // Settings push failed — orchestrator is up but misconfigured.
+            // Shut down cleanly rather than leaving the caller with a running
+            // process that silently ignores the requested levels.
+            await stop()
+            throw error
+        }
     }
 
     /// Send SIGTERM to the child process and wait up to 3 seconds for graceful
