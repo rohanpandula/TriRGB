@@ -13,6 +13,7 @@ with stubs. We verify:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -674,3 +675,77 @@ def test_capture_triplet_turns_scanlight_off_even_on_unexpected_exception(tmp_pa
     assert any(c[0] == "off" for c in light.calls), (
         "scanlight.off() must run even on uncaught exception"
     )
+
+
+# ---------- ephemeral port + port-file (child-owned port selection) ----------
+
+def test_ephemeral_port_binds_and_writes_port_file(tmp_path):
+    """With --web-port 0 + --port-file <tmp>, the server binds an OS-assigned
+    ephemeral port and writes a valid non-zero integer to the port-file
+    atomically before serving.
+
+    Strategy: start the werkzeug server in a background thread, poll the
+    port-file until it appears (or a short deadline), assert the port is
+    valid, then shut the server down cleanly via server.shutdown().
+    """
+    import threading
+    import time
+    from werkzeug.serving import make_server as _make_server
+
+    from triplet_capture.app import create_app
+    from triplet_capture.orchestrator import CaptureSettings, Orchestrator
+
+    port_file = tmp_path / "bound.port"
+
+    light = FakeScanlight()
+    settings = CaptureSettings(
+        roll_name="Roll001",
+        frame_number=1,
+        output_folder=tmp_path,
+        settle_ms=0,
+    )
+    orch = Orchestrator(light, settings, sony_capture_runner=lambda *a: 0, sleep=_zero_sleep)
+    app = create_app(orch)
+
+    # Replicate the main() ephemeral-port logic in isolation:
+    # bind to port 0, write port-file atomically, then serve_forever in a thread.
+    server = _make_server("127.0.0.1", 0, app, threaded=True)
+    bound_port = server.server_port
+
+    tmp_port_path = str(port_file) + ".tmp"
+    with open(tmp_port_path, "w") as f:
+        f.write(str(bound_port))
+    os.replace(tmp_port_path, str(port_file))
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    try:
+        # Poll the port-file (it was already written before serve_forever, but
+        # exercise the read path the same way the Swift launcher would).
+        deadline = time.monotonic() + 5.0
+        read_port = None
+        while time.monotonic() < deadline:
+            if port_file.exists():
+                raw = port_file.read_text().strip()
+                if raw.isdigit():
+                    read_port = int(raw)
+                    break
+            time.sleep(0.05)
+
+        assert read_port is not None, "port-file was never written or is non-integer"
+        assert read_port > 0, f"port must be positive, got {read_port}"
+        assert read_port == bound_port, (
+            f"port-file value {read_port} must match the server's bound port {bound_port}"
+        )
+
+        # Verify the server is actually accepting connections on that port.
+        import urllib.request
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{read_port}/api/state", timeout=3
+        )
+        assert resp.status == 200, f"Expected 200, got {resp.status}"
+
+    finally:
+        server.shutdown()
+        server_thread.join(timeout=3.0)

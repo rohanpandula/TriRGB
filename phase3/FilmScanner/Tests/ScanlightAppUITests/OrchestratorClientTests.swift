@@ -558,4 +558,79 @@ final class OrchestratorClientTests: XCTestCase {
             XCTFail("Wrong error type: \(error)")
         }
     }
+
+    // MARK: - Test 16: waitForPort reads a valid port from an existing file
+
+    /// Happy path: if the port-file already contains a valid port integer,
+    /// waitForPort must return that port immediately on the first poll.
+    func testWaitForPortReadsFromFile() async throws {
+        // Write a known port to a temp file — simulates the child writing after bind.
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test-port-\(UUID().uuidString)")
+        try "54321".write(to: tmpURL, atomically: true, encoding: .utf8)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        // childExitStatus must be nil so we don't trip the fast-fail path.
+        client.childExitStatus = nil
+
+        let port = try await client.waitForPort(file: tmpURL, timeout: 2.0)
+
+        XCTAssertEqual(port, 54321, "waitForPort must return the integer written to the file")
+        // The file should be cleaned up by the defer in waitForPort.
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: tmpURL.path),
+            "waitForPort must clean up the port-file after reading"
+        )
+    }
+
+    // MARK: - Test 17: waitForPort fails fast when the child exits before writing
+
+    /// If childExitStatus is already set (the termination handler fired), waitForPort
+    /// must throw startupFailed immediately — not hang the full timeout.
+    func testWaitForPortFailsFastOnChildExit() async throws {
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test-port-\(UUID().uuidString)")
+        // Do NOT write the file — the child never got that far.
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.childExitStatus = 1  // child died with exit code 1
+
+        let started = Date()
+        do {
+            // Large timeout — the fast-fail must NOT wait anywhere near this long.
+            _ = try await client.waitForPort(file: tmpURL, timeout: 10.0)
+            XCTFail("Expected OrchestratorError.startupFailed to be thrown")
+        } catch OrchestratorError.startupFailed(let exitCode, _) {
+            XCTAssertEqual(exitCode, 1, "Expected the child's exit code to be surfaced")
+        } catch {
+            XCTFail("Wrong error type thrown: \(error)")
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertLessThan(elapsed, 1.0,
+                          "waitForPort must fail fast on child exit (took \(elapsed)s, expected < 1s)")
+    }
+
+    // MARK: - Test 18: waitForPort times out when the file never appears
+
+    /// If the child never writes the port-file (and does not exit), waitForPort
+    /// must throw startupTimeout after the deadline.
+    func testWaitForPortTimesOut() async throws {
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test-port-\(UUID().uuidString)")
+        // Do NOT write the file; do NOT set childExitStatus — simulates a hung child.
+
+        let client = OrchestratorClient(session: makeStubSession())
+        // childExitStatus nil so the fast-fail path is not taken.
+
+        do {
+            _ = try await client.waitForPort(file: tmpURL, timeout: 0.5)
+            XCTFail("Expected OrchestratorError.startupTimeout to be thrown")
+        } catch OrchestratorError.startupTimeout(let stderr) {
+            // Pass: timed out correctly.
+            XCTAssertNotNil(stderr as String?,
+                            "startupTimeout.stderr should be a non-nil String")
+        } catch {
+            XCTFail("Wrong error type thrown: \(error)")
+        }
+    }
 }

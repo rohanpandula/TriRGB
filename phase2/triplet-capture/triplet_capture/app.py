@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Optional
@@ -140,6 +141,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             "launcher passes a random value and only treats the server as ready "
             "when it sees the matching token — so a foreign server that grabbed "
             "the port in the launcher's bind-probe gap can't falsely satisfy readiness."
+        ),
+    )
+    p.add_argument(
+        "--port-file",
+        default="",
+        help=(
+            "Path to write the actual bound port to once the server is listening "
+            "(used with --web-port 0 so the launcher learns the ephemeral port). "
+            "Written atomically: a .tmp file is renamed into place so the reader "
+            "never sees a partial/empty value."
         ),
     )
     p.add_argument(
@@ -322,14 +333,58 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         orch = Orchestrator(scanlight, settings, on_triplet_complete=on_triplet_complete)
         app = create_app(orch, composite_worker=composite_worker, ready_nonce=args.ready_nonce)
-        print(f"triplet-capture: web UI on http://{args.host}:{args.web_port}",
-              file=sys.stderr)
-        if args.no_browser:
-            print("triplet-capture: headless mode (--no-browser)", file=sys.stderr)
-        # Use Flask's built-in server — disposable tool, no production
-        # concerns. `use_reloader=False` so we don't double-open the serial port.
-        app.run(host=args.host, port=args.web_port, debug=False, use_reloader=False)
-        return 0
+
+        if args.web_port == 0:
+            # Child-owned ephemeral port path: bind to port 0, let the OS pick,
+            # then report the real port back to the Swift launcher via a port-file.
+            # This eliminates the TOCTOU window that existed when Swift probed for
+            # a free port and then passed it to us.
+            from werkzeug.serving import make_server as _make_server
+
+            server = _make_server(args.host, 0, app, threaded=True)
+            bound_port = server.server_port
+
+            # Write the real port atomically so the launcher never reads a
+            # partial/empty value (write to <path>.tmp then os.replace).
+            if args.port_file:
+                port_file_path = args.port_file
+                tmp_path_str = port_file_path + ".tmp"
+                with open(tmp_path_str, "w") as _pf:
+                    _pf.write(str(bound_port))
+                os.replace(tmp_path_str, port_file_path)
+
+            print(
+                f"triplet-capture: web UI on http://{args.host}:{bound_port} "
+                f"(ephemeral, --web-port 0)",
+                file=sys.stderr,
+            )
+            if args.no_browser:
+                print("triplet-capture: headless mode (--no-browser)", file=sys.stderr)
+
+            # Install SIGTERM/SIGINT handlers so serve_forever() exits cleanly
+            # and the finally: block below can drain the composite worker.
+            # Raw make_server+serve_forever does NOT install these automatically
+            # (unlike app.run / werkzeug run_simple), so we must do it ourselves.
+            def _shutdown_handler(signum, frame):
+                # server.shutdown() signals serve_forever() to stop on the next
+                # iteration — it is safe to call from a signal handler.
+                server.shutdown()
+
+            signal.signal(signal.SIGTERM, _shutdown_handler)
+            signal.signal(signal.SIGINT, _shutdown_handler)
+
+            server.serve_forever()
+            return 0
+        else:
+            # Non-zero port: use Flask's built-in server — existing behaviour,
+            # manual launches / the web UI must not regress.
+            # `use_reloader=False` so we don't double-open the serial port.
+            print(f"triplet-capture: web UI on http://{args.host}:{args.web_port}",
+                  file=sys.stderr)
+            if args.no_browser:
+                print("triplet-capture: headless mode (--no-browser)", file=sys.stderr)
+            app.run(host=args.host, port=args.web_port, debug=False, use_reloader=False)
+            return 0
     finally:
         if composite_worker is not None:
             # Let outstanding composites finish before we exit so the roll is

@@ -11,7 +11,8 @@
 //   GET  /api/composite-status → CompositeStatus
 //
 // Process lifecycle:
-//   start(settings:) → PythonToolLocator.resolve → findFreePort → Process.run
+//   start(settings:) → PythonToolLocator.resolve → Process.run (--web-port 0)
+//                    → waitForPort (polls port-file every 200ms, 10s timeout)
 //                    → waitForReady (polls /api/state every 200ms, 10s timeout)
 //   stop()           → process.interrupt (SIGTERM) → 3s grace → SIGKILL
 
@@ -152,9 +153,11 @@ final class OrchestratorClient: ObservableObject {
     /// Spawn `triplet-capture` with the given settings and wait for it to be ready.
     ///
     /// - Resolves the tool URL via `PythonToolLocator`.
-    /// - Picks a free localhost port via POSIX `bind(port:0)`.
+    /// - Passes `--web-port 0` so the child owns port selection (eliminates TOCTOU).
+    /// - Passes `--port-file <tmpfile>` so the child reports the actual bound port.
     /// - Builds a `[String]` argument array (never a shell string — T-05-04).
-    /// - Starts the process and polls `GET /api/state` until HTTP 200 (or timeout).
+    /// - Polls the port-file until the child writes its bound port, then polls
+    ///   `GET /api/state` until HTTP 200 + matching nonce (or timeout).
     ///
     /// Calling `start()` while already running throws immediately (prevents orphans).
     /// On startup timeout, the child is SIGTERMed/SIGKILLed before the error is
@@ -186,16 +189,20 @@ final class OrchestratorClient: ObservableObject {
             throw OrchestratorError.toolNotFound(msg)
         }
 
-        // 2. Free port + a readiness nonce. The nonce lets waitForReady reject a
-        // foreign server that grabbed the port in the bind-probe TOCTOU gap — only
-        // the child we spawned echoes this token back on /api/state.
-        let port = findFreePort(fallback: 8765)
+        // 2. Readiness nonce + a unique port-file path.
+        // The nonce lets waitForReady reject a foreign server (the child we spawned
+        // echoes it on /api/state). The port-file is where the child writes the
+        // actual bound port (--web-port 0 lets the OS pick; the child tells us what
+        // it got via the file). Using a UUID-named file per launch avoids any stale
+        // data from a prior launch racing with this one.
         let readyNonce = UUID().uuidString
+        let portFileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("triplet-capture-port-\(UUID().uuidString)")
 
         // 3. Build process
         let proc = Process()
         proc.executableURL = toolURL
-        proc.arguments = buildArgs(settings: settings, port: port, readyNonce: readyNonce)
+        proc.arguments = buildArgs(settings: settings, portFile: portFileURL.path, readyNonce: readyNonce)
         proc.environment = ProcessInfo.processInfo.environment
 
         let stderrPipe = Pipe()
@@ -224,11 +231,19 @@ final class OrchestratorClient: ObservableObject {
             }
         }
 
-        // 6. Wait for readiness — on timeout, kill the orphan before rethrowing.
-        // Without this, a failed start() leaves a live child process with no
-        // handle to terminate it, and a retry would spawn a second one.
+        // 6. Wait for the port-file to appear (child writes it once bound), then
+        // wait for the server to be ready. Kill orphan before rethrowing so a retry
+        // never creates an unreachable orphan process.
+        let resolvedPort: Int
         do {
-            try await waitForReady(port: port, timeout: 10.0, expectedNonce: readyNonce)
+            resolvedPort = try await waitForPort(file: portFileURL, timeout: 10.0)
+        } catch {
+            await teardownFailedLaunch(proc, generation: generation)
+            throw error
+        }
+
+        do {
+            try await waitForReady(port: resolvedPort, timeout: 10.0, expectedNonce: readyNonce)
         } catch {
             // Tear down THIS launch's child (scoped — never the generic stop(),
             // which acts on the current process and would kill a newer launch's
@@ -249,7 +264,7 @@ final class OrchestratorClient: ObservableObject {
         // webPort is set first (the POST needs it); isRunning is published only AFTER
         // the push succeeds, so an observer can't trigger a capture during the window
         // where the orchestrator still has default levels.
-        webPort = port
+        webPort = resolvedPort
         do {
             try await applyRuntimeSettings(settings)
         } catch {
@@ -537,12 +552,17 @@ final class OrchestratorClient: ObservableObject {
     ///
     /// IMPORTANT: This always returns a `[String]` array — NEVER a shell string.
     /// `Process.arguments` does not use a shell, so there is no injection surface (T-05-04).
-    private func buildArgs(settings: ScanSettings, port: Int, readyNonce: String) -> [String] {
+    ///
+    /// `--web-port 0` tells the child to bind an ephemeral OS-assigned port.
+    /// `--port-file <path>` tells the child where to write the actual bound port
+    /// once listening. Swift reads that file via `waitForPort(file:timeout:)`.
+    private func buildArgs(settings: ScanSettings, portFile: String, readyNonce: String) -> [String] {
         var args: [String] = [
             "--roll-name",      settings.rollName,
             "--output-folder",  settings.outputFolder,  // BASE folder; Python appends /rollName
             "--trigger-mode",   settings.triggerMode,
-            "--web-port",       "\(port)",
+            "--web-port",       "0",
+            "--port-file",      portFile,
             "--ready-nonce",    readyNonce,
             "--no-browser",
         ]
@@ -562,30 +582,51 @@ final class OrchestratorClient: ObservableObject {
         return args
     }
 
-    /// Select a free localhost port using POSIX `bind(port: 0)` + `getsockname`.
+    /// Poll for the port-file written by the child once it is bound and listening.
     ///
-    /// Falls back to `fallback` on any socket error.
-    private func findFreePort(fallback: Int) -> Int {
-        let s = socket(AF_INET, SOCK_STREAM, 0)
-        guard s >= 0 else { return fallback }
-        defer { close(s) }
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
-        addr.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian
-        let bindResult = withUnsafeMutablePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
+    /// The child is spawned with `--web-port 0` (OS-assigned ephemeral port) and
+    /// `--port-file <path>`. Once it has bound and is ready to accept connections
+    /// it writes the actual port number to that file atomically (via a .tmp rename),
+    /// then our `waitForReady` nonce-check provides the second layer of verification.
+    ///
+    /// - Polls every 200 ms, same cadence as `waitForReady`.
+    /// - Fast-fails immediately if `childExitStatus` is set (child died before writing).
+    /// - Throws `OrchestratorError.startupTimeout` if the deadline is reached.
+    /// - Cleans up the port-file (best-effort) after reading or on failure.
+    ///
+    /// Marked `internal` so tests can drive it directly without spawning a real child.
+    internal func waitForPort(file: URL, timeout: TimeInterval) async throws -> Int {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        let filePath = file.path
+        defer {
+            // Best-effort cleanup — ignore errors (file may not exist if we failed
+            // before the child wrote it, or if the child cleaned it up itself).
+            try? FileManager.default.removeItem(at: file)
         }
-        guard bindResult == 0 else { return fallback }
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        _ = withUnsafeMutablePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(s, $0, &len)
+        while Date() < deadline {
+            // Honor cancellation promptly.
+            try Task.checkCancellation()
+            // Fast-fail: if the child already exited without writing the port-file,
+            // don't hang the full timeout.
+            if let exitCode = childExitStatus {
+                let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+                throw OrchestratorError.startupFailed(exitCode: exitCode, stderr: stderrText)
             }
+            // Read the file off the main actor (non-blocking string read from a
+            // temp-dir file is fast enough that it doesn't need to be dispatched,
+            // but we guard against a partial read by requiring a non-empty trimmed
+            // string that parses as Int — the child writes atomically via rename
+            // so we will either see the complete content or nothing at all).
+            if FileManager.default.fileExists(atPath: filePath),
+               let raw = try? String(contentsOfFile: filePath, encoding: .utf8),
+               let port = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+               port > 0 {
+                return port
+            }
+            // No `try?` — let a cancelled sleep propagate so start() unwinds promptly.
+            try await Task.sleep(nanoseconds: 200_000_000)  // 200ms
         }
-        let assignedPort = Int(UInt16(bigEndian: addr.sin_port))
-        return assignedPort > 0 ? assignedPort : fallback
+        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+        throw OrchestratorError.startupTimeout(stderr: stderrText)
     }
 }
