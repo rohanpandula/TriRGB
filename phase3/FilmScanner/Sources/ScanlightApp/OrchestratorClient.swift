@@ -196,8 +196,18 @@ final class OrchestratorClient: ObservableObject {
 
     /// Send SIGTERM to the child process and wait up to 3 seconds for graceful
     /// shutdown. Falls back to SIGKILL if still running.
+    ///
+    /// isRunning and process are ALWAYS cleared on exit (including the early-return
+    /// path when the child has already exited on its own). Without this, a child
+    /// that crashes mid-session leaves isRunning=true and a stale process handle,
+    /// blocking any subsequent start() call permanently.
     func stop() async {
-        guard let proc = process, proc.isRunning else { return }
+        defer {
+            isRunning = false
+            process = nil
+        }
+        guard let proc = process else { return }
+        guard proc.isRunning else { return }
         proc.interrupt()   // sends SIGTERM on Darwin
         let deadline = Date(timeIntervalSinceNow: 3.0)
         while proc.isRunning && Date() < deadline {
@@ -213,8 +223,6 @@ final class OrchestratorClient: ObservableObject {
                 if !proc.isRunning { break }
             }
         }
-        isRunning = false
-        process = nil
     }
 
     /// Fetch the current orchestrator state.
