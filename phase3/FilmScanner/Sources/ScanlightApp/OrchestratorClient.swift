@@ -205,7 +205,13 @@ final class OrchestratorClient: ObservableObject {
         }
         if proc.isRunning {
             kill(proc.processIdentifier, SIGKILL)
-            proc.waitUntilExit()
+            // Poll asynchronously rather than blocking the main actor with
+            // proc.waitUntilExit(). SIGKILL is not deferrable on Darwin so the
+            // process dies quickly, but there is no OS timing guarantee.
+            for _ in 0..<20 {
+                try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+                if !proc.isRunning { break }
+            }
         }
         isRunning = false
         process = nil
