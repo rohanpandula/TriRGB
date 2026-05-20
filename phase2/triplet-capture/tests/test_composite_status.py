@@ -153,8 +153,13 @@ def test_composite_status_enabled_with_results(settings, tmp_path):
 
     worker.submit(1, {"R": fake_r, "G": fake_g, "B": fake_b})
 
-    # Let the background thread finish before building the app
-    time.sleep(0.2)
+    # Poll until the background ThreadPoolExecutor job completes (up to 5s).
+    # A fixed sleep(0.2) is a flake risk under heavy CI load; a deterministic
+    # poll on worker.pending avoids the race.
+    deadline = time.monotonic() + 5.0
+    while worker.pending > 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert worker.pending == 0, "composite job did not complete within 5 seconds"
 
     app = create_app(orch, composite_worker=worker)
     client = app.test_client()
@@ -165,7 +170,7 @@ def test_composite_status_enabled_with_results(settings, tmp_path):
     first_body = r1.get_json()
     assert first_body["enabled"] is True
     assert isinstance(first_body["pending"], int)
-    assert len(first_body["results"]) >= 1
+    assert len(first_body["results"]) == 1
     assert first_body["results"][0]["status"] in ("done", "failed")
     assert "frame_number" in first_body["results"][0]
 
