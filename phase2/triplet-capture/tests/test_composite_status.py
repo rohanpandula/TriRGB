@@ -153,13 +153,18 @@ def test_composite_status_enabled_with_results(settings, tmp_path):
 
     worker.submit(1, {"R": fake_r, "G": fake_g, "B": fake_b})
 
-    # Poll until the background ThreadPoolExecutor job completes (up to 5s).
-    # A fixed sleep(0.2) is a flake risk under heavy CI load; a deterministic
-    # poll on worker.pending avoids the race.
+    # Poll until the background ThreadPoolExecutor job finishes (up to 5s).
+    # A fixed sleep(0.2) is a flake risk under heavy CI load; checking the
+    # future directly is deterministic. worker.pending counts unpolled futures
+    # (including done-but-not-yet-collected), so we check the underlying future.
     deadline = time.monotonic() + 5.0
-    while worker.pending > 0 and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert worker.pending == 0, "composite job did not complete within 5 seconds"
+    all_done = False
+    while not all_done and time.monotonic() < deadline:
+        with worker._lock:
+            all_done = all(f.done() for f in worker._futures.values())
+        if not all_done:
+            time.sleep(0.01)
+    assert all_done, "composite job did not complete within 5 seconds"
 
     app = create_app(orch, composite_worker=worker)
     client = app.test_client()
