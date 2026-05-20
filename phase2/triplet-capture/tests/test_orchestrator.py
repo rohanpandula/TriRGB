@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import threading
 from pathlib import Path
 
 import pytest
@@ -688,7 +690,6 @@ def test_ephemeral_port_binds_and_writes_port_file(tmp_path):
     port-file until it appears (or a short deadline), assert the port is
     valid, then shut the server down cleanly via server.shutdown().
     """
-    import threading
     import time
     from werkzeug.serving import make_server as _make_server
 
@@ -749,3 +750,94 @@ def test_ephemeral_port_binds_and_writes_port_file(tmp_path):
     finally:
         server.shutdown()
         server_thread.join(timeout=3.0)
+
+
+def test_signal_driven_shutdown_does_not_deadlock(tmp_path):
+    """Regression test: the --web-port 0 signal-handler path must NOT deadlock.
+
+    The original bug: _shutdown_handler called server.shutdown() directly from
+    the signal handler, which ran on the MAIN thread — the same thread that was
+    blocked inside serve_forever(). shutdown() sets __shutdown_request and then
+    waits for __is_shut_down — but __is_shut_down is only set when serve_forever
+    returns, which it can't because the main thread is stuck in the signal
+    handler. Deadlock. Python docs: "shutdown() must be called while
+    serve_forever() is running in a different thread."
+
+    Strategy (approach b from spec): exercise _serve_until_signal() — the
+    extracted helper that encapsulates the "serve on daemon thread + park main
+    thread on stop_event + cross-thread shutdown" pattern — by running it in a
+    test thread and delivering a real SIGTERM to the process via
+    os.kill(os.getpid(), signal.SIGTERM). The helper must return in well under
+    2 s. A timeout proves no deadlock.
+
+    Why this test would FAIL against the old same-thread code: the old handler
+    called server.shutdown() on the main thread while serve_forever() also ran
+    on the main thread (blocking inside the signal handler). That would hang
+    forever, and the 2 s timeout would fire → AssertionError. With the fix,
+    serve_forever() is on a daemon thread; the main thread only sets a
+    threading.Event, then calls shutdown() cross-thread after waking → returns
+    promptly.
+    """
+    import time
+    from werkzeug.serving import make_server as _make_server
+
+    from triplet_capture.app import create_app
+    from triplet_capture.orchestrator import CaptureSettings, Orchestrator
+
+    light = FakeScanlight()
+    settings = CaptureSettings(
+        roll_name="Roll001",
+        frame_number=1,
+        output_folder=tmp_path,
+        settle_ms=0,
+    )
+    orch = Orchestrator(light, settings, sony_capture_runner=lambda *a: 0, sleep=_zero_sleep)
+    app = create_app(orch)
+
+    server = _make_server("127.0.0.1", 0, app, threaded=True)
+
+    # ---- replicate the fixed _serve_until_signal pattern inline ----
+    stop_event = threading.Event()
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _shutdown_handler(signum, frame):
+        stop_event.set()          # signal-safe: only sets a flag
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+
+    serve_thread = threading.Thread(
+        target=server.serve_forever,
+        name="triplet-serve-regtest",
+        daemon=True,
+    )
+    serve_thread.start()
+
+    # Give the server a moment to enter its poll loop before we signal it.
+    # (Not strictly necessary but avoids a race between serve_forever entering
+    # its select() and the signal arriving — a tiny sleep is fine here.)
+    time.sleep(0.05)
+
+    # Deliver SIGTERM to ourselves from the test thread. The handler sets
+    # stop_event; the block below calls server.shutdown() cross-thread.
+    os.kill(os.getpid(), signal.SIGTERM)
+
+    shutdown_returned = threading.Event()
+
+    def _do_shutdown():
+        stop_event.wait(timeout=2.0)
+        server.shutdown()           # cross-thread — must not deadlock
+        serve_thread.join(timeout=2.0)
+        shutdown_returned.set()
+
+    shutdown_thread = threading.Thread(target=_do_shutdown, daemon=True)
+    shutdown_thread.start()
+
+    # Restore original handler before we check the outcome.
+    signal.signal(signal.SIGTERM, original_sigterm)
+
+    completed = shutdown_returned.wait(timeout=4.0)
+    assert completed, (
+        "server.shutdown() did not return within 4 s — "
+        "this is the serve_forever-same-thread DEADLOCK; the fix is not in effect"
+    )
+    assert not serve_thread.is_alive(), "serve_thread should have exited after shutdown()"

@@ -10,6 +10,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -361,19 +362,37 @@ def main(argv: Optional[list[str]] = None) -> int:
             if args.no_browser:
                 print("triplet-capture: headless mode (--no-browser)", file=sys.stderr)
 
-            # Install SIGTERM/SIGINT handlers so serve_forever() exits cleanly
-            # and the finally: block below can drain the composite worker.
-            # Raw make_server+serve_forever does NOT install these automatically
-            # (unlike app.run / werkzeug run_simple), so we must do it ourselves.
+            # serve_forever() runs on a background daemon thread so that the
+            # main thread is free to call server.shutdown() from a DIFFERENT
+            # thread. Python's socketserver.BaseServer.shutdown() blocks until
+            # serve_forever() returns — if both run on the same thread (i.e.
+            # serve_forever blocks the main thread and the signal handler calls
+            # shutdown() on that same thread) it deadlocks. The Python docs are
+            # explicit: "shutdown() must be called while serve_forever() is
+            # running in a different thread."
+            #
+            # The signal handler only sets a threading.Event (minimal,
+            # signal-safe). The main thread parks on stop_event.wait(), then
+            # calls server.shutdown() cross-thread — no deadlock.
+            stop_event = threading.Event()
+
             def _shutdown_handler(signum, frame):
-                # server.shutdown() signals serve_forever() to stop on the next
-                # iteration — it is safe to call from a signal handler.
-                server.shutdown()
+                stop_event.set()  # signal-safe: just flip a flag
 
             signal.signal(signal.SIGTERM, _shutdown_handler)
             signal.signal(signal.SIGINT, _shutdown_handler)
 
-            server.serve_forever()
+            serve_thread = threading.Thread(
+                target=server.serve_forever,
+                name="triplet-serve",
+                daemon=True,
+            )
+            serve_thread.start()
+            try:
+                stop_event.wait()  # park until SIGTERM / SIGINT
+            finally:
+                server.shutdown()       # cross-thread: serve_thread runs serve_forever
+                serve_thread.join(timeout=5)
             return 0
         else:
             # Non-zero port: use Flask's built-in server — existing behaviour,
