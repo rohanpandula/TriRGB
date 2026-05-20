@@ -158,23 +158,39 @@ final class CalibrationViewModel: ObservableObject {
 
         let stdoutData = inspectStdout.fileHandleForReading.readDataToEndOfFile()
 
-        guard inspectProc.terminationStatus == 0 else {
-            let errData = inspectStderr.fileHandleForReading.readDataToEndOfFile()
-            let stderr = String(data: errData, encoding: .utf8) ?? ""
-            throw CalibrationRunnerError.inspectFailed(
-                exitCode: inspectProc.terminationStatus,
-                stderr: stderr
-            )
-        }
-
-        // 5. Decode CalibrationResult from stdout
+        // 5. Decode CalibrationResult from stdout FIRST.
+        //
+        // inspect-calibration.py emits valid JSON on exit code 0 (clean/acceptable)
+        // AND exit code 1 (fail verdict). Exit code 2 means file/decode error (no
+        // valid JSON). So: attempt decode first; only fall back to inspectFailed
+        // for exit code 2 or when the decode genuinely fails.
+        let decoded: CalibrationResult
         do {
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
-            return try decoder.decode(CalibrationResult.self, from: stdoutData)
+            decoded = try decoder.decode(CalibrationResult.self, from: stdoutData)
         } catch let decodingError {
+            // Real decode failure — also capture stderr for context.
+            let errData = inspectStderr.fileHandleForReading.readDataToEndOfFile()
+            let stderrStr = String(data: errData, encoding: .utf8) ?? ""
+            if !stderrStr.isEmpty {
+                throw CalibrationRunnerError.inspectFailed(
+                    exitCode: inspectProc.terminationStatus, stderr: stderrStr)
+            }
             throw CalibrationRunnerError.jsonDecodeFailed(decodingError.localizedDescription)
         }
+
+        // Exit code 2 means file-not-found / decode error on the Python side (stderr
+        // explains). Exit codes 0 and 1 both produce valid JSON; 1 simply means
+        // overall == "fail" — the verdict is inside the decoded result.
+        if inspectProc.terminationStatus == 2 {
+            let errData = inspectStderr.fileHandleForReading.readDataToEndOfFile()
+            let stderr = String(data: errData, encoding: .utf8) ?? ""
+            throw CalibrationRunnerError.inspectFailed(
+                exitCode: inspectProc.terminationStatus, stderr: stderr)
+        }
+
+        return decoded
     }
 
     // MARK: - Public API
