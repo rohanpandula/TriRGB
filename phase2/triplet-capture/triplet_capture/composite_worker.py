@@ -131,6 +131,11 @@ class CompositeWorker:
         self._futures: dict[int, Future] = {}
         self._lock = threading.Lock()
         self._closed = False
+        # Full history of every collected result, in completion order. Both
+        # poll() callers (the capture-loop logger in main() and the
+        # /api/composite-status route) append here, so neither permanently loses
+        # results the other drained first.
+        self._history: list[CompositeResult] = []
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
     def _output_path(self, frame_number: int) -> Path:
@@ -183,6 +188,10 @@ class CompositeWorker:
                 if fut.done():
                     done.append(self._collect(frame_number, fut))
                     del self._futures[frame_number]
+            # Record every collected result so a second poll() caller (the
+            # capture-loop logger vs /api/composite-status) can't make the other
+            # permanently miss it.
+            self._history.extend(done)
         return done
 
     def drain(self, timeout: Optional[float] = None) -> list[CompositeResult]:
@@ -199,6 +208,9 @@ class CompositeWorker:
             except Exception:  # noqa: BLE001 — _collect re-reads the outcome
                 pass
             results.append(self._collect(frame_number, fut))
+        # End-of-roll results belong in the history too.
+        with self._lock:
+            self._history.extend(results)
         return results
 
     @staticmethod
@@ -219,14 +231,28 @@ class CompositeWorker:
         with self._lock:
             return len(self._futures)
 
+    @property
+    def history(self) -> list[CompositeResult]:
+        """Snapshot of every collected result so far, in completion order.
+
+        Non-destructive — read it as often as you like. This is the single
+        source of truth for /api/composite-status, independent of which caller
+        drained a given result via poll().
+        """
+        with self._lock:
+            return list(self._history)
+
     def shutdown(self, *, wait: bool = False) -> None:
         """Tear down the pool. `wait=False` (default) cancels queued jobs and
         returns immediately — used when the operator kills the session
         mid-roll. `wait=True` lets running jobs finish (use drain() first if
         you also want their results)."""
-        if self._closed:
-            return
-        self._closed = True
+        # Flip _closed under the same lock submit() checks it under, so a
+        # concurrent submit() can't slip a job onto a pool that's shutting down.
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
         try:
             self._executor.shutdown(wait=wait, cancel_futures=not wait)
         except TypeError:

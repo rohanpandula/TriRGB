@@ -186,3 +186,54 @@ def test_composite_status_enabled_with_results(settings, tmp_path):
     assert r2.status_code == 200
     second_body = r2.get_json()
     assert len(second_body["results"]) == len(first_body["results"])
+
+
+def test_composite_status_survives_external_poll(settings, tmp_path):
+    """Regression: a second poll() consumer (the capture-loop logger wired in
+    main() as on_triplet_complete) must NOT make /api/composite-status lose
+    results. Before the fix, both consumers called the destructive poll() and
+    whoever drained a result first left the other permanently missing it. The
+    worker now keeps its own history as the single source of truth."""
+    light = FakeScanlight()
+    runner, _ = make_runner()
+    orch = Orchestrator(light, settings, sony_capture_runner=runner, sleep=_zero_sleep)
+
+    worker = CompositeWorker(
+        tmp_path / "composites",
+        "Roll001",
+        executor=ThreadPoolExecutor(max_workers=1),
+        job_fn=_fake_job_fn,
+    )
+    fake_r = tmp_path / "R.ARW"
+    fake_g = tmp_path / "G.ARW"
+    fake_b = tmp_path / "B.ARW"
+    fake_r.write_bytes(b"R")
+    fake_g.write_bytes(b"G")
+    fake_b.write_bytes(b"B")
+
+    worker.submit(1, {"R": fake_r, "G": fake_g, "B": fake_b})
+
+    deadline = time.monotonic() + 5.0
+    all_done = False
+    while not all_done and time.monotonic() < deadline:
+        with worker._lock:
+            all_done = bool(worker._futures) and all(
+                f.done() for f in worker._futures.values()
+            )
+        if not all_done:
+            time.sleep(0.01)
+    assert all_done, "composite job did not complete within 5 seconds"
+
+    # Simulate the capture-loop logger draining the result FIRST (as
+    # on_triplet_complete does after each triplet). This empties _futures.
+    drained = worker.poll()
+    assert len(drained) == 1, "the external consumer should have gotten the result"
+
+    # The endpoint must STILL report it — history is the single source of truth.
+    app = create_app(orch, composite_worker=worker)
+    client = app.test_client()
+    body = client.get("/api/composite-status").get_json()
+    assert len(body["results"]) == 1, (
+        "composite result was lost when an external poll() drained it first"
+    )
+    assert body["results"][0]["frame_number"] == 1

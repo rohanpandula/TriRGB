@@ -421,7 +421,7 @@ final class OrchestratorClientTests: XCTestCase {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: truePath)
-        client.installTerminationHandler(on: proc)
+        client.installTerminationHandler(on: proc, generation: client.launchGeneration)
         try proc.run()
 
         // Wait up to 2s for the process to exit and the handler to hop to MainActor.
@@ -434,5 +434,85 @@ final class OrchestratorClientTests: XCTestCase {
                        "terminationHandler must clear isRunning when the child exits")
         XCTAssertNotNil(client.childExitStatus,
                         "terminationHandler must record the child's exit status")
+    }
+
+    // MARK: - Test 12: a stale-generation termination callback is ignored
+
+    /// Regression: a late termination callback from a prior (superseded) launch
+    /// must NOT clobber the current launch's state. Installs a handler tagged with
+    /// an old generation, then bumps the client's current generation; when the
+    /// process exits, the stale callback must be a no-op.
+    func testStaleTerminationCallbackIsIgnored() async throws {
+        let truePath = "/usr/bin/true"
+        guard FileManager.default.isExecutableFile(atPath: truePath) else {
+            throw XCTSkip("\(truePath) not available")
+        }
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.isRunning = true
+        client.launchGeneration = 2  // the "current" launch is generation 2
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: truePath)
+        client.installTerminationHandler(on: proc, generation: 1)  // STALE generation
+        try proc.run()
+
+        // Give the (stale) handler ample time to fire and hop to MainActor.
+        try await Task.sleep(nanoseconds: 400_000_000)  // 400ms
+
+        XCTAssertTrue(client.isRunning,
+                      "a stale-generation termination callback must NOT clear isRunning")
+        XCTAssertNil(client.childExitStatus,
+                     "a stale-generation callback must NOT record an exit status for the current launch")
+    }
+
+    // MARK: - Test 13: applyRuntimeSettings sends only levels+settle (not output_folder)
+
+    /// Regression: start()'s post-ready settings push must NOT re-post output_folder
+    /// (POST /api/settings treats it as a full path, reverting the spawn's
+    /// `<base>/<rollName>`). It must send ONLY the runtime-adjustable fields.
+    func testApplyRuntimeSettingsOmitsOutputFolder() async throws {
+        StubURLProtocol.routes["/api/settings"] = (makeStateJSON(), 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        let settings = ScanSettings(
+            rollName: "Roll003",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: nil,
+            compositeFormat: "dng",
+            levelR: 211,
+            levelG: 199,
+            levelB: 188,
+            settleMs: 66
+        )
+
+        try await client.applyRuntimeSettings(settings)
+
+        guard let bodyData = StubURLProtocol.lastBody else {
+            XCTFail("No body was recorded by StubURLProtocol")
+            return
+        }
+        let decoded = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
+        guard let decoded = decoded else {
+            XCTFail("Could not decode body as [String: Any]")
+            return
+        }
+
+        // The runtime fields are present...
+        XCTAssertEqual(decoded["level_r"] as? Int, 211)
+        XCTAssertEqual(decoded["level_g"] as? Int, 199)
+        XCTAssertEqual(decoded["level_b"] as? Int, 188)
+        XCTAssertEqual(decoded["settle_ms"] as? Int, 66)
+        // ...and output_folder / roll_name are NOT (so the spawn's roll subfolder survives).
+        XCTAssertNil(decoded["output_folder"],
+                     "applyRuntimeSettings must NOT post output_folder (would revert the roll subfolder)")
+        XCTAssertNil(decoded["roll_name"],
+                     "applyRuntimeSettings must NOT post roll_name")
     }
 }

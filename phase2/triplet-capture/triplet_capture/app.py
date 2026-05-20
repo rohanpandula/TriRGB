@@ -69,23 +69,27 @@ def create_app(orchestrator: Orchestrator, composite_worker=None) -> Flask:
             "next_frame": orchestrator.settings.frame_number,
         }), (200 if result.success else 500)
 
-    _composite_history: list[dict] = []
-
     @app.get("/api/composite-status")
     def get_composite_status():
         if composite_worker is None:
             return jsonify({"enabled": False})
-        for cr in composite_worker.poll():
-            _composite_history.append({
+        # Drain any freshly-finished jobs into the worker's own history, then return
+        # that full history. The worker is the single source of truth, so results
+        # the capture-loop logger's poll() drained first are NOT lost here.
+        composite_worker.poll()
+        results = [
+            {
                 "frame_number": cr.frame_number,
                 "status": "done" if cr.ok else "failed",
                 "output_path": str(cr.output_path) if cr.output_path else None,
                 "error": cr.error,
-            })
+            }
+            for cr in composite_worker.history
+        ]
         return jsonify({
             "enabled": True,
             "pending": composite_worker.pending,
-            "results": _composite_history,
+            "results": results,
         })
 
     return app

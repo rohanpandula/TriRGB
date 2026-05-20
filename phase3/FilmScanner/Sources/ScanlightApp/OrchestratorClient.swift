@@ -127,6 +127,13 @@ final class OrchestratorClient: ObservableObject {
     /// termination handler doesn't surface an "exited unexpectedly" error for a
     /// shutdown we asked for.
     private var stopping = false
+    /// Monotonic per-launch token, bumped at the top of each start(). Every async
+    /// callback (termination handler, stderr reader) and every deferred cleanup
+    /// (start()'s catch, stop()'s defer) captures the generation it belongs to and
+    /// no-ops once a newer launch supersedes it — so a slow callback from a
+    /// killed/failed child can never clobber a newer launch's state. Internal so
+    /// tests can drive the generation guard directly.
+    internal var launchGeneration = 0
 
     // MARK: Init
 
@@ -159,6 +166,12 @@ final class OrchestratorClient: ObservableObject {
         stderrData = Data()
         stopping = false
 
+        // Bump the launch token. Every async callback/cleanup below captures this
+        // value and no-ops if a newer launch has superseded it — so a slow callback
+        // from a prior (killed/failed) child can't corrupt this launch's state.
+        launchGeneration &+= 1
+        let generation = launchGeneration
+
         // 1. Locate the tool
         let toolURL: URL
         do {
@@ -183,7 +196,7 @@ final class OrchestratorClient: ObservableObject {
         // crash later. Without this, isRunning goes stale on a crash (the Phase 7
         // state machine reads it for serial-port ownership) and waitForReady polls
         // the full timeout after a fast startup failure. Must be set before run().
-        installTerminationHandler(on: proc)
+        installTerminationHandler(on: proc, generation: generation)
 
         // 4. Launch
         try proc.run()
@@ -196,7 +209,9 @@ final class OrchestratorClient: ObservableObject {
         Task.detached { [weak self] in
             let data = fileHandle.readDataToEndOfFile()
             await MainActor.run { [weak self] in
-                self?.stderrData = data
+                // Ignore stderr belonging to a launch that has been superseded.
+                guard let self, self.launchGeneration == generation else { return }
+                self.stderrData = data
             }
         }
 
@@ -215,29 +230,37 @@ final class OrchestratorClient: ObservableObject {
                 try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms grace
                 if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
             }
-            self.process = nil
+            // Only clear the shared handle if this launch still owns it — the child
+            // may have died mid-startup, letting a concurrent start() supersede us.
+            if launchGeneration == generation { self.process = nil }
             throw error
         }
 
-        // 7. Mark as running
-        isRunning = true
+        // 7. Push the runtime-adjustable settings that have NO spawn-time CLI flag
+        // (R/G/B levels + settle) so a capture fired right after start() uses the
+        // caller's values, not the Python dataclass defaults (200/200/200, 50 ms).
+        //
+        // Sends ONLY levels+settle — NOT output_folder. The CLI spawn already set
+        // output_folder to <base>/<rollName>; re-posting the base folder here would
+        // REVERT it, because POST /api/settings treats output_folder as a full path
+        // with no rollName append (the documented spawn-vs-POST asymmetry).
+        //
+        // webPort is set first (the POST needs it); isRunning is published only AFTER
+        // the push succeeds, so an observer can't trigger a capture during the window
+        // where the orchestrator still has default levels.
         webPort = port
-        lastError = ""
-
-        // 8. Push full settings (levelR/G/B, settleMs, etc.) to the orchestrator
-        // immediately so any capture that fires right after start() uses the
-        // caller's values rather than the Python dataclass defaults (200/200/200,
-        // 50 ms). buildArgs() intentionally omits these fields at spawn time;
-        // this call closes the "capture-before-updateSettings uses defaults" window.
         do {
-            try await updateSettings(settings)
+            try await applyRuntimeSettings(settings)
         } catch {
-            // Settings push failed — orchestrator is up but misconfigured.
-            // Shut down cleanly rather than leaving the caller with a running
-            // process that silently ignores the requested levels.
+            // Orchestrator is up but we couldn't apply the requested levels — shut
+            // it down cleanly rather than leave the caller with default light levels.
             await stop()
             throw error
         }
+
+        // 8. Now safe to publish running state.
+        isRunning = true
+        lastError = ""
     }
 
     /// Send SIGTERM to the child process and wait up to 3 seconds for graceful
@@ -249,9 +272,15 @@ final class OrchestratorClient: ObservableObject {
     /// blocking any subsequent start() call permanently.
     func stop() async {
         stopping = true
+        let generation = launchGeneration
         defer {
-            isRunning = false
-            process = nil
+            // Only clear shared state if a newer start() hasn't superseded us — the
+            // child can exit mid-await, letting a concurrent start() launch a
+            // replacement whose process handle we must not stomp.
+            if launchGeneration == generation {
+                isRunning = false
+                process = nil
+            }
             stopping = false
         }
         guard let proc = process else { return }
@@ -292,6 +321,14 @@ final class OrchestratorClient: ObservableObject {
     ///
     /// Encodes `settings` as a JSON object with snake_case keys
     /// (`.convertToSnakeCase`), posts to `/api/settings`, and asserts HTTP 200.
+    ///
+    /// NOTE on `output_folder`: POST /api/settings sets `output_folder` to the
+    /// posted value VERBATIM (no `rollName` append, unlike the `--output-folder`
+    /// CLI flag which Python appends `/<rollName>` to). `ScanSettings.outputFolder`
+    /// holds the BASE folder for spawning, so callers that send the full struct
+    /// here will set the orchestrator's output to the bare base. Phase 6's Settings
+    /// view must send the intended full path. `start()` deliberately does NOT use
+    /// this method for its post-ready push — see `applyRuntimeSettings`.
     func updateSettings(_ settings: ScanSettings) async throws {
         let url = URL(string: "http://127.0.0.1:\(webPort)/api/settings")!
         var request = URLRequest(url: url)
@@ -307,6 +344,35 @@ final class OrchestratorClient: ObservableObject {
         guard http.statusCode == 200 else {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
+        }
+    }
+
+    /// POST only the runtime-adjustable fields that have no spawn-time CLI flag
+    /// (R/G/B levels + settle). Deliberately omits `output_folder` and `roll_name`:
+    /// those are set correctly at spawn, and POST /api/settings treats
+    /// `output_folder` as a full path (no rollName append), so re-posting the base
+    /// folder would revert the orchestrator's `<base>/<rollName>` output directory.
+    /// `/api/settings` whitelists + applies only the keys present in the body, so
+    /// sending a subset leaves every other field untouched.
+    func applyRuntimeSettings(_ settings: ScanSettings) async throws {
+        let url = URL(string: "http://127.0.0.1:\(webPort)/api/settings")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Int] = [
+            "level_r": settings.levelR,
+            "level_g": settings.levelG,
+            "level_b": settings.levelB,
+            "settle_ms": settings.settleMs,
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OrchestratorError.invalidResponse(statusCode: 0)
+        }
+        guard http.statusCode == 200 else {
+            let respBody = String(data: data, encoding: .utf8) ?? ""
+            throw OrchestratorError.httpError(statusCode: http.statusCode, body: respBody)
         }
     }
 
@@ -366,6 +432,9 @@ final class OrchestratorClient: ObservableObject {
         let url = URL(string: "http://127.0.0.1:\(port)/api/state")!
         let deadline = Date(timeIntervalSinceNow: timeout)
         while Date() < deadline {
+            // Honor cancellation promptly (e.g. the scan was aborted mid-startup)
+            // instead of spinning to the timeout.
+            try Task.checkCancellation()
             // Fast-fail: if the child has already exited (set by the termination
             // handler), stop polling immediately rather than waiting out the full
             // timeout. The common startup failure — bad args, missing Python dep,
@@ -377,12 +446,15 @@ final class OrchestratorClient: ObservableObject {
             do {
                 let (_, response) = try await session.data(from: url)
                 if (response as? HTTPURLResponse)?.statusCode == 200 { return }
-            } catch is URLError {
-                // Normal during startup (cannotConnectToHost, networkConnectionLost,
-                // etc.) — retry silently until the timeout deadline. A genuinely dead
-                // child is caught by the childExitStatus check above, not here.
+            } catch let urlError as URLError {
+                // A cancelled request means start() itself was cancelled — propagate.
+                if urlError.code == .cancelled { throw CancellationError() }
+                // Other URLErrors are normal during startup (cannotConnectToHost,
+                // networkConnectionLost, etc.) — retry until the deadline. A genuinely
+                // dead child is caught by the childExitStatus check above, not here.
             }
-            try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
+            // No `try?` — let a cancelled sleep propagate so start() unwinds promptly.
+            try await Task.sleep(nanoseconds: 200_000_000)  // 200ms
         }
         // Timeout: child stayed alive but never answered. Capture any stderr.
         let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
@@ -395,13 +467,13 @@ final class OrchestratorClient: ObservableObject {
     ///
     /// Internal (not private) so tests can install it on a trivial short-lived
     /// process and observe the state flip without spawning the real orchestrator.
-    internal func installTerminationHandler(on proc: Process) {
+    internal func installTerminationHandler(on proc: Process, generation: Int) {
         proc.terminationHandler = { [weak self] finished in
             // Read the exit code on the handler's own queue (it owns `finished`),
-            // then hop to the main actor with only a Sendable Int32.
+            // then hop to the main actor with only Sendable values.
             let status = finished.terminationStatus
             Task { @MainActor in
-                self?.handleChildTermination(status: status)
+                self?.handleChildTermination(status: status, generation: generation)
             }
         }
     }
@@ -409,7 +481,10 @@ final class OrchestratorClient: ObservableObject {
     /// Runs on the main actor when the child process exits. Clears running state
     /// so a crashed/exited orchestrator can never leave `isRunning` stale — the
     /// Phase 7 state machine reads `isRunning` to decide serial-port ownership.
-    private func handleChildTermination(status: Int32) {
+    private func handleChildTermination(status: Int32, generation: Int) {
+        // Ignore a late callback from a launch that has already been superseded —
+        // otherwise a prior child's exit could clobber a newer launch's state.
+        guard generation == launchGeneration else { return }
         childExitStatus = status
         process = nil
         let wasRunning = isRunning
