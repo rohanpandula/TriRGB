@@ -446,3 +446,62 @@ def test_json_overall_matches_classify_for_tint_drift(tmp_path, monkeypatch, cap
         f"No individual channel should be 'fail' in this tint-drift scenario, "
         f"got {per_channel_verdicts}"
     )
+
+
+def test_json_overall_acceptable_for_moderate_tint_drift(tmp_path, monkeypatch, capsys):
+    """WR-01 residual regression: tint drift in 3-10% band with all per-channel
+    falloffs < 15% → classify() returns rc=0 "OK with FFC" → JSON overall MUST
+    be "acceptable" (not "clean").
+
+    Setup: R/G ≈ 1% falloff (corner=39500), B ≈ 8% falloff (corner=36500).
+    Tint drift ≈ 7.2% (> TINT_DRIFT_FFC_PCT=3%). All per-channel falloffs are
+    well below FALLOFF_USABLE_PCT (15%) and all uniformity scores are < 3%
+    (radial gradient is gradual enough), so every _channel_verdict() returns
+    "clean". Only classify()'s cross-channel tint-drift gate fires.
+
+    The bug (before this fix) was that overall was computed purely from per-channel
+    aggregation, which found no "acceptable" channel and returned "clean" — even
+    though classify() said "OK with FFC".
+    """
+    cal = tmp_path / "cal"
+    cal.mkdir()
+    for name in ("R.ARW", "G.ARW", "B.ARW"):
+        (cal / name).write_bytes(b"\x00")
+
+    def fake_demosaic(path):
+        img = np.zeros((H, W, 3), dtype=np.uint16)
+        stem = Path(path).stem.upper()
+        ch = {"R": 0, "G": 1, "B": 2}[stem]
+        if stem == "B":
+            # ~8% falloff, uniformity ~2.3% (below UNIFORMITY_CLEAN_PCT=3%)
+            # corner=36500: measured falloff≈8.4%, tint drift vs R ≈ 7.2%
+            img[..., ch] = _vignetted(center=40000, corner=36500)
+        else:
+            # ~1% falloff, uniformity ~0.3%
+            img[..., ch] = _vignetted(center=40000, corner=39500)
+        return img
+
+    monkeypatch.setattr(inspect_calibration, "_load_demosaic", fake_demosaic)
+    rc = inspect_calibration.main([str(cal), "--json"])
+    out = capsys.readouterr().out
+    data = json.loads(out)
+
+    # All per-channel falloffs are below FALLOFF_USABLE_PCT (15%) and uniformity
+    # is below UNIFORMITY_CLEAN_PCT (3%), so each _channel_verdict() is "clean".
+    # But tint drift ≈ 7% (B-R) exceeds TINT_DRIFT_FFC_PCT (3%), so classify()
+    # returns "OK with FFC" — overall must be "acceptable".
+    assert rc == 0, f"Expected rc=0 for moderate tint drift (OK with FFC), got rc={rc}"
+    assert data["overall"] == "acceptable", (
+        f"Moderate tint drift must produce 'acceptable' (not 'clean'), "
+        f"got '{data['overall']}'. Per-channel: {data['channels']}"
+    )
+
+    # Confirm every per-channel verdict is "clean" — the "acceptable" overall
+    # comes purely from classify()'s cross-channel tint-drift gate, not from any
+    # individual channel exceeding its per-channel threshold.
+    per_channel_verdicts = [v["verdict"] for v in data["channels"].values()]
+    assert all(v == "clean" for v in per_channel_verdicts), (
+        f"All per-channel verdicts should be 'clean' in this scenario "
+        f"(acceptable comes from cross-channel tint drift only), "
+        f"got {per_channel_verdicts}"
+    )

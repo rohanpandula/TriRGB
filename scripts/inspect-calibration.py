@@ -367,11 +367,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         # that _channel_verdict() cannot evaluate in isolation (WR-01). Per-channel
         # verdicts above stay per-channel; overall must match the authoritative
         # classify() result so the JSON and the text report never disagree.
-        _, json_rc = classify(stats)
-        overall = "fail" if json_rc == 1 else (
-            "acceptable" if any(v["verdict"] == "acceptable" for v in channel_results.values())
-            else "clean"
-        )
+        # classify() has three distinct states: FAIL (rc=1), OK with FFC (rc=0,
+        # message contains "FFC"), and CLEAN (rc=0, no "FFC" in message). We must
+        # distinguish all three — per-channel aggregation alone misses the
+        # tint-drift-only "acceptable" case where all individual channels are clean.
+        classify_msg, json_rc = classify(stats)
+        if json_rc == 1:
+            overall = "fail"
+        elif "FFC" in classify_msg or any(v["verdict"] == "acceptable" for v in channel_results.values()):
+            overall = "acceptable"
+        else:
+            overall = "clean"
         import json
         print(json.dumps({"channels": channel_results, "overall": overall}))
         return json_rc
