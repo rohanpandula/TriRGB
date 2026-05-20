@@ -57,6 +57,38 @@ the Swift enum agree.
 | scroll-log | Log | scroll view |
 | btn-clear-log | Clear log | button |
 
+### Settings (Phase 06)
+
+| ID constant | Display label | Type/control |
+|---|---|---|
+| field-roll-name | Roll name | text field |
+| btn-pick-output | Choose output folder | button |
+| lbl-output-path | Output folder path | label |
+| picker-trigger-mode | Trigger mode | picker |
+| btn-pick-inbox | Choose IED inbox | button |
+| lbl-inbox-path | IED inbox path | label |
+| slider-level-r | Red level | slider |
+| slider-level-g | Green level | slider |
+| slider-level-b | Blue level | slider |
+| stepper-settle-ms | Settle (ms) | stepper |
+| btn-pick-ffc | Choose FFC calibration | button |
+| lbl-ffc-path | FFC calibration path | label |
+| picker-camera-model | Camera model | picker |
+| toggle-stream-composite | Stream composite | toggle |
+| picker-composite-format | Composite format | picker |
+| btn-save-settings | Save Settings | button |
+
+### Calibration (Phase 06)
+
+| ID constant | Display label | Type/control |
+|---|---|---|
+| btn-capture-calibration | Capture Calibration | button |
+| lbl-cal-verdict-r | Red channel verdict | label |
+| lbl-cal-verdict-g | Green channel verdict | label |
+| lbl-cal-verdict-b | Blue channel verdict | label |
+| lbl-cal-overall | Overall verdict | label |
+| btn-use-calibration | Use this calibration | button |
+
 To add a new AX-ID, add the constant to `AccessibilityIDs.swift` first, then
 add a row here. The consistency-check script
 (`scripts/check_docs_consistency.py`, or

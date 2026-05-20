@@ -1,9 +1,9 @@
 """Tests for scripts/check_docs_consistency.py.
 
 Covers:
-  - parse_swift_enum: extracts 23 IDs from the real swift file
+  - parse_swift_enum: extracts 45 IDs from the real swift file
   - parse_swift_enum: excludes schemaVersion symbol and its value "1"
-  - parse_md_reference: extracts 23 IDs from the real markdown file
+  - parse_md_reference: extracts 45 IDs from the real markdown file
   - Real sources are consistent (live end-to-end check)
   - compare detects IDs present in swift but missing from md
   - compare detects IDs present in md but missing from swift
@@ -38,12 +38,13 @@ _MD_FILE = _REPO_ROOT / "docs" / "ax-id-reference.md"
 # parse_swift_enum
 # --------------------------------------------------------------------------
 
-def test_parse_swift_enum_extracts_all_23_ids():
-    """The real AccessibilityIDs.swift should yield exactly 23 AX-ID strings."""
+def test_parse_swift_enum_extracts_all_45_ids():
+    """The real AccessibilityIDs.swift should yield exactly 45 AX-ID strings
+    (23 Phase 01 + 22 Phase 06 settings/calibration)."""
     swift_text = _SWIFT_FILE.read_text()
     result = cdc.parse_swift_enum(swift_text)
-    assert len(result) == 23, (
-        f"expected 23 AX-IDs from swift enum, got {len(result)}: {sorted(result)}"
+    assert len(result) == 45, (
+        f"expected 45 AX-IDs from swift enum, got {len(result)}: {sorted(result)}"
     )
 
 
@@ -64,12 +65,13 @@ def test_parse_swift_enum_excludes_schemaVersion():
 # parse_md_reference
 # --------------------------------------------------------------------------
 
-def test_parse_md_reference_extracts_all_23_ids():
-    """The real docs/ax-id-reference.md should yield exactly 23 AX-ID strings."""
+def test_parse_md_reference_extracts_all_45_ids():
+    """The real docs/ax-id-reference.md should yield exactly 45 AX-ID strings
+    (23 Phase 01 + 22 Phase 06 settings/calibration)."""
     md_text = _MD_FILE.read_text()
     result = cdc.parse_md_reference(md_text)
-    assert len(result) == 23, (
-        f"expected 23 AX-IDs from markdown table, got {len(result)}: {sorted(result)}"
+    assert len(result) == 45, (
+        f"expected 45 AX-IDs from markdown table, got {len(result)}: {sorted(result)}"
     )
 
 
