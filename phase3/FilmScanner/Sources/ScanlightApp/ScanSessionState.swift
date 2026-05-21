@@ -180,9 +180,14 @@ final class ScanCoordinator: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] isRunning in
                 guard let self else { return }
-                // Only act on a false flip that happens mid-scan (not during
-                // our own stop() which transitions phase to .idle first).
-                if !isRunning && self.phase == .scanning {
+                // Act ONLY on an UNEXPECTED false-flip mid-scan — i.e. a real
+                // orchestrator crash. An intentional stopScan() also flips
+                // isRunning false (client.stop() → SIGTERM → termination handler)
+                // while phase is still .scanning and stopScan is awaiting the
+                // grace period; without the !transitionInFlight guard that would
+                // mislabel a normal stop as a crash and double-connect the light
+                // panel. stopScan/startScan set transitionInFlight for exactly this.
+                if !isRunning && self.phase == .scanning && !self.transitionInFlight {
                     Task { @MainActor in
                         await self.handleOrchestratorCrash()
                     }

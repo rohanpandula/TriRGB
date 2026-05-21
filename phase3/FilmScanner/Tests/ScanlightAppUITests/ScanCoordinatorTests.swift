@@ -83,10 +83,20 @@ final class FakeOrchestratorClient: OrchestratorClientProtocol {
         isRunningSubject.send(true)
     }
 
+    /// When true, stop() suspends (Task.yield) AFTER flipping isRunning false —
+    /// mimicking production where the SIGTERM termination handler flips isRunning
+    /// while stopScan() is still awaiting stop()'s grace period (phase still
+    /// .scanning). This lets the test exercise the "normal stop mislabeled as a
+    /// crash" race; without the suspension the race always resolves the safe way.
+    var suspendOnStop: Bool = false
+
     func stop() async {
         callLog.append("stop")
         isRunning = false
         isRunningSubject.send(false)
+        if suspendOnStop {
+            for _ in 0..<5 { await Task.yield() }
+        }
     }
 
     func captureFrame(retake: Bool) async throws -> TripletOutcome {
@@ -223,6 +233,37 @@ final class ScanCoordinatorTests: XCTestCase {
                        "First stop-phase client call must be 'stop'. log: \(stopPhaseClientCalls)")
         XCTAssertEqual(stopPhaseLightCalls.first, "connect",
                        "First stop-phase light call must be 'connect'. log: \(stopPhaseLightCalls)")
+    }
+
+    // MARK: - T2b: a normal stop is NOT mislabeled as a crash
+
+    /// Regression: stopScan() calls client.stop(), which flips isRunning false
+    /// WHILE phase is still .scanning and stopScan is awaiting stop() (the
+    /// grace period in production). The crash monitor must NOT fire for this
+    /// intentional stop — otherwise a normal Stop Scan shows "Orchestrator
+    /// crashed" and connect() runs twice. The !transitionInFlight guard on the
+    /// crash sink closes this. (The fake's suspendOnStop reproduces the timing;
+    /// without the guard this test fails — crash handler runs while suspended.)
+    func testNormalStopIsNotMislabeledAsCrash() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+        client.suspendOnStop = true  // flip isRunning false mid-stop, then suspend
+
+        await coordinator.startScan(settings: makeScanSettings())
+        XCTAssertEqual(coordinator.phase, .scanning)
+        let connectsBefore = lightPanel.callLog.filter { $0 == "connect" }.count
+
+        await coordinator.stopScan()
+        // Give any errantly-scheduled crash Task a chance to run before asserting.
+        for _ in 0..<10 { await Task.yield() }
+
+        XCTAssertEqual(coordinator.phase, .idle)
+        XCTAssertFalse(coordinator.lastError.lowercased().contains("crash"),
+                       "A normal stopScan() must not be mislabeled as a crash. lastError=\(coordinator.lastError)")
+        let connectsAfter = lightPanel.callLog.filter { $0 == "connect" }.count
+        XCTAssertEqual(connectsAfter - connectsBefore, 1,
+                       "stopScan() must connect() exactly once — a spurious crash handler would double-connect")
+        XCTAssertFalse(coordinator.reconnectNeeded,
+                       "A clean stop with a successful reconnect must not flag reconnectNeeded")
     }
 
     // MARK: - T3: manual light actions rejected while scanning
