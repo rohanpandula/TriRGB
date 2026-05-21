@@ -271,4 +271,43 @@ def manual_picker(
     Raises:
         ValueError: if ``(row, col)`` is outside ``[0, H) x [0, W)``.
     """
-    raise NotImplementedError("manual_picker body will be implemented in Task 3")
+    H, W, _ = img.shape
+
+    # 1. Validate click coordinates -- only raise on structurally invalid input.
+    if not (0 <= row < H and 0 <= col < W):
+        raise ValueError(
+            f"click ({row}, {col}) is out of bounds for {H}x{W} image"
+        )
+
+    # 2. Compute neighbourhood size; clamp window to image bounds.
+    nh = nw = max(3, int(min(H, W) * neighborhood_frac))
+    half_h, half_w = nh // 2, nw // 2
+    y0 = max(0, row - half_h)
+    y1 = min(H, row + half_h + 1)
+    x0 = max(0, col - half_w)
+    x1 = min(W, col + half_w + 1)
+    x, y, w, h = x0, y0, x1 - x0, y1 - y0
+    # For an in-bounds (row, col) this guarantees w >= 1 and h >= 1.
+
+    # 3. Measure base_rgb on the actual (possibly edge-shrunk) region.
+    #    No color decision -- purely a numeric readout.
+    region = img[y : y + h, x : x + w, :]
+    base_rgb = (
+        float(region[:, :, 0].mean()),
+        float(region[:, :, 1].mean()),
+        float(region[:, :, 2].mean()),
+    )
+
+    # 4. Uniformity CV on the green channel (reuses _box_filter_2d, NFR-14).
+    uniformity_cv = _measure_uniformity_cv(region[:, :, 1])
+
+    # 5. Construct and return the descriptor.
+    return BaseRegionDescriptor(
+        x=x,
+        y=y,
+        w=w,
+        h=h,
+        base_rgb=base_rgb,
+        uniformity_cv=uniformity_cv,
+        source="manual",
+    )
