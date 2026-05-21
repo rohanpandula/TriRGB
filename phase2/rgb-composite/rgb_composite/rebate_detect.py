@@ -57,6 +57,11 @@ Algorithm details (``detect_rebate``)
 6. Normalise each component to [0, 1] (guard max ≥ 1e-9) and combine.
 7. ``np.argmax`` flat → ``np.unravel_index`` → (best_y_s, best_x_s).
 8. Map bbox to full-resolution space and clamp to image bounds.
+   Actual per-axis ratios ``ry = H/new_h`` and ``rx = W/new_w`` are used
+   (not the scalar ``scale``) to avoid sub-pixel drift from ``int()``
+   flooring.  The winning pixel is the CENTER of its scored window, so
+   ``(best_y_s + 0.5) * ry`` gives the full-res window center; the bbox
+   is built centered on that coordinate.
 9. Measure ``base_rgb`` on the *full-resolution* region (not the proxy).
 10. Measure ``uniformity_cv`` via ``_measure_uniformity_cv`` (reuses
     ``_box_filter_2d`` from ``ffc.py``, NFR-14).
@@ -159,6 +164,19 @@ def detect_rebate(
         ``BaseRegionDescriptor`` with ``source="auto"`` and
         ``schema_version=1``.
     """
+    # Guard: fail closed on wrong dtype or shape.  detect_rebate expects the
+    # output of demosaic_linear, which is always uint16 HxWx3.  A float32 or
+    # wrong-shape input would silently produce meaningless values after the
+    # uint16 clip in step 5 (Laplacian) or the normalisation step.
+    if img.ndim != 3 or img.shape[2] < 3:
+        raise ValueError(
+            f"img must be HxWx3 (or deeper), got shape {img.shape!r}"
+        )
+    if img.dtype != np.uint16:
+        raise ValueError(
+            f"img must be uint16 (demosaic_linear output), got dtype {img.dtype!r}"
+        )
+
     H, W, _ = img.shape  # HxWx3 uint16
 
     # Guard: degenerate all-zero green channel cannot produce a meaningful score.
@@ -216,10 +234,29 @@ def detect_rebate(
     best_y_s, best_x_s = np.unravel_index(int(np.argmax(score)), score.shape)
 
     # 8. Map bbox to full-resolution space + clamp to image bounds.
-    x = max(0, min(W - 1, int(round(best_x_s / scale))))
-    y = max(0, min(H - 1, int(round(best_y_s / scale))))
-    w = max(1, min(W - x, int(round(win / scale))))
-    h = max(1, min(H - y, int(round(win / scale))))
+    #
+    #    Two precision fixes vs the naive ``coord / scale`` approach:
+    #
+    #    (a) CENTER correction: uniform_filter scores each pixel as the CENTER
+    #        of its win×win window, so the winning pixel (best_y_s, best_x_s)
+    #        is the CENTER of the best window in downsampled space, NOT its
+    #        top-left.  Add 0.5 to convert pixel-index to pixel-center before
+    #        scaling, then build a centered bbox in full-res space.
+    #
+    #    (b) PER-AXIS ratio: new_h = int(H*scale) and new_w = int(W*scale)
+    #        both floor, so H/new_h and W/new_w can differ slightly from
+    #        1/scale on non-divisible sizes (up to ~1–2 px drift).  Use the
+    #        actual integer dimensions to compute per-axis ratios.
+    ry = H / float(new_h)   # actual full-res pixels per downsampled pixel, y
+    rx = W / float(new_w)   # actual full-res pixels per downsampled pixel, x
+    cy = (best_y_s + 0.5) * ry   # full-res center of the winning window
+    cx = (best_x_s + 0.5) * rx
+    win_h = max(1, int(round(win * ry)))
+    win_w = max(1, int(round(win * rx)))
+    x = max(0, min(W - win_w, int(round(cx - win_w / 2.0))))
+    y = max(0, min(H - win_h, int(round(cy - win_h / 2.0))))
+    w = win_w
+    h = win_h
 
     # 9. Measure base_rgb on the FULL-RESOLUTION region (not the proxy).
     #    Pitfall 2: INTER_AREA changes means near region boundaries.
@@ -282,18 +319,22 @@ def manual_picker(
     """
     H, W, _ = img.shape
 
-    # 0. Coerce float coords to int (truncation-toward-zero) before bounds check.
-    #    Phase 14 SwiftUI bridge may pass mouse-click coordinates as floats.
-    #    Without this, a float in-bounds coord passes the bounds check but then
-    #    produces float slice indices → TypeError instead of the documented ValueError.
-    row = int(row)
-    col = int(col)
-
-    # 1. Validate click coordinates -- only raise on structurally invalid input.
-    if not (0 <= row < H and 0 <= col < W):
+    # 0. Validate click coordinates against ORIGINAL (pre-truncation) values.
+    #    Negative fractional inputs like -0.1 truncate to 0 under int() and
+    #    would be silently accepted as in-bounds; checking BEFORE truncation
+    #    catches them.  The error message shows the raw input for diagnosability.
+    #    Phase 14 SwiftUI bridge may pass mouse-click coordinates as floats;
+    #    an in-bounds float (e.g. 5.7) passes this check and is then safely
+    #    truncated below.
+    if row < 0 or row >= H or col < 0 or col >= W:
         raise ValueError(
             f"click ({row}, {col}) is out of bounds for {H}x{W} image"
         )
+
+    # 1. Coerce float coords to int (truncation-toward-zero) now that we know
+    #    the original values are in [0, H) × [0, W).
+    row = int(row)
+    col = int(col)
 
     # 2. Compute neighbourhood size; clamp window to image bounds.
     nh = nw = max(3, int(min(H, W) * neighborhood_frac))

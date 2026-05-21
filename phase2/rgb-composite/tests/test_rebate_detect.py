@@ -291,14 +291,144 @@ def test_manual_picker_float_inbounds_truncates():
 def test_manual_picker_float_oob_raises_value_error():
     """manual_picker with float out-of-bounds coord raises ValueError (WR-01).
 
-    float(-1.0) truncates to int(-1) which is out-of-bounds; must raise
-    ValueError (documented), not TypeError.  Confirms the int() coercion
-    happens before the bounds check so the right exception type fires.
+    The bounds check runs on the ORIGINAL (pre-truncation) value, so both
+    float(-1.0) and the negative-fractional -0.1 are caught before int() is
+    called.  float(W) is also out-of-bounds (W is not a valid col index).
     """
     img = make_rebate_strip(height=H, width=W, seed=42)
-    # -1.0 truncates to -1: out-of-bounds → ValueError
+    # -1.0 is negative → ValueError caught pre-truncation
     with pytest.raises(ValueError):
         manual_picker(img, row=-1.0, col=0)
     # float(W) truncates to W: out-of-bounds (W is not a valid col index) → ValueError
     with pytest.raises(ValueError):
         manual_picker(img, row=0, col=float(W))
+
+
+# ===========================================================================
+# NFR-15 peer-review fix tests
+# ===========================================================================
+
+def test_detect_rebate_center_backprojection_formula():
+    """FIX 1: back-projection uses per-axis ratios + center offset (NFR-15).
+
+    Regression guard for two bugs in the old formula:
+    (a) ``best_y_s / scale`` treats the scored pixel as TOP-LEFT of the window;
+        correct formula is ``(best_y_s + 0.5) * ry - win_h/2`` (center offset).
+    (b) Single ``scale`` was used for both axes; correct is per-axis
+        ``ry = H / new_h``, ``rx = W / new_w``.
+
+    Test method: build a synthetic uint16 image with a bright stripe at rows
+    200..299 (not at y=0) and use a custom ``long_edge_target`` to force the
+    downsampled ``best_y_s > 0``.  When the best window is not clamped to the
+    top edge, the center-offset formula gives a DIFFERENT ``y`` than the old
+    top-left formula.  We compute both expected values and assert the result
+    matches the center-offset (correct) formula.
+    """
+    import cv2
+    from scipy.ndimage import uniform_filter as _uf
+
+    H, W = 500, 1600
+    long_edge_target = 400
+    stripe_y0, stripe_y1 = 200, 300
+
+    # Build synthetic image: dark body, bright uniform stripe at rows 200..299.
+    rng = np.random.default_rng(99)
+    img = np.zeros((H, W, 3), dtype=np.uint16)
+    body = rng.normal(3000, 100, (H, W, 3)).clip(0, 65535).astype(np.uint16)
+    img[:] = body
+    img[stripe_y0:stripe_y1, :, :] = (
+        rng.normal(40000, 30, (stripe_y1 - stripe_y0, W, 3)).clip(0, 65535).astype(np.uint16)
+    )
+
+    desc = detect_rebate(img, long_edge_target=long_edge_target)
+
+    # Replicate score map to find best_y_s and compute BOTH expected y values.
+    scale = min(1.0, long_edge_target / max(H, W))
+    new_h, new_w = int(H * scale), int(W * scale)
+    ry = H / float(new_h)
+    rx = W / float(new_w)
+    green_s = cv2.resize(
+        img[:, :, 1], (new_w, new_h), interpolation=cv2.INTER_AREA
+    ).astype(np.float32)
+    win = max(3, int(min(new_h, new_w) * 0.05))
+    mean_map = _uf(green_s, size=win, mode="nearest").astype(np.float64)
+    mean_sq = _uf((green_s ** 2).astype(np.float64), size=win, mode="nearest")
+    var_map = np.maximum(mean_sq - mean_map ** 2, 0.0)
+    cv_map = (np.sqrt(var_map) / np.maximum(mean_map, 1.0)).astype(np.float32)
+    lap = cv2.Laplacian(green_s.clip(0, 65535).astype(np.uint16), cv2.CV_64F)
+    detail_map = _uf(np.abs(lap).astype(np.float32), size=win, mode="nearest")
+    b = (mean_map.astype(np.float32) / max(float(mean_map.max()), 1e-9)).clip(0, 1)
+    c = (cv_map / max(float(cv_map.max()), 1e-9)).clip(0, 1)
+    d = (detail_map / max(float(detail_map.max()), 1e-9)).clip(0, 1)
+    score = b - c - d
+    best_y_s, _ = np.unravel_index(int(np.argmax(score)), score.shape)
+
+    # Center-offset formula (FIX 1 — correct):
+    win_h = max(1, int(round(win * ry)))
+    cy_correct = (best_y_s + 0.5) * ry
+    y_correct = max(0, min(H - win_h, int(round(cy_correct - win_h / 2.0))))
+
+    # Old formula (wrong — top-left placed at scored center):
+    y_wrong = max(0, min(H - 1, int(round(best_y_s / scale))))
+
+    # The bright stripe is at rows 200..299 so best_y_s > 0: both formulas
+    # differ (the fixture is designed so the stripe is not at the image edge).
+    assert best_y_s > 0, (
+        "best_y_s==0 means the stripe is at the image top; test fixture would not "
+        "distinguish the two formulas (both are clamped to y=0)"
+    )
+    assert y_correct != y_wrong, (
+        f"y_correct={y_correct} == y_wrong={y_wrong}; formulas do not differ for "
+        f"best_y_s={best_y_s} — choose a different fixture"
+    )
+
+    assert desc.y == y_correct, (
+        f"desc.y={desc.y} does not match center-offset formula y={y_correct}; "
+        f"old top-left formula would give y={y_wrong}.  "
+        f"Center-offset back-projection may not be applied."
+    )
+    # Bbox must remain within image bounds
+    assert desc.x >= 0 and desc.y >= 0
+    assert desc.x + desc.w <= W
+    assert desc.y + desc.h <= H
+
+
+def test_detect_rebate_float32_input_raises_value_error():
+    """FIX 2: float32 input raises ValueError (dtype guard, NFR-15).
+
+    detect_rebate expects uint16 (demosaic_linear output).  A float32 array
+    with the same shape must be rejected with a clear ValueError before any
+    computation, not silently produce garbage via uint16 clipping.
+    """
+    img_f32 = np.ones((H, W, 3), dtype=np.float32) * 0.5
+    with pytest.raises(ValueError, match="uint16"):
+        detect_rebate(img_f32)
+
+
+def test_manual_picker_negative_fractional_oob_raises():
+    """FIX 3: manual_picker rejects negative fractional coords pre-truncation (NFR-15).
+
+    row=-0.1 truncates to 0 under int(), which is in-bounds — the old code
+    would silently accept it.  After the fix, the bounds check runs on the
+    original float value so -0.1 is correctly rejected.
+
+    Also confirms that a positive in-bounds float (5.7) is still accepted and
+    truncates to the corresponding integer (5), returning a valid descriptor.
+    """
+    img = make_rebate_strip(height=H, width=W, seed=42)
+
+    # -0.1 must raise even though int(-0.1) == 0
+    with pytest.raises(ValueError):
+        manual_picker(img, row=-0.1, col=0)
+
+    # -0.9 must also raise (int(-0.9) == 0 truncates toward zero in Python)
+    with pytest.raises(ValueError):
+        manual_picker(img, row=0, col=-0.9)
+
+    # In-bounds positive float: 5.7 → truncates to 5, must succeed
+    desc = manual_picker(img, row=5.7, col=10.3)
+    assert isinstance(desc, BaseRegionDescriptor)
+    # Must match the integer-truncated call
+    desc_int = manual_picker(img, row=5, col=10)
+    assert desc.x == desc_int.x and desc.y == desc_int.y and \
+           desc.w == desc_int.w and desc.h == desc_int.h
