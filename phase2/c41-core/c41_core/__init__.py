@@ -16,11 +16,11 @@ __all__ = [
     "ChannelCalibration",
     "CalibrationResult",
     "InversionParams",
-    # fixtures (added in Task 2)
+    # fixtures
     "make_c41_negative",
     "make_rebate_strip",
     "DEFAULT_SEED",
 ]
 
-# Fixtures imported after __all__ is defined (populated in Task 2)
+# Fixtures are imported after __all__ to silence the E402 lint rule
 from .fixtures import make_c41_negative, make_rebate_strip, DEFAULT_SEED  # noqa: E402
