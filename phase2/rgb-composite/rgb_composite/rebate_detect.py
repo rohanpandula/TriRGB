@@ -282,6 +282,13 @@ def manual_picker(
     """
     H, W, _ = img.shape
 
+    # 0. Coerce float coords to int (truncation-toward-zero) before bounds check.
+    #    Phase 14 SwiftUI bridge may pass mouse-click coordinates as floats.
+    #    Without this, a float in-bounds coord passes the bounds check but then
+    #    produces float slice indices → TypeError instead of the documented ValueError.
+    row = int(row)
+    col = int(col)
+
     # 1. Validate click coordinates -- only raise on structurally invalid input.
     if not (0 <= row < H and 0 <= col < W):
         raise ValueError(

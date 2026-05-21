@@ -231,3 +231,37 @@ def test_manual_picker_uniformity_cv_in_range():
     assert 0.0 <= desc.uniformity_cv <= 100.0, (
         f"uniformity_cv={desc.uniformity_cv} is outside [0, 100]"
     )
+
+
+def test_manual_picker_float_inbounds_truncates():
+    """manual_picker with float in-bounds coords truncates and succeeds (WR-01).
+
+    Phase 14 SwiftUI bridge may pass mouse-click coords as floats (e.g. 0.5).
+    These must truncate to the corresponding int and return a valid descriptor,
+    not crash with TypeError.
+    """
+    img = make_rebate_strip(height=H, width=W, seed=42)
+    # 0.5 truncates to 0 — valid in-bounds coord
+    desc = manual_picker(img, row=float(H // 2) + 0.7, col=float(W // 2) + 0.9)
+    assert isinstance(desc, BaseRegionDescriptor), "Should return BaseRegionDescriptor"
+    # The returned bbox should match the int-truncated coords
+    desc_int = manual_picker(img, row=H // 2, col=W // 2)
+    assert desc.x == desc_int.x and desc.y == desc_int.y, (
+        "float truncated coord should produce same bbox as int coord"
+    )
+
+
+def test_manual_picker_float_oob_raises_value_error():
+    """manual_picker with float out-of-bounds coord raises ValueError (WR-01).
+
+    float(-1.0) truncates to int(-1) which is out-of-bounds; must raise
+    ValueError (documented), not TypeError.  Confirms the int() coercion
+    happens before the bounds check so the right exception type fires.
+    """
+    img = make_rebate_strip(height=H, width=W, seed=42)
+    # -1.0 truncates to -1: out-of-bounds → ValueError
+    with pytest.raises(ValueError):
+        manual_picker(img, row=-1.0, col=0)
+    # float(W) truncates to W: out-of-bounds (W is not a valid col index) → ValueError
+    with pytest.raises(ValueError):
+        manual_picker(img, row=0, col=float(W))
