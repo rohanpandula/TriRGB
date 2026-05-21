@@ -415,6 +415,12 @@ def invert_composite(
         raise ValueError(
             f"triplet must be HxWx3, got shape {triplet.shape}"
         )
+    if triplet.dtype != np.uint16:
+        raise ValueError(
+            f"triplet dtype must be uint16 (HxWx3 uint16 contract), got {triplet.dtype}; "
+            "non-uint16 arrays (e.g. float with NaN) are rejected to prevent silent "
+            "data corruption in astype(uint16)"
+        )
     if any(b < _MIN_BASE_CHANNEL for b in descriptor.base_rgb):
         raise ValueError(
             f"base_rgb {descriptor.base_rgb} has a channel below the minimum "
