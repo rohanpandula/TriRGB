@@ -5,6 +5,7 @@ from .contracts import (
     ChannelCalibration,
     CalibrationResult,
     InversionParams,
+    FlatFieldResult,
 )
 
 __version__ = "0.1.0"
@@ -16,6 +17,7 @@ __all__ = [
     "ChannelCalibration",
     "CalibrationResult",
     "InversionParams",
+    "FlatFieldResult",
     # fixtures
     "make_c41_negative",
     "make_rebate_strip",

@@ -47,6 +47,7 @@ __all__ = [
     "ChannelCalibration",
     "CalibrationResult",
     "InversionParams",
+    "FlatFieldResult",
 ]
 
 
@@ -336,3 +337,64 @@ class InversionParams(JsonContract):
             self, "tone_curve_params",
             tuple(float(v) for v in self.tone_curve_params),
         )
+
+
+# ---------------------------------------------------------------------------
+# FlatFieldResult
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class FlatFieldResult(JsonContract):
+    """Averaged flat-field capture record for radiometric FFC (R-26).
+
+    Records the metadata for an N-frame averaged flat captured at working
+    brightness after LED warmup, following the Phase 08 hardened-contract
+    conventions (finite, non-negative numeric fields, schema_version int).
+
+    flat_data_path references the averaged flat on disk (path/id to an
+    HxWx3 uint16 NPY file or directory of ARWs) — NOT embedded arrays,
+    consistent with CalibrationResult.ffc_cal_dir.
+
+    uniformity_improvement is CV(single_frame) / CV(averaged), a ratio >
+    1.0 meaning the averaged flat is more uniform than any single frame.
+
+    No from_json override is needed: all fields are primitive types (str,
+    int, float).  The default JsonContract.from_json (cls(**json.loads(s)))
+    works directly — no nested dataclass reconstruction required.  Do NOT
+    add a custom from_json (Pitfall 4 — that would be copying
+    CalibrationResult's nested-reconstruction override unnecessarily).
+
+    schema_version bumped when fields are added (starts at 1).
+    """
+
+    flat_data_path: str
+    n_frames_averaged: int
+    warmup_s: float
+    black_level_r: float
+    black_level_g: float
+    black_level_b: float
+    working_brightness: int          # LED level used during flat capture, 0-255
+    uniformity_improvement: float    # CV(single_frame) / CV(avg_frame) — > 1.0 means improvement
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.n_frames_averaged < 1:
+            raise ValueError(
+                f"n_frames_averaged must be >= 1, got {self.n_frames_averaged}"
+            )
+        if self.warmup_s < 0:
+            raise ValueError(f"warmup_s must be >= 0, got {self.warmup_s}")
+        if not 0 <= self.working_brightness <= 255:
+            raise ValueError(
+                f"working_brightness must be 0-255, got {self.working_brightness}"
+            )
+        for name, val in (
+            ("black_level_r", self.black_level_r),
+            ("black_level_g", self.black_level_g),
+            ("black_level_b", self.black_level_b),
+            ("uniformity_improvement", self.uniformity_improvement),
+        ):
+            if not math.isfinite(val):
+                raise ValueError(f"{name} must be finite, got {val}")
+            if val < 0:
+                raise ValueError(f"{name} must be >= 0, got {val}")

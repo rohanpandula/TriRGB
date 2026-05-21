@@ -15,6 +15,7 @@ from c41_core.contracts import (
     BaseRegionDescriptor,
     CalibrationResult,
     ChannelCalibration,
+    FlatFieldResult,
     InversionParams,
     JsonContract,
 )
@@ -484,3 +485,82 @@ def test_calibration_result_rejects_wrong_channel_in_b_slot():
             base_region=make_brd(),
             ffc_cal_dir="/tmp",
         )
+
+
+# ---------------------------------------------------------------------------
+# FlatFieldResult — round-trip, validation, schema_version (Phase 10 R-26)
+# ---------------------------------------------------------------------------
+
+def make_flat_field_result() -> FlatFieldResult:
+    """Return a valid FlatFieldResult instance for testing."""
+    return FlatFieldResult(
+        flat_data_path="/tmp/flat.npy",
+        n_frames_averaged=8,
+        warmup_s=5.0,
+        black_level_r=250.0,
+        black_level_g=255.0,
+        black_level_b=240.0,
+        working_brightness=200,
+        uniformity_improvement=2.83,
+    )
+
+
+def test_flat_field_result_round_trip():
+    """FlatFieldResult round-trips through JSON using the DEFAULT mixin (no override)."""
+    ffr = make_flat_field_result()
+    restored = FlatFieldResult.from_json(ffr.to_json())
+    assert restored == ffr
+    # Confirm the default mixin is in use — no custom from_json on the class
+    assert "from_json" not in FlatFieldResult.__dict__, (
+        "FlatFieldResult must NOT define a custom from_json — "
+        "all fields are primitive, the default mixin works directly"
+    )
+    # Confirm all fields are plain primitives (not nested dicts) after round-trip
+    assert isinstance(restored.flat_data_path, str)
+    assert isinstance(restored.n_frames_averaged, int)
+    assert isinstance(restored.warmup_s, float)
+    assert isinstance(restored.working_brightness, int)
+    assert isinstance(restored.uniformity_improvement, float)
+
+
+def test_flat_field_result_validation():
+    """FlatFieldResult.__post_init__ rejects all invalid construction cases."""
+    base = dict(
+        flat_data_path="/tmp/flat.npy",
+        n_frames_averaged=8,
+        warmup_s=5.0,
+        black_level_r=250.0,
+        black_level_g=255.0,
+        black_level_b=240.0,
+        working_brightness=200,
+        uniformity_improvement=2.83,
+    )
+    # n_frames_averaged < 1
+    with pytest.raises(ValueError, match="n_frames_averaged"):
+        FlatFieldResult(**{**base, "n_frames_averaged": 0})
+    # warmup_s < 0
+    with pytest.raises(ValueError, match="warmup_s"):
+        FlatFieldResult(**{**base, "warmup_s": -1.0})
+    # working_brightness out of range
+    with pytest.raises(ValueError, match="working_brightness"):
+        FlatFieldResult(**{**base, "working_brightness": 300})
+    # non-finite black level — infinity
+    with pytest.raises(ValueError, match="black_level_r"):
+        FlatFieldResult(**{**base, "black_level_r": float("inf")})
+    # non-finite black level — NaN
+    with pytest.raises(ValueError, match="black_level_g"):
+        FlatFieldResult(**{**base, "black_level_g": float("nan")})
+    # negative uniformity_improvement
+    with pytest.raises(ValueError, match="uniformity_improvement"):
+        FlatFieldResult(**{**base, "uniformity_improvement": -0.1})
+
+
+def test_flat_field_result_schema_version_present():
+    """schema_version defaults to 1 and appears in the JSON output."""
+    ffr = make_flat_field_result()
+    assert ffr.schema_version == 1
+    serialized = ffr.to_json()
+    assert "schema_version" in serialized
+    import json as _json
+    d = _json.loads(serialized)
+    assert d["schema_version"] == 1
