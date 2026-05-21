@@ -5,6 +5,7 @@ from .composite import (
     OUTPUT_FORMATS,
     composite_triplet,
     demosaic_linear,
+    invert_composite,
 )
 from .dng import (
     build_dng_extratags,
@@ -26,6 +27,7 @@ __all__ = [
     # composite
     "composite_triplet",
     "demosaic_linear",
+    "invert_composite",
     "DEMOSAIC_KWARGS",
     "DimensionMismatchError",
     "OUTPUT_FORMATS",
