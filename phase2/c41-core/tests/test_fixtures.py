@@ -124,8 +124,13 @@ def test_fixture_orange_mask_realism():
         f"Blue density swing ({b_ratio:.1f}) must exceed red density swing ({r_ratio:.1f})"
     )
 
-    # No clipping (values must be below 65535)
-    assert arr.max() < 65535, "No pixel should clip to 65535 in the default fixture"
+    # No saturation: default bases (~12k) are far from the 16-bit ceiling.
+    # The clip in make_c41_negative allows exactly 65535, so use <= 65534
+    # to confirm the default fixture doesn't reach the saturation boundary.
+    assert arr.max() <= 65534, (
+        f"Default fixture should not reach 65535 (got {arr.max()}); "
+        "suggests unrealistically high base or noise params"
+    )
 
 
 def test_fixture_blue_attenuation():
