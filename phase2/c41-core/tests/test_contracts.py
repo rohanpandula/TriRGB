@@ -606,3 +606,69 @@ def test_flat_field_result_schema_version_present():
     import json as _json
     d = _json.loads(serialized)
     assert d["schema_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# CheckResult — JSON round-trip and fail-closed validation (Phase 13 R-28)
+# ---------------------------------------------------------------------------
+
+from c41_core.contracts import CheckResult  # noqa: E402  (import after guard tests above)
+
+
+def test_check_result_json_roundtrip():
+    """SC-5 (canonical): CheckResult.from_json(r.to_json()) == r, deltas stays dict.
+
+    No from_json override needed — dict[str, float] round-trips natively through
+    the default JsonContract mixin (Pitfall 4: do NOT add a custom from_json).
+    """
+    original = CheckResult(
+        name="registration",
+        passed=False,
+        deltas={"g_vs_r_dx": 3.0, "g_vs_r_dy": 5.0, "b_vs_r_dx": -2.0, "b_vs_r_dy": 0.0},
+    )
+    restored = CheckResult.from_json(original.to_json())
+    assert restored.name == original.name
+    assert restored.passed == original.passed
+    assert restored.deltas == original.deltas
+    assert restored.schema_version == original.schema_version
+    assert isinstance(restored.deltas, dict), "deltas must remain a dict after round-trip"
+    # Confirm no custom from_json — the default mixin handles it (Pitfall 4)
+    assert "from_json" not in CheckResult.__dict__, (
+        "CheckResult must NOT define a custom from_json — "
+        "dict[str, float] round-trips natively via the default mixin"
+    )
+
+
+def test_check_result_validation():
+    """CheckResult.__post_init__ is fail-closed: all invalid construction cases raise."""
+    valid_kw = dict(name="registration", passed=True, deltas={"dx": 0.0})
+
+    # Empty name raises ValueError
+    with pytest.raises(ValueError, match="name"):
+        CheckResult(**{**valid_kw, "name": ""})
+
+    # Whitespace-only name raises ValueError
+    with pytest.raises(ValueError, match="name"):
+        CheckResult(**{**valid_kw, "name": "   "})
+
+    # passed=1 (non-bool int) raises TypeError
+    with pytest.raises(TypeError, match="passed"):
+        CheckResult(**{**valid_kw, "passed": 1})  # type: ignore[arg-type]
+
+    # schema_version=0 raises ValueError
+    with pytest.raises(ValueError, match="schema_version"):
+        CheckResult(**{**valid_kw, "schema_version": 0})
+
+    # deltas=[...] (non-dict) raises TypeError
+    with pytest.raises(TypeError, match="deltas"):
+        CheckResult(**{**valid_kw, "deltas": [1.0, 2.0]})  # type: ignore[arg-type]
+
+    # non-finite delta value raises ValueError
+    with pytest.raises(ValueError, match="deltas"):
+        CheckResult(**{**valid_kw, "deltas": {"dx": float("nan")}})
+
+    # Happy path: valid construction raises nothing
+    cr = CheckResult(name="registration", passed=True, deltas={"dx": 1.5, "dy": -0.3})
+    assert cr.name == "registration"
+    assert cr.passed is True
+    assert cr.schema_version == 1
