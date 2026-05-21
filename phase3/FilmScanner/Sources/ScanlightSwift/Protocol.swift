@@ -20,6 +20,16 @@ public enum ScanlightProtocol {
     // architecture, Configuration B.
     public static let h2dShutterPulse: UInt8 = 3
 
+    // The remaining H2D packets exist in the firmware but this client never
+    // sends them. DFU_MODE (4) reboots into the RP2040 bootloader for flashing
+    // (manual/recovery only). SET_TRIM (5)/GET_TRIM (6) write per-channel NVM
+    // trim, compiled ONLY for the BSL1 board (`#ifdef HW_VERSION_BSL1`); on the
+    // Scanlight v4 (SL4 build) they are no-ops, and we correct per-channel in
+    // software anyway. Defined for a faithful mirror of the firmware protocol.h.
+    public static let h2dDFUMode: UInt8 = 4
+    public static let h2dSetTrim: UInt8 = 5
+    public static let h2dGetTrim: UInt8 = 6
+
     // Shutter-pulse byte encoding: the firmware accepts one byte
     // representing pulse length in 10 ms units, clamped to [1, 255]
     // → 10 ms … 2550 ms.
@@ -27,11 +37,17 @@ public enum ScanlightProtocol {
     public static let shutterPulseMinMs: Int = 10
     public static let shutterPulseMaxMs: Int = 2550
 
-    // Device-to-host headers
+    // Device-to-host headers.
+    // D2H_ACK (0) is a dead opcode — declared by the firmware but never sent
+    // (verified against main.c/protocol.c). D2H_TRIM (5) is the GET_TRIM reply,
+    // BSL1-only and never emitted by the v4 SL4 build. Both defined only for a
+    // complete mirror of the firmware protocol.h; neither is handled here.
+    public static let d2hACK: UInt8 = 0
     public static let d2hLEDTemp: UInt8 = 1
     public static let d2hVBUS: UInt8 = 2
     public static let d2hFWVersion: UInt8 = 3
     public static let d2hDefaultRGB: UInt8 = 4
+    public static let d2hTrim: UInt8 = 5
 
     public enum ProtocolError: Error, Equatable {
         case headerOutOfRange(Int)

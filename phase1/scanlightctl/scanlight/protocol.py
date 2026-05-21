@@ -26,13 +26,33 @@ H2D_GET_FW_VERSION = 2
 # `docs/optical_dry_run.md` for the operator-side rules.
 H2D_SHUTTER_PULSE = 3
 
+# The remaining H2D packets exist in the firmware (firmware_bsl1/protocol.h)
+# but this client deliberately does not send them:
+#   DFU_MODE (4) — reboots into the RP2040 USB bootloader for firmware
+#       flashing (`reset_usb_boot`). Flashing is a manual/recovery operation,
+#       not part of scanning — see HANDOFF.md "Manual firmware flash".
+#   SET_TRIM (5) / GET_TRIM (6) — per-channel signed brightness trim stored in
+#       NVM. Compiled ONLY for the BSL1 board (`#ifdef HW_VERSION_BSL1` in
+#       main.c); on the Scanlight v4 (the SL4 build, HW_VERSION_ID == 1) these
+#       are no-ops. We do per-channel correction in software (FFC + per-channel
+#       levels), so we never write device-side trim. Defined here only so this
+#       module is a faithful, complete mirror of the firmware's protocol.h.
+H2D_DFU_MODE = 4
+H2D_SET_TRIM = 5
+H2D_GET_TRIM = 6
+
 # Device-to-host headers
-# D2H_ACK (header 0) is declared by the firmware/web app but never handled
-# in the canonical Vue app — we likewise drop ACK frames on the floor.
+# D2H_ACK (header 0) is declared by the firmware/web app but is a dead opcode —
+# no firmware send-site emits it (verified against main.c/protocol.c). Defined
+# for completeness; we never wait for or handle an ACK frame.
+D2H_ACK = 0
 D2H_LED_TEMP = 1
 D2H_VBUS = 2
 D2H_FW_VERSION = 3
 D2H_DEFAULT_RGB = 4
+# D2H_TRIM (5) — response to GET_TRIM. BSL1-only (see SET_TRIM/GET_TRIM above);
+# never emitted by the v4 SL4 build and never requested by this client.
+D2H_TRIM = 5
 
 # Shutter-pulse byte encoding (per canonical `app_bsl/src/components/Main.vue`):
 # the firmware takes one byte representing pulse length in units of 10 ms,

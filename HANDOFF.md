@@ -260,15 +260,28 @@ Open the resulting `/Volumes/SSD/Scans/TestRoll/composites/*.tif` in FilmLab or 
 
 These are the places I made a best-guess that might be wrong. Each has a how-to-check.
 
-### Assumption 1 — Scanlight USB VID:PID is `2E8A:000A`
+### Assumption 1 — Scanlight USB VID:PID is `2E8A:000A` — **CONFIRMED FROM CODE (2026-05-20)**
 
-**Source of assumption:** firmware uses `pico_enable_stdio_usb` in its CMakeLists, which is the stock Pico SDK USB CDC. Stock VID:PID for that is `2E8A:000A`.
+**Resolved against the upstream firmware build** (`jackw01/scanlight` @ c8bf780):
+`firmware_bsl1/CMakeLists.txt` enables USB CDC via the stock
+`pico_enable_stdio_usb` on **both** build targets (`bsl1_controller`,
+`sl4_controller`) and ships **no custom USB descriptor / tusb_config** (none
+exists anywhere in the firmware tree). So the device enumerates with the Pico
+SDK default `2E8A:000A`. `discover_port()` already matches VID `0x2E8A` + PID
+`{0x000A, 0x0009}` with a name/usbmodem/override fallback chain, so it is
+correct regardless. No longer a guess.
 
-**How to verify:** plug in the Scanlight, run diagnose.py. Step 2 prints all ports with VID:PID. If the Scanlight shows up under a *different* VID:PID, update `discover_port()` in `phase1/scanlightctl/scanlight/device.py`. The auto-discovery already has a fallback chain (Pico VID → "scanlight" name match → single usbmodem → user override), so even if the assumption is wrong the code will still work — the fallback just kicks in.
+**Still worth a glance on plug-in:** diagnose.py step 2 prints the actual
+VID:PID. Only a future firmware that adds a custom descriptor would change it.
 
-### Assumption 2 — Default baud rate 115200 works for the CDC port
+### Assumption 2 — Default baud rate 115200 — **CONFIRMED FROM CODE (2026-05-20)**
 
-USB CDC is a *virtual* serial protocol — baud rate is nominally ignored by the device. We pick 115200 because pyserial requires a value. Most firmware ignores it; some validates it. If `scanlightctl status` hangs after open, try 9600.
+The canonical web app (`app_bsl/src/protocol.js`) hardcodes
+`UART_BAUD_RATE = 115200` and opens the port with `{ baudRate: 115200 }`. The
+firmware uses `stdio_init_all()` over USB CDC, where baud is a virtual no-op
+(ignored by the device). Our `DEFAULT_BAUDRATE = 115200` matches the web app
+exactly — not a guess anymore. (If `status` ever hangs after open it's a port
+or self-test-timing issue, not baud.)
 
 ### Assumption 3 — RAW file size band 40–120 MB
 
@@ -354,7 +367,52 @@ These are real behaviors of the Scanlight v4 firmware (`automation/firmware_bsl1
 - **Upstream web app's firmware-version table is stale.** `automation/app_bsl/src/config.js` only lists FW ID 0 → "v1.0.0", but current firmware (`automation/firmware_bsl1/config.h`) reports FW ID 1. The web app will display "Unknown firmware version" and a spurious "Update available" prompt when connected to current firmware. Ignore — FW ID 1 = v1.1.0 = current, per `bsl_control_interface.md`. We use raw integer IDs internally so this doesn't affect us.
 - **Manual firmware flash** (in case the web app's DFU button is unavailable): hold the Scanlight's DFU button while plugging in the LEFT USB-C port → an `RPI-RP2` volume mounts on the Mac → run `python3 /tmp/scanlight/automation/autoflasher.py /tmp/scanlight/automation/sl4_controller_v1.1.uf2` (or copy the `.uf2` file directly onto the mounted volume). The `.uf2` lives at `automation/` in the upstream repo, not at the repo root. Use this if you ever need to recover from a bricked or development firmware.
 
-- **`PKT_D2H_ACK` (header 0) is a dead opcode.** The upstream `protocol.h` declares it but no firmware send-site uses it. Our `scanlight/protocol.py` doesn't define it either — never poll or wait for an ACK packet; you won't receive one. Confirmed against `/tmp/scanlight/automation/firmware_bsl1/main.c` and `protocol.c` (no `protocol_send_packet(PKT_D2H_ACK, ...)` calls anywhere).
+- **`PKT_D2H_ACK` (header 0) is a dead opcode.** The upstream `protocol.h` declares it but no firmware send-site emits it (confirmed against `firmware_bsl1/main.c` + `protocol.c`). Our `protocol.py`/`Protocol.swift` now define `D2H_ACK = 0` for a complete protocol mirror, but never poll or wait for an ACK frame — you won't receive one.
+
+---
+
+## Protocol re-verification against jackw01/scanlight (2026-05-20, @ c8bf780)
+
+Full byte-for-byte re-check of our serial codec against the two ground-truth
+implementations — the firmware (`firmware_bsl1/main.c`, `protocol.c`) and the
+canonical web app (`app_bsl/src/protocol.js`). **Every field matched; no codec
+changes were needed.** Specifically verified:
+
+- **Framing** `0xFE | header | length | data[length]` — identical in our
+  `encode_packet`, the firmware RX state machine, and the web app.
+- **`SET_COLOR`** payload is `R,G,B,W,IR,save` — firmware does
+  `memcpy(color, data, 5)` then treats `data[5]` as the save flag
+  (`main.c` ~line 265). Matches our `[r,g,b,w,0,save]`.
+- **`FW_VERSION`** = `FW_ID + (HW_ID << 16)` sent big-endian — matches our
+  `fw = word & 0xFFFF`, `hw = word >> 16`.
+- **`SHUTTER_PULSE`** = one byte × 10 ms (`shutter_pulse_timer = millis +
+  data[0] * 10`). Matches our `pulse_ms // 10`.
+- **`LED_TEMP` / `VBUS`** are sent as **signed** `int32` big-endian
+  (`protocol_send_packet_int32`). Matches our signed BE decode.
+- **`DEFAULT_RGB`** = 3 bytes R,G,B. Matches.
+- **Baud / VID:PID** — see Assumptions 1 & 2 above (both now confirmed).
+
+**Hardware variant — confirm on plug-in.** The firmware has two build targets:
+`bsl1_controller` (HW_VERSION_BSL1, id 0) and `sl4_controller`
+(HW_VERSION_SL4, id 1). The Scanlight **v4 runs the SL4 build → HW id 1**. On
+plug-in, `scanlightctl status` prints the HW id: **expect `hw=1`**. `hw=0`
+would mean a BSL1 board (different power limits, an extra IR channel, TRIM
+enabled). The wire protocol is identical either way — our code works for both;
+only the device's internal behavior differs.
+
+**Packets we intentionally don't drive (now documented in `protocol.py`):**
+- **`SET_TRIM` (5) / `GET_TRIM` (6) / `D2H_TRIM` (5)** — per-channel signed NVM
+  brightness trim. Compiled **only** for BSL1 (`#ifdef HW_VERSION_BSL1` in
+  `main.c`); **no-ops on the v4 (SL4)**. We correct per-channel in software
+  (FFC + per-channel levels), so device-side trim is unnecessary even on BSL1.
+- **`DFU_MODE` (4)** — `reset_usb_boot()` into the RP2040 bootloader for
+  flashing. Available on both boards; a manual/recovery operation only (see
+  "Manual firmware flash"), never part of scanning.
+
+**Two firmware behaviors worth re-stating** (both confirmed in `main.c`, both
+already accounted for): every `SET_COLOR` sets `led_enable = 1` (sending a
+color always turns output on), and white/RGB exclusivity is enforced
+**device-side** (`update_pwm` zeros RGB when W>0) on top of our client guard.
 
 ---
 
