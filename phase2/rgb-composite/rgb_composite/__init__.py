@@ -22,6 +22,9 @@ from .ffc import (
     load_ffc_maps,
 )
 from .rebate_detect import detect_rebate, manual_picker
+# checks (Phase 13 R-28)
+from .checks import check_base_neutrality, check_frame_anomaly, check_registration
+from c41_core.contracts import CheckResult
 
 __all__ = [
     # composite
@@ -46,5 +49,10 @@ __all__ = [
     # rebate_detect (Phase 09)
     "detect_rebate",
     "manual_picker",
+    # checks (Phase 13)
+    "check_registration",
+    "check_base_neutrality",
+    "check_frame_anomaly",
+    "CheckResult",
 ]
 __version__ = "0.2.0"
