@@ -32,6 +32,8 @@ import tifffile
 
 logger = logging.getLogger("rgb_composite")
 
+from c41_core.contracts import BaseRegionDescriptor, InversionParams
+
 from .dng import write_linear_dng
 from .ffc import (
     CalibrationError,
@@ -298,6 +300,158 @@ def composite_triplet(
         )
 
     return primary
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 inversion extensions (additive — NFR-14)
+# ---------------------------------------------------------------------------
+
+# Fail-closed guard for a near-zero base calibration value.  The smallest
+# real base channel in practice is blue (~2952 for Sony a7CR no-WB).  100.0
+# is well below any plausible real value, so only a calibration failure (e.g.
+# a mis-detected dark region) would fall below it.
+# InversionParams.__post_init__ already guarantees white_point > black_point
+# per channel (CR-02), so no inversion-denominator guard is needed here.
+_MIN_BASE_CHANNEL: float = 100.0
+
+
+def _apply_tone_curve(
+    data: np.ndarray,
+    tone_curve_id: str,
+    tone_curve_params: tuple,
+) -> np.ndarray:
+    """Apply a tone curve to HxWx3 float32 data in the range [0, 1].
+
+    Phase 11 implements ONLY the ``"linear"`` (identity) tone curve.  The
+    dispatch structure is present so a future phase can add an ``elif`` branch
+    without touching Phase 11 logic.  gamma is NOT applied here — see
+    ``invert_composite``.
+
+    Args:
+        data: HxWx3 float32 array, values in [0, 1] after Step 3 clip.
+        tone_curve_id: Identifier string.  Only ``"linear"`` is supported.
+        tone_curve_params: Tuple of float params (empty for ``"linear"``).
+
+    Returns:
+        The (possibly transformed) array.  For ``"linear"``, returns ``data``
+        unchanged (identity — SC-1 monotonic tone satisfied).
+
+    Raises:
+        NotImplementedError: for any ``tone_curve_id`` other than ``"linear"``.
+    """
+    if tone_curve_id == "linear":
+        return data  # identity — monotonic, SC-1 satisfied
+    raise NotImplementedError(
+        f"tone_curve_id {tone_curve_id!r} is not implemented; "
+        'only "linear" is supported in Phase 11'
+    )
+
+
+def invert_composite(
+    triplet: np.ndarray,
+    descriptor: BaseRegionDescriptor,
+    params: InversionParams,
+) -> np.ndarray:
+    """Invert a composited C-41 negative triplet to a finished positive.
+
+    Returns a 16-bit linear ProPhoto-RGB ``uint16`` array (HxWx3), suitable
+    for downstream tone-grading in Phase 14 (wizard) or Phase 15 (roll
+    integration).
+
+    Five-step pipeline (all in LINEAR space, pure float32 arithmetic):
+
+      Step 0 — Validate: triplet shape must be HxWx3; each ``base_rgb``
+               channel must be >= ``_MIN_BASE_CHANNEL``.
+      Step 1 — Dtype: ``triplet.astype(np.float32)`` — uint16 → float32
+               always allocates a fresh copy (no caller-array mutation).
+      Step 2 — Neutralize: per-channel gain = ``base_target / base_rgb[ch]``
+               forces the measured rebate base to ``base_target`` gray,
+               simultaneously canceling the orange mask AND the baked-in
+               white balance.
+      Step 3 — Invert: ``(white[ch] - x) / (white[ch] - black[ch])`` then
+               ``clip(0, 1)``.  The denominator is never zero — InversionParams
+               CR-02 guarantees ``white > black`` per channel.
+      Step 4 — Tone curve: dispatched through ``_apply_tone_curve``.  Phase 11
+               implements ONLY ``"linear"`` (identity).  Non-``"linear"``
+               tone_curve_id raises ``NotImplementedError`` (fail-closed).
+      Step 5 — Encode: ``*= 65535``, ``clip(0, 65535)``,
+               ``astype(np.uint16)``.
+
+    NOTE (anti-pattern warning): the input ``triplet`` is ALREADY
+    black-subtracted by ``apply_ffc_radiometric`` in ``ffc.py`` (see
+    ffc.py lines 418-420: "Phase 11 inversion must NOT re-subtract
+    black_level from this output").  ``InversionParams.black_point_*`` is
+    the INVERSION SHADOW FLOOR for the ``(white-x)/(white-black)`` formula,
+    NOT a second black subtraction.  Do not add any subtraction of a
+    black-level constant from ``triplet`` or ``work`` before Step 3.
+
+    NOTE (gamma deferred): ``params.gamma`` is NOT applied in Phase 11.
+    The field exists in ``InversionParams`` for a future phase.  No
+    ``np.power`` or gamma encoding is performed here.
+
+    NOTE (no color-vision path — NFR-11 / SC-5): all operations are
+    per-channel numeric transforms; no perceptual color decision is made
+    anywhere in this function.
+
+    Args:
+        triplet: HxWx3 ``uint16`` array — the composited, FFC-corrected,
+            black-subtracted narrowband-RGB frame from ``composite_triplet``
+            (or ``make_c41_negative`` in tests).
+        descriptor: ``BaseRegionDescriptor`` carrying ``base_rgb`` — the
+            measured no-WB raw per-channel mean of the rebate (film base).
+        params: ``InversionParams`` carrying black/white points, base_target,
+            tone_curve_id, and gamma.
+
+    Returns:
+        HxWx3 ``np.uint16`` finished positive in 16-bit linear ProPhoto-RGB.
+
+    Raises:
+        ValueError: if ``triplet`` is not HxWx3, or any ``base_rgb`` channel
+            is below ``_MIN_BASE_CHANNEL`` (possible calibration failure).
+        NotImplementedError: if ``params.tone_curve_id`` is not ``"linear"``.
+    """
+    # Step 0: validate inputs (fail-closed — T-11-01, T-11-02)
+    if triplet.ndim != 3 or triplet.shape[2] != 3:
+        raise ValueError(
+            f"triplet must be HxWx3, got shape {triplet.shape}"
+        )
+    if any(b < _MIN_BASE_CHANNEL for b in descriptor.base_rgb):
+        raise ValueError(
+            f"base_rgb {descriptor.base_rgb} has a channel below the minimum "
+            f"threshold {_MIN_BASE_CHANNEL}; possible calibration error — "
+            "recapture the rebate base measurement"
+        )
+
+    # Step 1: float32 workspace — dtype change uint16→float32 guarantees a
+    # fresh allocation; caller's array is never mutated (Pitfall 3).
+    work = triplet.astype(np.float32)
+
+    # Step 2: neutralize — per-channel gain forces measured base to base_target
+    # gray, canceling the orange mask AND the baked-in WB simultaneously.
+    # (Pitfall 1 reminder: do NOT subtract a black level here — the triplet is
+    # already black-subtracted by apply_ffc_radiometric; see ffc.py:418-420.)
+    for ch, base_val in enumerate(descriptor.base_rgb):
+        work[..., ch] *= params.base_target / base_val
+
+    # Step 3: invert per channel — (white − x) / (white − black), then clip.
+    # Unpack as explicit (r,g,b) tuples to avoid channel transposition (Pitfall 2).
+    # No runtime white>black guard needed — InversionParams CR-02 guarantees it.
+    black_pts = (params.black_point_r, params.black_point_g, params.black_point_b)
+    white_pts = (params.white_point_r, params.white_point_g, params.white_point_b)
+    for ch in range(3):
+        work[..., ch] = (white_pts[ch] - work[..., ch]) / (white_pts[ch] - black_pts[ch])
+    # Clip BEFORE tone curve so _apply_tone_curve always receives [0, 1] data
+    # (Pitfall 5 — future gamma curves require valid domain).
+    np.clip(work, 0.0, 1.0, out=work)
+
+    # Step 4: tone curve dispatch (Phase 11: identity only).
+    # gamma is NOT applied here — deferred per Phase 11 scope.
+    work = _apply_tone_curve(work, params.tone_curve_id, params.tone_curve_params)
+
+    # Step 5: scale to 16-bit and encode (matches ffc.py clip+cast discipline).
+    work *= 65535.0
+    np.clip(work, 0.0, 65535.0, out=work)
+    return work.astype(np.uint16)
 
 
 def main(argv=None) -> int:
