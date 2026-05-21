@@ -369,7 +369,9 @@ def apply_ffc_radiometric(
         )
 
     # 1. Average all N flat frames in float32.  Shape: HxWx3
-    avg_flat = np.mean(flat_stack.astype(np.float32), axis=0)
+    # dtype=np.float32 avoids materializing a full float32 copy of the N-frame
+    # stack (np.mean(..., dtype=) accumulates in float32 without a prior astype).
+    avg_flat = np.mean(flat_stack, axis=0, dtype=np.float32)
 
     # 2. Output buffer (same shape and dtype as raw_array)
     out = np.empty_like(raw_array)
