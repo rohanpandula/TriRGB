@@ -93,8 +93,15 @@ def make_c41_negative(
     - Body: per-channel random values between min_val and base, where
       min_val = base / (10.0 ** density).  Larger density → larger swing
       → darker minimum (orange mask effect: blue has the largest swing).
-    - Rebate strip: the top rebate_height_frac rows are filled at the base
-      level (brightest region, no density variation — unexposed film base).
+    - Rebate strip: the top rebate_height_frac rows have a per-channel MEAN
+      value at the base level (no density variation — unexposed film base).
+      The rebate strip is the BRIGHTEST REGION by mean, not per-pixel:
+      individual body pixels may statistically exceed individual rebate pixels
+      due to Gaussian noise tails (body sigma=noise_sigma, rebate sigma=
+      noise_sigma*0.5; a 3-sigma body excursion can exceed a rebate pixel).
+      Downstream code that selects "the brightest pixel" or uses per-pixel
+      thresholds to locate the rebate boundary must use mean-based comparisons,
+      not per-pixel maximum comparisons.
 
     Channel index: R=0, G=1, B=2 (locked project convention).
 
