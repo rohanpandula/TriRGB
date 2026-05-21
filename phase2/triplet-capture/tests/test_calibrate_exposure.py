@@ -18,6 +18,7 @@ All tests are fully hardware-free (NFR-12): no rawpy, no real hardware.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pytest
@@ -96,7 +97,7 @@ def make_calibration_demosaic(
     *,
     black_offset: float = BLACK_OFFSET,
     scale: dict[str, float] | None = None,
-) -> "Callable[[Path], np.ndarray]":
+) -> Callable[[Path], np.ndarray]:
     """Factory that returns a demosaic closure over orch.settings.
 
     At call time, reads orch.settings.level_r/g/b (LIVE — update_settings
@@ -399,3 +400,80 @@ def test_hardware_free(tmp_path):
     assert "rawpy" not in sys.modules, (
         "rawpy was imported during calibrate_exposure with demosaic_factory injected"
     )
+
+
+def test_max_iterations_zero_raises(tmp_path):
+    """WR-03/IN-02: max_iterations=0 must raise ValueError, not silently return junk.
+
+    Regression gate: ensures the max_iterations guard at function entry fires
+    before any Orchestrator construction or capture call.
+    """
+    runner, calls = make_runner()
+
+    def demosaic_factory(orch: Orchestrator) -> Callable[[Path], np.ndarray]:
+        return make_calibration_demosaic(orch)
+
+    with pytest.raises(ValueError, match="max_iterations"):
+        calibrate_exposure(
+            scanlight=FakeScanlight(),
+            settings=CaptureSettings(
+                roll_name="CalibExposure",
+                frame_number=1,
+                output_folder=tmp_path,
+                level_r=128,
+                level_g=128,
+                level_b=128,
+                settle_ms=0,
+            ),
+            base_region=make_base_region(),
+            ffc_cal_dir="",
+            max_iterations=0,
+            warmup_s=0.0,
+            sony_capture_runner=runner,
+            sleep=lambda _: None,
+            demosaic_factory=demosaic_factory,
+        )
+
+    # Guard fires before any capture — runner must NOT have been called
+    assert len(calls) == 0, (
+        "runner was called despite max_iterations=0 — guard must fire before capture"
+    )
+
+
+def test_zero_signal_raises(tmp_path):
+    """WR-02: if the dark frame is brighter than the calibration signal on any channel,
+    calibrate_exposure must raise ValueError, not silently return led_level=128.
+
+    Simulates a 'too-bright dark frame' scenario by making the demosaic return a
+    uniformly-black image (all zeros), so after black-level subtraction every ROI
+    is zero and p99 == 0.0 at every probe level.
+    """
+    runner, _ = make_runner()
+
+    def demosaic_factory(orch: Orchestrator) -> Callable[[Path], np.ndarray]:
+        # Return a closure that always yields an all-zero image regardless of LED level.
+        # This simulates black_level >= signal at every probe (WR-02 scenario).
+        def _zero_demosaic(path: Path) -> np.ndarray:
+            return np.zeros((_IMG_H, _IMG_W, 3), dtype=np.uint16)
+        return _zero_demosaic
+
+    with pytest.raises(ValueError, match="rebate signal is zero"):
+        calibrate_exposure(
+            scanlight=FakeScanlight(),
+            settings=CaptureSettings(
+                roll_name="CalibExposure",
+                frame_number=1,
+                output_folder=tmp_path,
+                level_r=128,
+                level_g=128,
+                level_b=128,
+                settle_ms=0,
+            ),
+            base_region=make_base_region(),
+            ffc_cal_dir="",
+            max_iterations=10,
+            warmup_s=0.0,
+            sony_capture_runner=runner,
+            sleep=lambda _: None,
+            demosaic_factory=demosaic_factory,
+        )
