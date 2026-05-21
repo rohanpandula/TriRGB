@@ -1,8 +1,8 @@
 """Flat-field capture loop for radiometric FFC (Phase 10 R-26).
 
 Drives the Config-B Orchestrator N times to capture blank-light flat frames,
-averages them in linear space per channel, computes the uniformity-improvement
-metric, and returns a FlatFieldResult.
+keeps all N demosaiced frames to build a flat_stack (NxHxWx3 uint16), averages
+them for the uniformity-improvement metric, and returns (flat_stack, FlatFieldResult).
 
 Design notes
 ------------
@@ -15,6 +15,10 @@ Design notes
   ``lambda _: None`` for instant, deterministic runs (NFR-12).
 - ``capture_triplet(retake=True)`` is used so the Orchestrator frame counter
   does not advance on each flat — flats are not part of the roll sequence.
+- Memory note: keeping N full-res uint16 HxWx3 frames in memory is an
+  acceptable one-time calibration cost (a 7CR frame ≈ 54 MP × 6 bytes × N ≈
+  1.7 GB for N=8 — large but bounded; full memory optimisation deferred to M2).
+  The caller can pass flat_data_path to persist the stack and free RAM promptly.
 """
 from __future__ import annotations
 
@@ -54,12 +58,26 @@ def capture_flats(
     sony_capture_runner: Optional[Callable[[str, Path, int], int]] = None,
     sleep: Callable[[float], None] = time.sleep,
     demosaic_fn: Optional[Callable[[Path], np.ndarray]] = None,
-) -> FlatFieldResult:
-    """Capture N blank-light flat frames and return a FlatFieldResult.
+) -> tuple[np.ndarray, FlatFieldResult]:
+    """Capture N blank-light flat frames and return (flat_stack, FlatFieldResult).
 
     Reuses ``Orchestrator.capture_triplet()`` (Config-B loop) so all
     the existing inbox/quarantine/retry logic is inherited rather than
     reimplemented (NFR-14).
+
+    The returned ``flat_stack`` is the primary output: an NxHxWx3 uint16
+    array that can be passed directly to ``apply_ffc_radiometric(raw,
+    flat_stack, black_levels)``.  The averaging happens inside
+    ``apply_ffc_radiometric`` (single averaging point, maximum precision).
+    The ``FlatFieldResult`` carries metadata (n_frames, black levels, CV
+    metric) for JSON serialisation and audit trail.
+
+    Memory note: keeping N full-res frames in memory is an acceptable
+    one-time calibration cost.  Full optimisation (streaming to disk during
+    capture) is deferred to Milestone 2.  If ``flat_data_path`` is a
+    non-empty string the stack is persisted to that path via ``np.save``
+    (the caller can then load it with ``np.load`` and free the in-memory
+    copy if needed).
 
     Args:
         scanlight:        Scanlight instance (already connected).
@@ -72,8 +90,9 @@ def capture_flats(
                           In tests, pass ``sleep=lambda _: None`` to skip.
         working_brightness: LED level recorded in FlatFieldResult.  Defaults
                           to ``settings.level_g`` if None.
-        flat_data_path:   Path/id string for the caller to reference where the
-                          averaged flat is (or will be) stored on disk.
+        flat_data_path:   If non-empty, the flat_stack is saved to this path
+                          via ``np.save``.  The path is also stored in
+                          FlatFieldResult.flat_data_path for reference.
         sony_capture_runner: Injected runner for the Orchestrator (same kwarg
                           as ``Orchestrator.__init__``).  Tests pass a stub.
         sleep:            Injectable sleep callable; default ``time.sleep``.
@@ -85,8 +104,9 @@ def capture_flats(
                           rawpy is never touched in the test path (Pitfall 5).
 
     Returns:
-        FlatFieldResult with n_frames_averaged, black levels, working_brightness,
-        and uniformity_improvement (CV ratio on the G channel).
+        (flat_stack, FlatFieldResult) where flat_stack is NxHxWx3 uint16 and
+        FlatFieldResult carries n_frames_averaged, black levels,
+        working_brightness, uniformity_improvement, and flat_data_path.
 
     Raises:
         ValueError: if n_frames < 1.
@@ -117,10 +137,13 @@ def capture_flats(
             from rgb_composite.ffc import _demosaic_cal_frame
             return _demosaic_cal_frame(path)
 
-    # 4. Capture N frames and accumulate per-channel sums in float64.
-    #    Accumulators are initialised lazily on the first frame once shapes
-    #    are known (avoids needing to know HxW before capturing).
-    sums: list[Optional[np.ndarray]] = [None, None, None]   # per channel index
+    # 4. Capture N frames; keep all demosaiced HxWx3 uint16 frames in a list.
+    #    Shapes are known after the first frame; the list is then stacked at
+    #    the end into a single NxHxWx3 array (the primary output).
+    #    Also accumulate per-channel float64 sums for the CV metric and
+    #    keep the first frame per channel for the CV(single) baseline.
+    frames: list[np.ndarray] = []                              # HxWx3 uint16, len = N
+    sums: list[Optional[np.ndarray]] = [None, None, None]     # per channel float64 sum
     first_channels: list[Optional[np.ndarray]] = [None, None, None]  # for CV(single)
 
     for i in range(n_frames):
@@ -130,34 +153,60 @@ def capture_flats(
         if not result.success:
             raise RuntimeError(f"flat capture {i} failed: {result.error}")
 
+        # Accumulate the full HxWx3 frame for the flat_stack primary output.
+        # Demosaic each channel file; note all three channels of a given frame
+        # are demosaiced from separate R/G/B exposures, so we collect them into
+        # one HxWx3 array aligned to the canonical channel order.
+        frame_channels: list[np.ndarray] = []
         for ch_idx, ch in enumerate("RGB"):
-            img = dem(result.files[ch])          # HxWx3 uint16
-            channel_data = img[..., ch_idx].astype(np.float64)
-            if sums[ch_idx] is None:
-                sums[ch_idx] = channel_data.copy()
-                first_channels[ch_idx] = img[..., ch_idx].copy()
-            else:
-                sums[ch_idx] += channel_data  # type: ignore[operator]
+            img = dem(result.files[ch])             # HxWx3 uint16
+            channel_hw = img[..., ch_idx]           # HxW uint16 — matching channel
+            frame_channels.append(channel_hw)
 
-    # 5. Compute per-channel averages; reassemble HxWx3 float32 averaged flat.
+            # Accumulate for the CV metric (float64 for accuracy)
+            channel_f64 = channel_hw.astype(np.float64)
+            if sums[ch_idx] is None:
+                sums[ch_idx] = channel_f64.copy()
+                first_channels[ch_idx] = channel_hw.copy()
+            else:
+                sums[ch_idx] += channel_f64  # type: ignore[operator]
+
+        # Reconstruct an HxWx3 uint16 frame from the three matching channels.
+        # Each ch_idx slot holds the radiometrically-correct channel from its
+        # respective narrow-band exposure (R-lit→ch0, G-lit→ch1, B-lit→ch2).
+        frame_hwx3 = np.stack(frame_channels, axis=-1)   # HxWx3 uint16
+        frames.append(frame_hwx3)
+
+    # 5. Stack all frames into the flat_stack primary output: NxHxWx3 uint16.
+    flat_stack = np.stack(frames, axis=0)    # (N, H, W, 3)
+
+    # 6. Build per-channel averaged flat for the CV metric.
+    #    float32 is sufficient for the metric; the single authoritative
+    #    averaging is done inside apply_ffc_radiometric (not here).
     h, w = sums[0].shape  # type: ignore[union-attr]
     avg_channels = [
         (sums[ch].astype(np.float32) / n_frames)  # type: ignore[union-attr]
         for ch in range(3)
     ]
 
-    # 6. Uniformity-improvement metric on the G channel (index 1).
+    # 7. Uniformity-improvement metric on the G channel (index 1).
     #    CV(single_frame) / CV(averaged) — higher is better (Pitfall 6: floor 1e-9).
     single_cv = _cv(first_channels[1])  # type: ignore[arg-type]
     avg_cv = _cv(avg_channels[1])
     uniformity_improvement = single_cv / max(avg_cv, 1e-9)
 
-    # 7. Resolve working brightness.
+    # 8. Resolve working brightness.
     if working_brightness is None:
         working_brightness = settings.level_g
 
-    # 8. Construct and return FlatFieldResult.
-    return FlatFieldResult(
+    # 9. Persist flat_stack to disk if a path was provided.
+    #    np.save creates an .npy file at the given path (appends .npy if absent).
+    #    The caller can np.load it later and free the in-memory flat_stack.
+    if flat_data_path:
+        np.save(flat_data_path, flat_stack)
+
+    # 10. Build FlatFieldResult metadata record.
+    result_meta = FlatFieldResult(
         flat_data_path=flat_data_path,
         n_frames_averaged=n_frames,
         warmup_s=warmup_s,
@@ -167,3 +216,5 @@ def capture_flats(
         working_brightness=working_brightness,
         uniformity_improvement=float(uniformity_improvement),
     )
+
+    return flat_stack, result_meta

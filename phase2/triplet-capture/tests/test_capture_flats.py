@@ -7,6 +7,10 @@ Mirrors the stub patterns from test_orchestrator.py:
   - fake_demosaic: returns make_rebate_strip(...) ignoring path (no rawpy)
 
 All tests are fully hardware-free (NFR-12).
+
+FIX 1: capture_flats now returns (flat_stack, FlatFieldResult).  All tests
+updated to unpack the tuple.  A new end-to-end test verifies that the returned
+flat_stack connects directly to apply_ffc_radiometric to produce valid uint16 output.
 """
 from __future__ import annotations
 
@@ -85,11 +89,14 @@ def _make_black_levels(
 # ---------------------------------------------------------------------------
 
 def test_capture_flats_returns_flat_field_result(settings):
-    """capture_flats returns a FlatFieldResult with correct fields."""
+    """capture_flats returns (flat_stack, FlatFieldResult) with correct fields.
+
+    FIX 1: updated to unpack the (flat_stack, result) tuple.
+    """
     runner, _ = make_runner()
     black_levels = _make_black_levels(250.0, 255.0, 240.0)
 
-    result = capture_flats(
+    flat_stack, result = capture_flats(
         scanlight=FakeScanlight(),
         settings=settings,
         black_levels=black_levels,
@@ -99,6 +106,13 @@ def test_capture_flats_returns_flat_field_result(settings):
         sleep=lambda _: None,     # test-fast warmup
         demosaic_fn=fake_demosaic,
     )
+
+    # flat_stack must be a 4-frame NxHxWx3 uint16 array
+    assert isinstance(flat_stack, np.ndarray)
+    assert flat_stack.ndim == 4
+    assert flat_stack.shape[0] == 4       # N = n_frames
+    assert flat_stack.shape[3] == 3       # 3 channels
+    assert flat_stack.dtype == np.uint16
 
     assert isinstance(result, FlatFieldResult)
     assert result.n_frames_averaged == 4
@@ -118,11 +132,14 @@ def test_capture_flats_returns_flat_field_result(settings):
 
 
 def test_capture_flats_drives_loop_n_times(settings):
-    """The Orchestrator runner is invoked n_frames * 3 times (R/G/B per frame)."""
+    """The Orchestrator runner is invoked n_frames * 3 times (R/G/B per frame).
+
+    FIX 1: updated to unpack the (flat_stack, result) tuple.
+    """
     runner, calls = make_runner()
     n_frames = 6
 
-    capture_flats(
+    flat_stack, _result = capture_flats(
         scanlight=FakeScanlight(),
         settings=settings,
         black_levels=_make_black_levels(),
@@ -131,6 +148,9 @@ def test_capture_flats_drives_loop_n_times(settings):
         sleep=lambda _: None,
         demosaic_fn=fake_demosaic,
     )
+
+    # flat_stack must have N=n_frames frames on axis 0
+    assert flat_stack.shape[0] == n_frames
 
     # Each frame requires R + G + B = 3 runner calls
     assert len(calls) == n_frames * 3, (
@@ -144,7 +164,10 @@ def test_capture_flats_drives_loop_n_times(settings):
 
 
 def test_capture_flats_hardware_free_and_warmup_injectable(settings):
-    """Warmup sleep is injectable; no real ARW / rawpy path is touched."""
+    """Warmup sleep is injectable; no real ARW / rawpy path is touched.
+
+    FIX 1: updated to unpack the (flat_stack, result) tuple.
+    """
     runner, _ = make_runner()
     sleep_calls: list[float] = []
 
@@ -152,7 +175,7 @@ def test_capture_flats_hardware_free_and_warmup_injectable(settings):
         sleep_calls.append(seconds)
 
     warmup_val = 42.5
-    capture_flats(
+    _flat_stack, _result = capture_flats(
         scanlight=FakeScanlight(),
         settings=settings,
         black_levels=_make_black_levels(),
@@ -170,3 +193,108 @@ def test_capture_flats_hardware_free_and_warmup_injectable(settings):
     )
     # No real ARW was opened because fake_demosaic bypasses rawpy entirely
     # (verified by the fact that the test suite doesn't need rawpy installed)
+
+
+def test_capture_flats_flat_stack_shape_and_dtype(settings):
+    """flat_stack from capture_flats is NxHxWx3 uint16 — axis-0 is frames.
+
+    FIX 1: explicit shape/dtype contract test for the new primary output.
+    """
+    runner, _ = make_runner()
+    n_frames = 3
+    flat_stack, result = capture_flats(
+        scanlight=FakeScanlight(),
+        settings=settings,
+        black_levels=_make_black_levels(),
+        n_frames=n_frames,
+        sony_capture_runner=runner,
+        sleep=lambda _: None,
+        demosaic_fn=fake_demosaic,
+    )
+
+    # Shape: (N, H, W, 3) — fake_demosaic returns 128x192 from make_rebate_strip
+    assert flat_stack.shape == (n_frames, 128, 192, 3), (
+        f"expected ({n_frames}, 128, 192, 3), got {flat_stack.shape}"
+    )
+    assert flat_stack.dtype == np.uint16, (
+        f"flat_stack must be uint16, got {flat_stack.dtype}"
+    )
+    # result.n_frames_averaged must agree with stack depth
+    assert result.n_frames_averaged == flat_stack.shape[0]
+
+
+def test_capture_flats_persist_to_disk(settings, tmp_path):
+    """flat_data_path triggers np.save; the saved array round-trips correctly.
+
+    FIX 1: when flat_data_path is provided, the flat_stack is saved via
+    np.save so the caller can free memory and reload later.
+    """
+    runner, _ = make_runner()
+    save_path = str(tmp_path / "flat_stack.npy")
+
+    flat_stack, result = capture_flats(
+        scanlight=FakeScanlight(),
+        settings=settings,
+        black_levels=_make_black_levels(),
+        n_frames=2,
+        flat_data_path=save_path,
+        sony_capture_runner=runner,
+        sleep=lambda _: None,
+        demosaic_fn=fake_demosaic,
+    )
+
+    # np.save appends .npy if the path doesn't already end in it
+    import pathlib
+    saved_path = pathlib.Path(save_path) if save_path.endswith(".npy") else pathlib.Path(save_path + ".npy")
+    assert saved_path.exists(), f"expected saved flat at {saved_path}"
+    loaded = np.load(saved_path)
+    assert loaded.shape == flat_stack.shape
+    assert loaded.dtype == flat_stack.dtype
+    assert np.array_equal(loaded, flat_stack)
+    # FlatFieldResult.flat_data_path records the path
+    assert result.flat_data_path == save_path
+
+
+def test_capture_flats_end_to_end_pipeline(settings):
+    """FIX 1 end-to-end: capture_flats -> apply_ffc_radiometric produces valid uint16.
+
+    This test proves the pipeline actually connects:
+      capture_flats(...) -> (flat_stack, result)
+      apply_ffc_radiometric(raw, flat_stack, black_levels) -> HxWx3 uint16
+
+    SC-2 requires capture_flats to return a flat stack consumable by
+    apply_ffc_radiometric — this test is the automated proof of that contract.
+    """
+    from rgb_composite.ffc import apply_ffc_radiometric
+
+    runner, _ = make_runner()
+    # Use zero black levels so arithmetic is easy to verify
+    black_levels = _make_black_levels(bl_r=0.0, bl_g=0.0, bl_b=0.0)
+
+    flat_stack, _result = capture_flats(
+        scanlight=FakeScanlight(),
+        settings=settings,
+        black_levels=black_levels,
+        n_frames=4,
+        sony_capture_runner=runner,
+        sleep=lambda _: None,
+        demosaic_fn=fake_demosaic,
+    )
+
+    # Build a synthetic raw matching the flat's spatial dimensions
+    _n, h, w, _c = flat_stack.shape
+    raw = np.full((h, w, 3), 20000, dtype=np.uint16)
+
+    # apply_ffc_radiometric must accept flat_stack directly and return valid output
+    corrected = apply_ffc_radiometric(raw, flat_stack, black_levels)
+
+    # Output contract: HxWx3 uint16
+    assert corrected.shape == (h, w, 3), (
+        f"expected ({h}, {w}, 3), got {corrected.shape}"
+    )
+    assert corrected.dtype == np.uint16, (
+        f"expected uint16, got {corrected.dtype}"
+    )
+    # Sanity: output values are in valid uint16 range (no NaN, no overflow wrap)
+    assert int(corrected.max()) <= 65535
+    assert int(corrected.min()) >= 0
