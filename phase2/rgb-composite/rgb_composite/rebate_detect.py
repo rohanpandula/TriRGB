@@ -159,7 +159,81 @@ def detect_rebate(
         ``BaseRegionDescriptor`` with ``source="auto"`` and
         ``schema_version=1``.
     """
-    raise NotImplementedError("detect_rebate body will be implemented in Task 2")
+    H, W, _ = img.shape  # HxWx3 uint16
+
+    # 1. Downsample green channel for efficient scoring.
+    #    The else branch MUST set new_h, new_w (not just green_s) — fixture
+    #    images are 128x192 so scale == 1.0 on every fixture test; omitting
+    #    new_h, new_w here causes NameError at step 2.
+    scale = min(1.0, long_edge_target / max(H, W))
+    if scale < 1.0:
+        new_h, new_w = int(H * scale), int(W * scale)
+        green_s = cv2.resize(
+            img[:, :, 1], (new_w, new_h), interpolation=cv2.INTER_AREA
+        ).astype(np.float32)
+    else:
+        new_h, new_w = H, W
+        green_s = img[:, :, 1].astype(np.float32)
+
+    # 2. Score-window size (configurable via window_frac kwarg).
+    win = max(3, int(min(new_h, new_w) * window_frac))
+
+    # 3. Windowed brightness map (O(N) via uniform_filter).
+    mean_map = uniform_filter(green_s, size=win, mode="nearest").astype(np.float64)
+
+    # 4. Windowed CV via E[x^2] - E[x]^2 in float64 to avoid FP cancellation
+    #    at uint16 magnitudes.  np.maximum clamp prevents sqrt of tiny negatives.
+    mean_sq = uniform_filter(
+        (green_s ** 2).astype(np.float64), size=win, mode="nearest"
+    )
+    var_map = np.maximum(mean_sq - mean_map ** 2, 0.0)
+    cv_map = (np.sqrt(var_map) / np.maximum(mean_map, 1.0)).astype(np.float32)
+
+    # 5. Windowed edge/detail via Laplacian -- MUST pass uint16 input.
+    #    cv2.Laplacian(float32, CV_64F) raises on OpenCV 4.13 macOS (Pitfall 1).
+    lap = cv2.Laplacian(green_s.clip(0, 65535).astype(np.uint16), cv2.CV_64F)
+    detail_map = uniform_filter(
+        np.abs(lap).astype(np.float32), size=win, mode="nearest"
+    )
+
+    # 6. Normalise all three to [0, 1] (equal weights -- no tunable constants).
+    b = (mean_map.astype(np.float32) / float(mean_map.max())).clip(0, 1)
+    c = (cv_map / max(float(cv_map.max()), 1e-9)).clip(0, 1)
+    d = (detail_map / max(float(detail_map.max()), 1e-9)).clip(0, 1)
+    score = b - c - d  # higher = brighter, more uniform, less detail
+
+    # 7. Top-left tiebreak: argmax first occurrence in C/row-major order =
+    #    topmost row first, then leftmost column -- deterministic, no extra code.
+    best_y_s, best_x_s = np.unravel_index(int(np.argmax(score)), score.shape)
+
+    # 8. Map bbox to full-resolution space + clamp to image bounds.
+    x = max(0, min(W - 1, int(round(best_x_s / scale))))
+    y = max(0, min(H - 1, int(round(best_y_s / scale))))
+    w = max(1, min(W - x, int(round(win / scale))))
+    h = max(1, min(H - y, int(round(win / scale))))
+
+    # 9. Measure base_rgb on the FULL-RESOLUTION region (not the proxy).
+    #    Pitfall 2: INTER_AREA changes means near region boundaries.
+    region = img[y : y + h, x : x + w, :]
+    base_rgb = (
+        float(region[:, :, 0].mean()),
+        float(region[:, :, 1].mean()),
+        float(region[:, :, 2].mean()),
+    )
+
+    # 10. Uniformity CV on full-res region (reuses _box_filter_2d, NFR-14).
+    uniformity_cv = _measure_uniformity_cv(region[:, :, 1])
+
+    # 11. Construct and return the descriptor.
+    return BaseRegionDescriptor(
+        x=x,
+        y=y,
+        w=w,
+        h=h,
+        base_rgb=base_rgb,
+        uniformity_cv=uniformity_cv,
+        source="auto",
+    )
 
 
 def manual_picker(
