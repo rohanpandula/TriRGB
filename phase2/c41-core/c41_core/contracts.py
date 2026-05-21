@@ -309,9 +309,12 @@ class InversionParams(JsonContract):
         ):
             if not math.isfinite(val):
                 raise ValueError(f"{name} must be finite, got {val}")
-        # WR-01: raw pixel counts are non-negative — reject negative black points and base_target
+        # WR-01: base_target must be strictly positive — zero produces gain=0 →
+        # all-white inverted output with no error (silent data loss).
+        if not math.isfinite(self.base_target) or self.base_target <= 0:
+            raise ValueError(f"base_target must be > 0, got {self.base_target}")
+        # WR-01: raw pixel counts are non-negative — reject negative black points
         for name, val in (
-            ("base_target", self.base_target),
             ("black_point_r", self.black_point_r),
             ("black_point_g", self.black_point_g),
             ("black_point_b", self.black_point_b),

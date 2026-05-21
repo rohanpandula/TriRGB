@@ -315,6 +315,23 @@ def test_inversion_params_rejects_negative_base_target():
         )
 
 
+def test_inversion_params_rejects_zero_base_target():
+    """WR-02/IN-01: base_target=0 must raise ValueError.
+
+    Zero produces gain=0 in invert_composite Step 2, which zeros the entire
+    work array and causes a silent all-white positive output — a hard-to-
+    diagnose data loss with no error and no log message.  The contract must
+    reject it at construction time so Phase 14 Swift round-trips also fail fast.
+    """
+    with pytest.raises(ValueError, match="base_target"):
+        InversionParams(
+            base_target=0.0,
+            black_point_r=0.0, black_point_g=0.0, black_point_b=0.0,
+            white_point_r=8930.0, white_point_g=12097.0, white_point_b=2952.0,
+            tone_curve_id="linear", tone_curve_params=(), gamma=1.0,
+        )
+
+
 # ---------------------------------------------------------------------------
 # WR-02: from_json schema-evolution behavior — consistent policy test
 # ---------------------------------------------------------------------------
