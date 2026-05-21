@@ -307,8 +307,12 @@ def _cv(channel_hw: np.ndarray) -> float:
     return float(np.std(smoothed)) / max(mean_val, 1.0)
 
 
-def test_apply_ffc_radiometric_identity_shaped():
-    """With zero black levels and a uniform flat equal to the raw, output is uniform and finite."""
+def test_apply_ffc_radiometric_identity_zero_black():
+    """With bl=0 and uniform flat==raw, output == raw (identity case, bl=0 only).
+
+    NOTE: With bl>0, output is raw-bl (black-subtracted); see
+    test_apply_ffc_radiometric_black_subtract_math for that case.
+    """
     # Build raw: uniform 30000 across all channels
     raw = np.full((H, W, 3), 30000, dtype=np.uint16)
     # Build a single-frame flat matching the raw exactly
@@ -318,9 +322,16 @@ def test_apply_ffc_radiometric_identity_shaped():
     out = apply_ffc_radiometric(raw, flat_stack, black_levels)
     assert out.shape == (H, W, 3)
     assert out.dtype == np.uint16
-    # Every pixel should be finite (no inf/nan after uint16 conversion)
-    assert np.all(out > 0), "uniform flat on uniform raw should produce uniform positive output"
-    assert np.all(out <= 65535)
+    # With bl=0, output == raw (identity holds only for the zero-bl degenerate case)
+    assert np.all(out == 30000), f"expected all 30000, got unique={np.unique(out)}"
+
+
+def test_apply_ffc_radiometric_empty_stack_raises():
+    """N=0 flat_stack must raise ValueError, not silently return NaN garbage."""
+    raw = np.full((H, W, 3), 20000, dtype=np.uint16)
+    flat_stack = np.zeros((0, H, W, 3), dtype=np.uint16)
+    with pytest.raises(ValueError, match="at least 1 frame"):
+        apply_ffc_radiometric(raw, flat_stack, _make_black_levels())
 
 
 def test_apply_ffc_radiometric_black_subtract_math():
