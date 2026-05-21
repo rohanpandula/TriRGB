@@ -477,3 +477,94 @@ def test_zero_signal_raises(tmp_path):
             sleep=lambda _: None,
             demosaic_factory=demosaic_factory,
         )
+
+
+def test_near_zero_signal_raises(tmp_path):
+    """FIX-1 regression: near-zero signal (p99 < _MIN_SIGNAL_P99 = 10 counts) also
+    raises ValueError, not just exact-zero.
+
+    Simulates ADC offset / hot-pixel residual that leaves p99 slightly above 0
+    (e.g. 5 counts) on every probe — still below the noise-floor threshold and
+    therefore indistinguishable from no optical signal.
+    """
+    runner, _ = make_runner()
+
+    # p99 = 5 counts at every probe: above 0 but below _MIN_SIGNAL_P99 (10).
+    NEAR_ZERO_SIGNAL = 5.0
+
+    def demosaic_factory(orch: Orchestrator) -> Callable[[Path], np.ndarray]:
+        def _near_zero_demosaic(path: Path) -> np.ndarray:
+            # Uniform image at NEAR_ZERO_SIGNAL; after black_level=0 subtraction
+            # the p99 is exactly NEAR_ZERO_SIGNAL.
+            img = np.full((_IMG_H, _IMG_W, 3), NEAR_ZERO_SIGNAL, dtype=np.float32)
+            return np.clip(img, 0, 65535).astype(np.uint16)
+        return _near_zero_demosaic
+
+    with pytest.raises(ValueError, match="rebate signal is zero"):
+        calibrate_exposure(
+            scanlight=FakeScanlight(),
+            settings=CaptureSettings(
+                roll_name="CalibExposure",
+                frame_number=1,
+                output_folder=tmp_path,
+                level_r=128,
+                level_g=128,
+                level_b=128,
+                settle_ms=0,
+            ),
+            base_region=make_base_region(),
+            ffc_cal_dir="",
+            max_iterations=10,
+            warmup_s=0.0,
+            sony_capture_runner=runner,
+            sleep=lambda _: None,
+            demosaic_factory=demosaic_factory,
+        )
+
+
+def test_non_convergence_logs_warning(tmp_path, caplog):
+    """FIX-2 regression: when bisection maxes out and stays under target, a WARNING
+    is emitted naming the channel and explaining it could not reach the exposure target.
+
+    The function must still return a valid CalibrationResult (not raise).
+    """
+    import logging
+
+    runner, _ = make_runner()
+
+    def demosaic_factory(orch: Orchestrator):
+        return make_calibration_demosaic(orch, scale=SCALE_NO_CONV)
+
+    with caplog.at_level(logging.WARNING, logger="triplet_capture.calibrate_exposure"):
+        cal = calibrate_exposure(
+            scanlight=FakeScanlight(),
+            settings=CaptureSettings(
+                roll_name="CalibExposure",
+                frame_number=1,
+                output_folder=tmp_path,
+                level_r=128,
+                level_g=128,
+                level_b=128,
+                settle_ms=0,
+            ),
+            base_region=make_base_region(),
+            ffc_cal_dir="",
+            max_iterations=10,
+            warmup_s=0.0,
+            sony_capture_runner=runner,
+            sleep=lambda _: None,
+            demosaic_factory=demosaic_factory,
+        )
+
+    # Must still return a valid result
+    assert isinstance(cal, CalibrationResult), "non-convergence must return CalibrationResult, not raise"
+
+    # A WARNING must have been logged for the blue channel (the one that can't converge)
+    warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "B" in msg and ("255" in msg or "max LED" in msg or "exposure target" in msg)
+        for msg in warning_messages
+    ), (
+        f"Expected a WARNING about channel B failing to reach target at level 255. "
+        f"Got warnings: {warning_messages}"
+    )

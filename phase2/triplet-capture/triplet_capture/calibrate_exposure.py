@@ -31,6 +31,7 @@ Design notes
 """
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -41,6 +42,8 @@ from c41_core import ChannelCalibration, CalibrationResult
 from c41_core.contracts import BaseRegionDescriptor
 from .orchestrator import Orchestrator, CaptureSettings
 
+_logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
@@ -49,6 +52,10 @@ _CLIP_CEILING: int = 65535
 _SATURATION_VALUE: int = 64000  # reuse inspect-calibration.py threshold for clip_fraction
 _CH_IDX: dict[str, int] = {"R": 0, "G": 1, "B": 2}
 _CH_LEVEL_FIELD: dict[str, str] = {"R": "level_r", "G": "level_g", "B": "level_b"}
+# Minimum p99 (counts) after black-subtraction before we consider the signal real.
+# Exact-zero equality misses near-zero signals from ADC offset / read noise / hot pixels
+# on real hardware.  10 counts is comfortably above typical dark-frame read noise.
+_MIN_SIGNAL_P99: float = 10.0
 
 
 def calibrate_exposure(
@@ -163,7 +170,7 @@ def calibrate_exposure(
     for ch, ch_idx in _CH_IDX.items():
         dark_img = dem(dark_result.files[ch])                        # HxWx3 uint16
         dark_ch = dark_img[..., ch_idx].astype(np.float64)           # HxW
-        black_level[ch] = float(np.mean(dark_ch))
+        black_level[ch] = float(np.median(dark_ch))  # median: robust to hot pixels / stuck columns
 
     # ------------------------------------------------------------------
     # STEP 2: Per-channel bisection calibration loop
@@ -178,10 +185,11 @@ def calibrate_exposure(
         lo: int = 1       # 0 reserved for dark frame
         hi: int = 255
         probe_level: int = (lo + hi) // 2   # current bisection probe (not the best-seen)
-        best_p99: float = 0.0
+        # float('inf') so the strict-< update fires on the very first probe regardless
+        # of target value.  After the first probe best_p99 holds a real p99 value.
+        best_p99: float = float("inf")
         best_level_so_far: int = probe_level
         converged: bool = False
-        final_roi_raw: Optional[np.ndarray] = None
         best_final_roi_raw: Optional[np.ndarray] = None
 
         for _iteration in range(max_iterations):
@@ -217,8 +225,6 @@ def calibrate_exposure(
                 best_level_so_far = probe_level
                 best_final_roi_raw = roi_raw.copy()
 
-            final_roi_raw = roi_raw  # last iteration's raw ROI
-
             # Convergence check
             if abs(p99 - target) <= tolerance:
                 converged = True
@@ -238,10 +244,12 @@ def calibrate_exposure(
         # ------------------------------------------------------------------
         # Post-loop: resolve converged level and compute clip_fraction
         # ------------------------------------------------------------------
-        # Fail-closed: if every probe produced p99==0.0 the dark frame was brighter
-        # than the calibration signal — return an error rather than a silent garbage
-        # result (WR-02).
-        if best_p99 == 0.0:
+        # Fail-closed: if every probe produced near-zero p99 the dark frame was
+        # brighter than the calibration signal — raise rather than return silent
+        # garbage (WR-02).  Threshold _MIN_SIGNAL_P99 (not exact 0) catches ADC
+        # offset / read-noise / hot pixels that leave best_p99 slightly above 0
+        # even with no optical signal.
+        if best_p99 < _MIN_SIGNAL_P99:
             raise ValueError(
                 f"channel {ch}: rebate signal is zero after black subtraction at every "
                 f"probe level — dark frame (black_level={black_level[ch]:.1f}) is "
@@ -252,19 +260,33 @@ def calibrate_exposure(
         # paths (WR-01/WR-04: symmetric branches, probe_level != best_level_so_far
         # if convergence criterion were ever loosened).
         converged_level = best_level_so_far
-        clip_roi = best_final_roi_raw if best_final_roi_raw is not None else final_roi_raw
+
+        # Warn (but do not raise) when bisection maxed out and still under target:
+        # the best-effort result is returned with clip_fraction ≈ 0 so the Phase 14
+        # wizard can surface the under-exposure numerically (CONTEXT decision).
+        if converged_level == 255 and not converged:
+            _logger.warning(
+                "channel %s: bisection reached max LED level (255) but could not reach "
+                "the exposure target (best p99 = %.0f, target = %d); clip_fraction will "
+                "be near 0 — frame will be under-exposed for this channel",
+                ch,
+                best_p99,
+                target,
+            )
 
         # clip_fraction: fraction of RAW (pre-subtraction) rebate pixels at or above
-        # saturation threshold (near 0 for non-convergence / never-reached-target case)
-        if clip_roi is not None:
-            clip_fraction = float(np.mean(clip_roi >= _SATURATION_VALUE))
-        else:
-            clip_fraction = 0.0
+        # saturation threshold (near 0 for non-convergence / never-reached-target case).
+        # best_final_roi_raw is always set after the first probe (best_p99 init = inf
+        # guarantees the first iteration updates it).
+        clip_fraction = float(np.mean(best_final_roi_raw >= _SATURATION_VALUE))
 
         # Clamp to [0, 1] for safety (np.mean output should be in range, but guard anyway)
         clip_fraction = float(np.clip(clip_fraction, 0.0, 1.0))
 
-        # gain = TARGET / max(converged_level, 1) — always > 0 (T-12-02)
+        # gain = TARGET / max(converged_level, 1) — always > 0 (T-12-02).
+        # This is a first-order linear LED-response approximation (assumes output
+        # brightness is proportional to LED level).  Non-linearity and gamma
+        # correction are deferred to a later phase / M2.
         gain = float(target) / max(converged_level, 1)
 
         ch_cals[ch] = ChannelCalibration(
