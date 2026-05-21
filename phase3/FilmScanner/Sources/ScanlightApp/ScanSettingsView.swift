@@ -1,14 +1,15 @@
-// ScanSettingsView — nine-section settings form bound to SettingsStore.
-//
-// Layout mirrors ScanlightView exactly: ScrollView root, VStack(spacing:16),
-// GroupBox sections with HStack(spacing:8) rows and .padding(.top, 4) inside
-// each GroupBox content block.
+// ScanSettingsView — capture-settings form bound to SettingsStore.
 //
 // Validation: store.validate() mirrors CaptureSettings.__post_init__ rules.
-// Inline errors appear as red .caption Text below the offending control.
+// Inline errors appear as a danger Banner below the offending control.
 //
 // Folder pickers delegate to store.folderPicker (injectable in tests to avoid
 // real NSOpenPanel in headless runs).
+//
+// Visual language: shared PanelGroupBoxStyle + Theme tokens (see DesignSystem).
+// All AccessibilityIDs, element types, and the conditional rendering of the
+// HW-trigger inbox row and the composite-format picker are preserved exactly —
+// the AX-ID coverage gate (SettingsCalibrationUITests) depends on them.
 
 import SwiftUI
 
@@ -24,182 +25,141 @@ struct ScanSettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: Theme.Space.section) {
 
                 // MARK: 1. Roll
 
-                GroupBox(label: Text("Roll").font(.headline)) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Text("Name:")
-                                .frame(width: 120, alignment: .trailing)
+                GroupBox(label: Text("Roll")) {
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        HStack(spacing: Theme.Space.md) {
+                            Text("Name")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 96, alignment: .leading)
                             TextField("Roll001", text: $store.settings.rollName)
                                 .accessibilityIdentifier(AccessibilityID.settingsRollNameField)
                                 .textFieldStyle(.roundedBorder)
                         }
-                        if let error = store.validationErrors["rollName"] {
-                            Text(error)
-                                .foregroundColor(.red)
-                                .font(.caption)
-                        }
+                        validationError("rollName")
                     }
-                    .padding(.top, 4)
                 }
 
                 // MARK: 2. Output
 
-                GroupBox(label: Text("Output").font(.headline)) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Text("Folder:")
-                                .frame(width: 120, alignment: .trailing)
-                            Button("Choose\u{2026}") {
-                                store.folderPicker("Select output folder") { url in
-                                    if let url = url {
-                                        store.settings.outputFolder = url.path
-                                    }
-                                }
-                            }
-                            .accessibilityIdentifier(AccessibilityID.settingsPickOutputBtn)
-                            Text(store.settings.outputFolder.isEmpty
-                                 ? "No folder selected"
-                                 : store.settings.outputFolder)
-                                .accessibilityIdentifier(AccessibilityID.settingsOutputPathLabel)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(store.settings.outputFolder.isEmpty ? .secondary : .primary)
-                        }
-                        if let error = store.validationErrors["outputFolder"] {
-                            Text(error)
-                                .foregroundColor(.red)
-                                .font(.caption)
-                        }
+                GroupBox(label: Text("Output")) {
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        folderRow(
+                            label: "Folder",
+                            buttonId: AccessibilityID.settingsPickOutputBtn,
+                            pathId: AccessibilityID.settingsOutputPathLabel,
+                            path: store.settings.outputFolder,
+                            placeholder: "No folder selected",
+                            prompt: "Select output folder"
+                        ) { url in store.settings.outputFolder = url.path }
+                        validationError("outputFolder")
                     }
-                    .padding(.top, 4)
                 }
 
                 // MARK: 3. Trigger
 
-                GroupBox(label: Text("Trigger").font(.headline)) {
-                    VStack(alignment: .leading, spacing: 4) {
+                GroupBox(label: Text("Trigger")) {
+                    VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Picker("Trigger", selection: $store.settings.triggerMode) {
-                            Text("HW").tag("hw")
+                            Text("Hardware").tag("hw")
                             Text("SDK").tag("sdk")
                         }
                         .pickerStyle(.segmented)
+                        .labelsHidden()
                         .accessibilityIdentifier(AccessibilityID.settingsTriggerModePicker)
 
+                        Text(store.settings.triggerMode == "hw"
+                             ? "Scanlight fires the shutter over the 3.5 mm jack; RAWs arrive in the IED inbox."
+                             : "The Sony SDK fires the shutter over USB tether.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
                         if store.settings.triggerMode == "hw" {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 8) {
-                                    Text("IED Inbox:")
-                                        .frame(width: 120, alignment: .trailing)
-                                    Button("Choose\u{2026}") {
-                                        store.folderPicker("Select IED inbox folder") { url in
-                                            if let url = url {
-                                                store.settings.iedInbox = url.path
-                                            }
-                                        }
-                                    }
-                                    .accessibilityIdentifier(AccessibilityID.settingsPickInboxBtn)
-                                    Text(store.settings.iedInbox ?? "No folder selected")
-                                        .accessibilityIdentifier(AccessibilityID.settingsInboxPathLabel)
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundColor(
-                                            (store.settings.iedInbox ?? "").isEmpty ? .secondary : .primary
-                                        )
-                                }
-                                if let error = store.validationErrors["iedInbox"] {
-                                    Text(error)
-                                        .foregroundColor(.red)
-                                        .font(.caption)
-                                }
+                            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                                folderRow(
+                                    label: "IED inbox",
+                                    buttonId: AccessibilityID.settingsPickInboxBtn,
+                                    pathId: AccessibilityID.settingsInboxPathLabel,
+                                    path: store.settings.iedInbox ?? "",
+                                    placeholder: "No folder selected",
+                                    prompt: "Select IED inbox folder"
+                                ) { url in store.settings.iedInbox = url.path }
+                                validationError("iedInbox")
                             }
                         }
                     }
-                    .padding(.top, 4)
                 }
 
                 // MARK: 4. Levels
 
-                GroupBox(label: Text("Levels").font(.headline)) {
-                    VStack(spacing: 8) {
+                GroupBox(label: Text("Levels")) {
+                    VStack(spacing: Theme.Space.md) {
                         settingsChannelRow(
-                            label: "R",
-                            level: Binding(
-                                get: { store.settings.levelR },
-                                set: { store.settings.levelR = $0 }
-                            ),
+                            label: "Red", tint: Theme.Channel.red,
+                            level: Binding(get: { store.settings.levelR }, set: { store.settings.levelR = $0 }),
                             sliderId: AccessibilityID.settingsLevelRSlider
                         )
                         settingsChannelRow(
-                            label: "G",
-                            level: Binding(
-                                get: { store.settings.levelG },
-                                set: { store.settings.levelG = $0 }
-                            ),
+                            label: "Green", tint: Theme.Channel.green,
+                            level: Binding(get: { store.settings.levelG }, set: { store.settings.levelG = $0 }),
                             sliderId: AccessibilityID.settingsLevelGSlider
                         )
                         settingsChannelRow(
-                            label: "B",
-                            level: Binding(
-                                get: { store.settings.levelB },
-                                set: { store.settings.levelB = $0 }
-                            ),
+                            label: "Blue", tint: Theme.Channel.blue,
+                            level: Binding(get: { store.settings.levelB }, set: { store.settings.levelB = $0 }),
                             sliderId: AccessibilityID.settingsLevelBSlider
                         )
                     }
-                    .padding(.top, 4)
                 }
 
                 // MARK: 5. Timing
 
-                GroupBox(label: Text("Timing").font(.headline)) {
-                    // Stepper step:10 is the sole constraint on settle ms —
-                    // settle_ms has no __post_init__ validation rule; see
-                    // SettingsStore.validate() comment.
-                    Stepper("\(store.settings.settleMs) ms",
-                            value: $store.settings.settleMs,
-                            in: 0...9999,
-                            step: 10)
-                        .accessibilityIdentifier(AccessibilityID.settingsSettleStepper)
-                    .padding(.top, 4)
+                GroupBox(label: Text("Timing")) {
+                    HStack(spacing: Theme.Space.md) {
+                        Text("Settle")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Stepper("\(store.settings.settleMs) ms",
+                                value: $store.settings.settleMs,
+                                in: 0...9999,
+                                step: 10)
+                            .accessibilityIdentifier(AccessibilityID.settingsSettleStepper)
+                            .monospacedDigit()
+                            .fixedSize()
+                        Spacer()
+                    }
                 }
 
                 // MARK: 6. Calibration (FFC dir)
 
-                GroupBox(label: Text("Calibration").font(.headline)) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Text("FFC Dir:")
-                                .frame(width: 120, alignment: .trailing)
-                            Button("Choose\u{2026}") {
-                                store.folderPicker("Select FFC calibration folder") { url in
-                                    if let url = url {
-                                        store.settings.ffcCalibration = url.path
-                                    }
-                                }
-                            }
-                            .accessibilityIdentifier(AccessibilityID.settingsPickFfcBtn)
-                            Text(store.settings.ffcCalibration ?? "No calibration selected")
-                                .accessibilityIdentifier(AccessibilityID.settingsFfcPathLabel)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(
-                                    (store.settings.ffcCalibration ?? "").isEmpty ? .secondary : .primary
-                                )
-                        }
+                GroupBox(label: Text("Calibration")) {
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        folderRow(
+                            label: "FFC dir",
+                            buttonId: AccessibilityID.settingsPickFfcBtn,
+                            pathId: AccessibilityID.settingsFfcPathLabel,
+                            path: store.settings.ffcCalibration ?? "",
+                            placeholder: "No calibration selected",
+                            prompt: "Select FFC calibration folder"
+                        ) { url in store.settings.ffcCalibration = url.path }
+
                         if let lastDir = store.lastCalibrationDir {
                             Button("Use last calibration") {
                                 store.settings.ffcCalibration = lastDir
                             }
+                            .buttonStyle(.link)
                         }
                     }
-                    .padding(.top, 4)
                 }
 
                 // MARK: 7. Camera
 
-                GroupBox(label: Text("Camera").font(.headline)) {
-                    VStack(alignment: .leading, spacing: 4) {
+                GroupBox(label: Text("Camera")) {
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
                         let cameraOptions = ["Sony ILCE-7CR", "FUJIFILM GFX100 II", "Custom\u{2026}"]
                         let cameraBinding = Binding<String>(
                             get: {
@@ -217,13 +177,21 @@ struct ScanSettingsView: View {
                             }
                         )
 
-                        Picker("Camera", selection: cameraBinding) {
-                            ForEach(cameraOptions, id: \.self) { option in
-                                Text(option).tag(option)
+                        HStack(spacing: Theme.Space.md) {
+                            Text("Model")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 96, alignment: .leading)
+                            Picker("Camera", selection: cameraBinding) {
+                                ForEach(cameraOptions, id: \.self) { option in
+                                    Text(option).tag(option)
+                                }
                             }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .accessibilityIdentifier(AccessibilityID.settingsCameraModelPicker)
+                            Spacer()
                         }
-                        .pickerStyle(.menu)
-                        .accessibilityIdentifier(AccessibilityID.settingsCameraModelPicker)
 
                         if cameraBinding.wrappedValue == "Custom\u{2026}" {
                             TextField("Custom camera model", text: $customCameraModel)
@@ -232,7 +200,6 @@ struct ScanSettingsView: View {
                                     store.settings.cameraModel = newValue.isEmpty ? nil : newValue
                                 }
                                 .onAppear {
-                                    // Pre-populate the text field if current value is custom
                                     let current = store.settings.cameraModel ?? ""
                                     if !["Sony ILCE-7CR", "FUJIFILM GFX100 II"].contains(current) {
                                         customCameraModel = current
@@ -240,50 +207,57 @@ struct ScanSettingsView: View {
                                 }
                         }
                     }
-                    .padding(.top, 4)
                 }
 
                 // MARK: 8. Composite
 
-                GroupBox(label: Text("Composite").font(.headline)) {
-                    VStack(alignment: .leading, spacing: 4) {
+                GroupBox(label: Text("Composite")) {
+                    VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Toggle("Stream composite", isOn: $store.settings.streamComposite)
                             .accessibilityIdentifier(AccessibilityID.settingsStreamToggle)
 
                         if store.settings.streamComposite {
-                            Picker("Format", selection: $store.settings.compositeFormat) {
-                                Text("DNG").tag("dng")
-                                Text("TIFF").tag("tiff")
-                                Text("Both").tag("both")
+                            HStack(spacing: Theme.Space.md) {
+                                Text("Format")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 96, alignment: .leading)
+                                Picker("Format", selection: $store.settings.compositeFormat) {
+                                    Text("DNG").tag("dng")
+                                    Text("TIFF").tag("tiff")
+                                    Text("Both").tag("both")
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                                .accessibilityIdentifier(AccessibilityID.settingsCompositeFormat)
                             }
-                            .pickerStyle(.segmented)
-                            .accessibilityIdentifier(AccessibilityID.settingsCompositeFormat)
                         }
                     }
-                    .padding(.top, 4)
                 }
 
                 // MARK: 9. Actions
 
-                GroupBox(label: Text("Actions").font(.headline)) {
-                    VStack(alignment: .leading, spacing: 4) {
+                GroupBox(label: Text("Save")) {
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
                         Button("Save Settings") {
                             Task { await saveSettings() }
                         }
                         .accessibilityIdentifier(AccessibilityID.settingsSaveBtn)
+                        .buttonStyle(.borderedProminent)
 
                         if !store.validationErrors.isEmpty {
-                            Text("Please fix the errors above.")
-                                .foregroundColor(.red)
+                            Banner(kind: .danger, text: "Please fix the errors above.")
+                        } else {
+                            Text("Settings apply on the next scan, or live when the orchestrator is running.")
                                 .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                    .padding(.top, 4)
                 }
-
             }
-            .padding()
+            .padding(Theme.Space.xl)
         }
+        .groupBoxStyle(PanelGroupBoxStyle())
     }
 
     // MARK: - Actions
@@ -309,14 +283,64 @@ struct ScanSettingsView: View {
 
     // MARK: - Private helpers
 
-    /// Channel row for the Levels GroupBox: slider bound to an Int field on
-    /// ScanSettings (levelR/G/B). Uses Int↔Double conversion for the Slider.
-    /// No "On" button — levels here are settings, not live light controls.
+    /// Inline validation message for a given field key, rendered as a danger Banner.
     @ViewBuilder
-    private func settingsChannelRow(label: String, level: Binding<Int>, sliderId: String) -> some View {
-        HStack(spacing: 8) {
+    private func validationError(_ key: String) -> some View {
+        if let error = store.validationErrors[key] {
+            Banner(kind: .danger, text: error)
+        }
+    }
+
+    /// A folder-picker row: leading label, "Choose…" button, and a truncating
+    /// monospaced path. Shared shape for output / inbox / FFC so the three read
+    /// identically (consistent component vocabulary).
+    @ViewBuilder
+    private func folderRow(
+        label: String,
+        buttonId: String,
+        pathId: String,
+        path: String,
+        placeholder: String,
+        prompt: String,
+        onPick: @escaping (URL) -> Void
+    ) -> some View {
+        HStack(spacing: Theme.Space.md) {
             Text(label)
-                .frame(width: 44, alignment: .trailing)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .frame(width: 96, alignment: .leading)
+            Button("Choose\u{2026}") {
+                store.folderPicker(prompt) { url in
+                    if let url = url { onPick(url) }
+                }
+            }
+            .accessibilityIdentifier(buttonId)
+            .buttonStyle(.bordered)
+            Text(path.isEmpty ? placeholder : path)
+                .accessibilityIdentifier(pathId)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(path.isEmpty ? .secondary : .primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// Channel row for the Levels GroupBox: a channel-tinted slider bound to an
+    /// Int field on ScanSettings (levelR/G/B). No "On" button — these are saved
+    /// capture levels, not live light controls.
+    @ViewBuilder
+    private func settingsChannelRow(label: String, tint: Color, level: Binding<Int>, sliderId: String) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            HStack(spacing: Theme.Space.sm) {
+                Circle()
+                    .fill(tint)
+                    .frame(width: 9, height: 9)
+                    .accessibilityHidden(true)
+                Text(label)
+                    .font(.subheadline)
+                    .frame(width: 46, alignment: .leading)
+            }
             Slider(
                 value: Binding(
                     get: { Double(level.wrappedValue) },
@@ -325,10 +349,13 @@ struct ScanSettingsView: View {
                 in: 0...255
             )
             .accessibilityIdentifier(sliderId)
-            .frame(minWidth: 120)
+            .tint(tint)
+            .frame(minWidth: 140)
             Text("\(level.wrappedValue)")
-                .frame(width: 30, alignment: .trailing)
+                .font(.body)
                 .monospacedDigit()
+                .foregroundStyle(tint)
+                .frame(width: 36, alignment: .trailing)
         }
     }
 }

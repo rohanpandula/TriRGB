@@ -22,12 +22,15 @@ of a negative; FilmLab or NLP handles inversion downstream.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Mapping, Optional, Union
 
 import numpy as np
 import rawpy
 import tifffile
+
+logger = logging.getLogger("rgb_composite")
 
 from .dng import write_linear_dng
 from .ffc import (
@@ -244,10 +247,19 @@ def composite_triplet(
 
     composite = np.stack([r_ch, g_ch, b_ch], axis=-1)
 
-    # Sanity check the dtype — postprocess(output_bps=16) returns uint16,
-    # apply_ffc preserves that.
+    # Sanity check the dtype — postprocess(output_bps=16) returns uint16 and
+    # apply_ffc preserves that. If something upstream ever changes (a rawpy
+    # upgrade, an FFC path returning float), coerce but log loudly rather than
+    # silently masking the regression; round floats so we don't bias-truncate.
     if composite.dtype != np.uint16:
-        composite = composite.astype(np.uint16)
+        logger.warning(
+            "composite dtype was %s, expected uint16 — coercing "
+            "(check rawpy/FFC output)", composite.dtype,
+        )
+        if np.issubdtype(composite.dtype, np.floating):
+            composite = np.rint(composite).astype(np.uint16)
+        else:
+            composite = composite.astype(np.uint16)
 
     description = (
         f"narrowband-RGB composite from {r_path.name}, {g_path.name}, {b_path.name} "

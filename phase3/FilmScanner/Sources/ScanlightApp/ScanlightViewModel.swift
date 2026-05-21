@@ -55,15 +55,17 @@ final class ScanlightViewModel: ObservableObject {
 
     // MARK: - Port-ownership guard (Phase 07)
 
-    /// Set by ScanCoordinator when transitioning into/out of a scan. When not
-    /// .idle, manual light actions (connect/disconnect/setChannel/pulse) are
-    /// rejected with a clear error rather than racing the orchestrator for the
-    /// serial port (which would cause a double-open and corrupt scans silently).
+    /// Who currently owns the Scanlight serial port. When not `.idle`, manual
+    /// light actions (connect/setChannel/pulse) are rejected with a clear error
+    /// rather than racing the orchestrator (`.scanning`) or the calibration
+    /// script (`.calibrating`) for the port — a double-open corrupts scans
+    /// silently. `disconnect()` is intentionally NOT guarded (ScanCoordinator
+    /// calls it deliberately when starting a scan).
     ///
-    /// ScanCoordinator is the ONLY writer of this property. The guard is
-    /// intentionally minimal: it does not prevent disconnect() (which
-    /// ScanCoordinator calls deliberately when starting a scan).
-    var portOwner: PortOwner = .idle
+    /// Writers: ScanCoordinator (`.scanning`/`.idle`) and CalibrationView
+    /// (`.calibrating`/`.idle`). `@Published` so the Light and Calibrate tabs
+    /// reactively disable their port-grabbing controls while it is owned.
+    @Published var portOwner: PortOwner = .idle
 
     // MARK: - Init
 
@@ -74,6 +76,7 @@ final class ScanlightViewModel: ObservableObject {
     // MARK: - Actions
 
     func connect() {
+        guard guardPortOwner("connect") else { return }
         log("connect: opening transport")
         switch transportFactory() {
         case .success(let transport):

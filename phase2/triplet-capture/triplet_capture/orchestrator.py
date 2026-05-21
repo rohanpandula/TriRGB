@@ -34,6 +34,7 @@ import json
 import logging
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -174,6 +175,12 @@ class Orchestrator:
         self._settings = settings
         self._clock = clock
         self._sleep = sleep
+        # Serializes capture_triplet + update_settings. Flask serves on a
+        # threaded server, so without this two concurrent /api/capture requests
+        # (or a capture racing /api/settings) could interleave R/G/B serial
+        # writes and race the frame counter. CompositeWorker is already lock-
+        # guarded for the same reason; the capture path needs it too.
+        self._lock = threading.Lock()
         # Optional hook fired after a successful (non-retake AND retake)
         # triplet, with the TripletResult. The app layer wires a
         # CompositeWorker.submit() here to kick off background compositing
@@ -219,16 +226,17 @@ class Orchestrator:
         otherwise a runtime switch from sdk→hw (or vice versa) would
         keep firing through the old runner.
         """
-        if "roll_name" in kwargs and "frame_number" not in kwargs:
-            if kwargs["roll_name"] != self._settings.roll_name:
-                kwargs["frame_number"] = 1
-        old_trigger_mode = self._settings.trigger_mode
-        self._settings = replace(self._settings, **kwargs)
-        # Run validators
-        self._settings.__post_init__()
-        if self._settings.trigger_mode != old_trigger_mode:
-            self._runner = self._pick_runner()
-        return self._settings
+        with self._lock:
+            if "roll_name" in kwargs and "frame_number" not in kwargs:
+                if kwargs["roll_name"] != self._settings.roll_name:
+                    kwargs["frame_number"] = 1
+            old_trigger_mode = self._settings.trigger_mode
+            self._settings = replace(self._settings, **kwargs)
+            # Run validators
+            self._settings.__post_init__()
+            if self._settings.trigger_mode != old_trigger_mode:
+                self._runner = self._pick_runner()
+            return self._settings
 
     def capture_triplet(self, *, retake: bool = False) -> TripletResult:
         """Capture R, G, B for the current frame.
@@ -236,7 +244,26 @@ class Orchestrator:
         On success the frame counter advances; on any failure it does not.
         `retake=True` overwrites the current frame's files without
         advancing afterwards (the operator presses Retake explicitly).
+
+        Serialized via `self._lock`. Flask serves on a threaded server, so two
+        concurrent /api/capture requests could otherwise interleave R/G/B
+        serial writes and race the frame counter. A capture that arrives while
+        another is in flight is rejected (success=False) rather than queued —
+        queuing would silently shoot a second frame with no film advance.
         """
+        if not self._lock.acquire(blocking=False):
+            return TripletResult(
+                success=False,
+                frame_number=self._settings.frame_number,
+                files={},
+                error="a capture is already in progress",
+            )
+        try:
+            return self._capture_triplet_locked(retake=retake)
+        finally:
+            self._lock.release()
+
+    def _capture_triplet_locked(self, *, retake: bool) -> TripletResult:
         s = self._settings
         s.output_folder.mkdir(parents=True, exist_ok=True)
         log_path = s.output_folder / "scan_log.jsonl"

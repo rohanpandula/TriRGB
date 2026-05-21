@@ -29,8 +29,8 @@ struct ScanlightAppMain: App {
         WindowGroup {
             ScanHubRootView()
                 .frame(
-                    minWidth: 720, idealWidth: 900, maxWidth: .infinity,
-                    minHeight: 480, idealHeight: 640, maxHeight: .infinity
+                    minWidth: 680, idealWidth: 800, maxWidth: .infinity,
+                    minHeight: 520, idealHeight: 700, maxHeight: .infinity
                 )
         }
     }
@@ -81,5 +81,6 @@ struct ScanHubRootView: View {
             ScanView(coordinator: scanCoordinator, store: settingsStore)
                 .tabItem { Label("Scan", systemImage: "camera") }
         }
+        .tint(Theme.accent)
     }
 }

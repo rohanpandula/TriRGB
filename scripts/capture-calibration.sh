@@ -98,9 +98,12 @@ if [[ -z "$TARGET" ]]; then
 fi
 
 # Resolve scanlightctl + sony-capture, matching scripts/smoketest.sh's logic.
-SCANLIGHTCTL="$(command -v scanlightctl || true)"
-if [[ -z "$SCANLIGHTCTL" ]]; then
-    SCANLIGHTCTL="python3 -m scanlight.cli"
+# Array so the multi-word python fallback expands as separate argv elements,
+# without word-splitting a path that happens to contain spaces.
+if command -v scanlightctl >/dev/null 2>&1; then
+    SCANLIGHTCTL=(scanlightctl)
+else
+    SCANLIGHTCTL=(python3 -m scanlight.cli)
     export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}${REPO_ROOT}/phase1/scanlightctl"
 fi
 
@@ -181,7 +184,7 @@ run_one() {
     local level="$3"       # 1–255
     local out="${TARGET}/${label}.ARW"
     echo "→ scanlightctl on $channel --level $level"
-    $SCANLIGHTCTL on "$channel" --level "$level"
+    "${SCANLIGHTCTL[@]}" on "$channel" --level "$level"
     sleep 0.1  # let LEDs settle
     echo "→ sony-capture → $out"
     "$SONY_CAPTURE" --out "$out" --timeout 30
@@ -189,14 +192,14 @@ run_one() {
 }
 
 # Always turn the scanlight off on exit, even if something fails halfway.
-trap '$SCANLIGHTCTL off || true' EXIT
+trap '"${SCANLIGHTCTL[@]}" off || true' EXIT
 
 run_one r R "$LEVEL_R"
 run_one g G "$LEVEL_G"
 run_one b B "$LEVEL_B"
 
 echo "→ scanlightctl off"
-$SCANLIGHTCTL off
+"${SCANLIGHTCTL[@]}" off
 
 # Capture device telemetry post-calibration. If VBUS dipped below 4500 mV
 # or LED temp climbed near the firmware's 80 °C threshold during the cal
@@ -204,7 +207,7 @@ $SCANLIGHTCTL off
 # conditions and should be re-shot. We capture status AFTER scanlight off
 # so the temperature reading is the worst-case (LEDs warm from R+G+B).
 echo "→ recording post-cal telemetry"
-STATUS_OUT="$( $SCANLIGHTCTL status 2>&1 || echo "status: scanlightctl status failed" )"
+STATUS_OUT="$( "${SCANLIGHTCTL[@]}" status 2>&1 || echo "status: scanlightctl status failed" )"
 
 # Extract the relevant numbers from the status output (key: value format).
 # Best-effort parsing — if scanlightctl output format ever changes, the

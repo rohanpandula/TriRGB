@@ -112,7 +112,17 @@ def discover_frames(roll_dir: Path) -> list[FrameGroup]:
         frame = int(m.group("frame"))
         ch = m.group("channel").upper()
         roll_name = m.group("roll")
-        by_key.setdefault((roll_name, frame), {})[ch] = entry
+        channels = by_key.setdefault((roll_name, frame), {})
+        if ch in channels:
+            # The pattern is case-insensitive, so e.g. `_r.ARW` and `_R.ARW`
+            # both map to channel "R". Don't silently drop one — warn so the
+            # operator can fix the stray-case file.
+            logger.warning(
+                "duplicate %s channel for %s Frame%03d: %s overwrites %s "
+                "(case-insensitive filename match)",
+                ch, roll_name, frame, entry.name, channels[ch].name,
+            )
+        channels[ch] = entry
 
     distinct_rolls = {roll for (roll, _) in by_key}
     if len(distinct_rolls) > 1:
@@ -363,6 +373,23 @@ def main(argv=None) -> int:
         f"skipped: {len(result.skipped)}  "
         f"failed: {len(result.failed)}"
     )
+    # Surface dimension-mismatch failures distinctly — these mean the film
+    # physically moved between the R/G/B exposures (reshoot the frame), not a
+    # decode/IO error. _composite_one tags each failure with the exception type.
+    dim_mismatch = [
+        g for (g, err) in result.failed
+        if err.startswith("DimensionMismatchError")
+    ]
+    if dim_mismatch:
+        print(
+            "batch-composite: %d frame(s) had a dimension mismatch (film likely "
+            "moved between exposures — reshoot): %s"
+            % (
+                len(dim_mismatch),
+                ", ".join(f"Frame{g.frame_number:03d}" for g in dim_mismatch),
+            ),
+            file=sys.stderr,
+        )
     # Empty-roll guard (codex audit): if discovery found zero matching
     # files at all, the operator probably has a misnamed directory or
     # wrong file extension. Don't return silent success.

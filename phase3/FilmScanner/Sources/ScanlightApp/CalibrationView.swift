@@ -6,16 +6,13 @@
 // capture-calibration.sh (which opens the serial port via scanlightctl) from
 // conflicting with the app's existing connection.
 //
-// Layout: three GroupBox sections (Calibration / Results / Apply), matching the
-// ScanlightView GroupBox + ScrollView + VStack pattern exactly.
+// Layout: PanelGroupBoxStyle sections (Calibration / Results / Apply). The
+// Results and Apply sections render only when a CalibrationResult exists — that
+// conditional, plus every AccessibilityID and the verdict accessibilityValue
+// wiring, is preserved exactly (the automation contract depends on it).
 //
 // Injection pattern (mirrors OrchestratorClientTests URLSession injection):
 //   CalibrationView(store:viewModel:calibrationViewModel:calVM)
-// Tests pass a CalibrationViewModel with a stub runner. Production code passes
-// nil and the View creates its own fresh CalibrationViewModel.
-//
-// Serial-port guard note: Phase 07 delivers the full port-handoff state machine.
-// Phase 06 only prevents the double-open via .disabled(viewModel.isConnected).
 
 import SwiftUI
 
@@ -34,20 +31,11 @@ struct CalibrationView: View {
 
     // MARK: - Init
 
-    /// Create CalibrationView.
-    ///
-    /// - Parameters:
-    ///   - store: The shared SettingsStore (must be @StateObject at the app level).
-    ///   - viewModel: ScanlightViewModel for the serial-port guard.
-    ///   - calibrationViewModel: Optional pre-built CalibrationViewModel for tests.
-    ///     When nil (default), a fresh CalibrationViewModel is created.
     init(store: SettingsStore,
          viewModel: ScanlightViewModel,
          calibrationViewModel: CalibrationViewModel? = nil) {
         self.store = store
         self.viewModel = viewModel
-        // Inject or create. @StateObject requires the initial value at init time.
-        // This is the standard injection pattern for @StateObject in SwiftUI tests.
         _calViewModel = StateObject(wrappedValue: calibrationViewModel ?? CalibrationViewModel())
     }
 
@@ -55,47 +43,71 @@ struct CalibrationView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: Theme.Space.section) {
                 calibrationSection
                 if calViewModel.result != nil {
                     resultsSection
                     applySection
                 }
             }
-            .padding()
+            .padding(Theme.Space.xl)
         }
+        .groupBoxStyle(PanelGroupBoxStyle())
     }
 
     // MARK: - Sections
 
-    /// GroupBox 1: Capture trigger, running indicator, error display.
+    /// GroupBox 1: Capture trigger, running indicator, error display, hint.
     private var calibrationSection: some View {
-        GroupBox(label: Text("Calibration").font(.headline)) {
-            VStack(alignment: .leading, spacing: 6) {
-                // Serial-port guard: show explanatory label when connected.
-                if viewModel.isConnected {
-                    Text("Disconnect the Light panel before calibrating.")
-                        .foregroundColor(.red)
-                        .font(.caption)
+        GroupBox(label: Text("Calibration")) {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                // Serial-port guard: explain why capture is blocked while connected.
+                if viewModel.portOwner == .scanning {
+                    Banner(kind: .warning,
+                           text: "A scan is using the serial port. Stop the scan before calibrating.")
+                } else if viewModel.isConnected {
+                    Banner(kind: .warning,
+                           text: "Disconnect the Light panel before calibrating — the script needs the serial port.")
                 }
 
-                Button("Capture Calibration") {
-                    Task { await calViewModel.runCalibration() }
-                }
-                .accessibilityIdentifier(AccessibilityID.calCaptureBtn)
-                .disabled(calViewModel.isRunning || viewModel.isConnected)
+                HStack(spacing: Theme.Space.md) {
+                    Button("Capture Calibration") {
+                        // Claim the serial port for the calibration script before
+                        // launching it — capture-calibration.sh opens the port via
+                        // scanlightctl, so the Light tab's Connect/channel controls
+                        // (and Start Scan) must lock while it runs. Set synchronously
+                        // here (not inside the Task) so a rapid double-tap can't pass
+                        // this guard twice and spawn two runs. Released on completion.
+                        guard viewModel.portOwner == .idle, !viewModel.isConnected, !calViewModel.isRunning else { return }
+                        viewModel.portOwner = .calibrating
+                        Task { @MainActor in
+                            defer { viewModel.portOwner = .idle }
+                            await calViewModel.runCalibration()
+                        }
+                    }
+                    .accessibilityIdentifier(AccessibilityID.calCaptureBtn)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(calViewModel.isRunning || viewModel.isConnected || viewModel.portOwner != .idle)
 
-                if calViewModel.isRunning {
-                    ProgressView()
+                    if calViewModel.isRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Capturing flat-field frames\u{2026}")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 if let err = calViewModel.lastError {
-                    Text(err)
-                        .foregroundColor(.red)
+                    Banner(kind: .danger, text: err)
+                }
+
+                if calViewModel.result == nil && !calViewModel.isRunning && calViewModel.lastError == nil {
+                    Text("Capture a flat-field frame per channel to measure illumination falloff and uniformity. Results appear below.")
                         .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
-            .padding(.top, 4)
         }
     }
 
@@ -104,39 +116,43 @@ struct CalibrationView: View {
     private var resultsSection: some View {
         Group {
             if let result = calViewModel.result {
-                GroupBox(label: Text("Results").font(.headline)) {
-                    VStack(spacing: 6) {
+                GroupBox(label: Text("Results")) {
+                    VStack(spacing: Theme.Space.sm) {
                         // Column headers
-                        HStack {
-                            Text("").frame(width: 60, alignment: .trailing)
+                        HStack(spacing: Theme.Space.md) {
+                            Text("")
+                                .frame(width: 52, alignment: .leading)
                             Text("Falloff")
-                                .frame(width: 64, alignment: .trailing)
+                                .frame(width: 72, alignment: .trailing)
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundStyle(.secondary)
                             Text("Uniformity")
-                                .frame(width: 64, alignment: .trailing)
+                                .frame(width: 80, alignment: .trailing)
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundStyle(.secondary)
                             Text("Verdict")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
                         }
 
-                        verdictRow(channel: "R", stats: result.channelR)
-                        verdictRow(channel: "G", stats: result.channelG)
-                        verdictRow(channel: "B", stats: result.channelB)
+                        verdictRow(channel: "R", tint: Theme.Channel.red, stats: result.channelR)
+                        verdictRow(channel: "G", tint: Theme.Channel.green, stats: result.channelG)
+                        verdictRow(channel: "B", tint: Theme.Channel.blue, stats: result.channelB)
 
-                        Divider()
+                        Divider().opacity(0.6)
 
                         // Overall verdict row
-                        HStack {
-                            Text("Overall").frame(width: 60, alignment: .trailing)
-                            verdictChip(verdict: result.overall)
+                        HStack(spacing: Theme.Space.md) {
+                            Text("Overall")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(width: 52, alignment: .leading)
+                            Spacer(minLength: 0)
+                            Chip(text: result.overall, tint: verdictTint(result.overall))
                                 .accessibilityIdentifier(AccessibilityID.calOverallLabel)
                                 .accessibilityValue(result.overall)
                         }
                     }
-                    .padding(.top, 4)
                 }
             }
         }
@@ -147,21 +163,28 @@ struct CalibrationView: View {
     private var applySection: some View {
         Group {
             if calViewModel.result != nil {
-                GroupBox(label: Text("Apply").font(.headline)) {
-                    VStack(alignment: .leading, spacing: 6) {
+                GroupBox(label: Text("Apply")) {
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
                         Button("Use this calibration") {
                             calViewModel.applyCalibration(to: store)
                         }
                         .accessibilityIdentifier(AccessibilityID.calUseBtn)
+                        .buttonStyle(.borderedProminent)
                         .disabled(calViewModel.result == nil)
 
                         if let dir = calViewModel.lastCalDir {
-                            Text("FFC path set to: \(dir.path)")
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(.secondary)
+                            HStack(spacing: Theme.Space.sm) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(Theme.State.success)
+                                    .accessibilityHidden(true)
+                                Text("FFC path set to \(dir.path)")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
                         }
                     }
-                    .padding(.top, 4)
                 }
             }
         }
@@ -169,46 +192,42 @@ struct CalibrationView: View {
 
     // MARK: - Verdict helpers
 
-    /// One data row in the verdict table.
+    /// One data row in the verdict table: channel dot + falloff/uniformity + verdict chip.
     @ViewBuilder
-    private func verdictRow(channel: String, stats: ChannelCalResult?) -> some View {
+    private func verdictRow(channel: String, tint: Color, stats: ChannelCalResult?) -> some View {
         if let stats = stats {
-            HStack(spacing: 8) {
-                Text(channel).frame(width: 60, alignment: .trailing)
+            HStack(spacing: Theme.Space.md) {
+                HStack(spacing: Theme.Space.sm) {
+                    Circle().fill(tint).frame(width: 9, height: 9).accessibilityHidden(true)
+                    Text(channel).font(.subheadline).frame(width: 28, alignment: .leading)
+                }
+                .frame(width: 52, alignment: .leading)
                 Text(String(format: "%.1f%%", stats.falloffPct))
-                    .frame(width: 64, alignment: .trailing)
+                    .frame(width: 72, alignment: .trailing)
                     .monospacedDigit()
                     .accessibilityLabel("\(channel) falloff")
                     .accessibilityValue(String(format: "%.1f%%", stats.falloffPct))
                 Text(String(format: "%.1f%%", stats.uniformityPct))
-                    .frame(width: 64, alignment: .trailing)
+                    .frame(width: 80, alignment: .trailing)
                     .monospacedDigit()
                     .accessibilityLabel("\(channel) uniformity")
                     .accessibilityValue(String(format: "%.1f%%", stats.uniformityPct))
-                verdictChip(verdict: stats.verdict)
+                Chip(text: stats.verdict, tint: verdictTint(stats.verdict))
                     .accessibilityIdentifier(axId(for: channel))
                     .accessibilityValue(stats.verdict)
+                Spacer(minLength: 0)
             }
         }
     }
 
-    /// Colored chip badge for a verdict string.
-    ///
-    /// Colors per 06-UI-SPEC.md:
-    ///   clean      → green background,  white text
-    ///   acceptable → yellow background, black text (contrast)
-    ///   fail       → red background,    white text
-    @ViewBuilder
-    private func verdictChip(verdict: String) -> some View {
-        let bg: Color = verdict == "clean" ? .green : verdict == "fail" ? .red : .yellow
-        let fg: Color = verdict == "acceptable" ? .black : .white
-        Text(verdict)
-            .font(.caption)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 2)
-            .background(bg)
-            .foregroundColor(fg)
-            .cornerRadius(4)
+    /// Map a verdict string to its semantic tint.
+    ///   clean → success, acceptable → warning, fail → danger.
+    private func verdictTint(_ verdict: String) -> Color {
+        switch verdict {
+        case "clean": return Theme.State.success
+        case "fail": return Theme.State.danger
+        default: return Theme.State.warning
+        }
     }
 
     /// Map channel name to its AccessibilityID constant.

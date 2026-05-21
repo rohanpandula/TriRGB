@@ -223,11 +223,26 @@ final class OrchestratorClient: ObservableObject {
         // After the data is read, update stderrData via MainActor.run.
         let fileHandle = stderrPipe.fileHandleForReading
         Task.detached { [weak self] in
-            let data = fileHandle.readDataToEndOfFile()
-            await MainActor.run { [weak self] in
-                // Ignore stderr belonging to a launch that has been superseded.
-                guard let self, self.launchGeneration == generation else { return }
-                self.stderrData = data
+            // Read incrementally (availableData returns as soon as a chunk is
+            // ready) rather than readDataToEndOfFile (which only returns at EOF /
+            // child exit). This still drains the pipe to avoid a full-buffer
+            // stall on a chatty child, but ALSO makes a startup traceback visible
+            // to the fast-fail paths (which read stderrData the moment
+            // childExitStatus trips) instead of racing the EOF read. (Audit Low)
+            while true {
+                let chunk = fileHandle.availableData
+                if chunk.isEmpty { break }  // EOF — write end closed (child exited)
+                await MainActor.run { [weak self] in
+                    // Ignore stderr belonging to a launch that has been superseded.
+                    guard let self, self.launchGeneration == generation else { return }
+                    self.stderrData.append(chunk)
+                    // Keep only the tail so a long, chatty session can't grow this
+                    // unbounded — a startup/crash traceback lives at the end anyway.
+                    let cap = 64 * 1024
+                    if self.stderrData.count > cap {
+                        self.stderrData.removeFirst(self.stderrData.count - cap)
+                    }
+                }
             }
         }
 

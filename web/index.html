@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scanlight Studio — Narrowband Film Scanning for macOS</title>
+  <meta name="description" content="Automated narrowband RGB film scanning. One native macOS app. Cleaner color, no terminal required." />
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,600;0,9..144,700;1,9..144,300;1,9..144,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- Tailwind Play CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            display: ['Fraunces', 'Georgia', 'serif'],
+            body: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['"JetBrains Mono"', '"IBM Plex Mono"', 'monospace'],
+          },
+          colors: {
+            base: {
+              950: '#0b0c0e',
+              900: '#111215',
+              800: '#1a1c20',
+              700: '#242730',
+              600: '#2f3340',
+            },
+            ink: {
+              100: '#f0ede8',
+              200: '#d8d4cc',
+              400: '#8a8880',
+              500: '#5a5955',
+            },
+            ch: {
+              red:   '#e8574a',
+              green: '#4ab87a',
+              blue:  '#4a8fe8',
+              redfade:   'rgba(232,87,74,0.12)',
+              greenfade: 'rgba(74,184,122,0.12)',
+              bluefade:  'rgba(74,143,232,0.12)',
+            },
+          },
+          spacing: {
+            '18': '4.5rem',
+            '22': '5.5rem',
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- AOS scroll animation -->
+  <link rel="stylesheet" href="https://unpkg.com/aos@2.3.4/dist/aos.css" />
+  <script src="https://unpkg.com/aos@2.3.4/dist/aos.js"></script>
+
+  <style>
+    :root {
+      --r: #e8574a;
+      --g: #4ab87a;
+      --b: #4a8fe8;
+    }
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+    body { background: #0b0c0e; color: #f0ede8; font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+
+    /* ─── Reduced motion ─── */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+      [data-aos] { opacity: 1 !important; transform: none !important; }
+    }
+
+    /* ─── Nav ─── */
+    .nav-link { font-size: 0.8125rem; letter-spacing: 0.06em; text-transform: uppercase; color: #8a8880; transition: color 0.2s; }
+    .nav-link:hover { color: #f0ede8; }
+
+    /* ─── Typography ─── */
+    .display { font-family: 'Fraunces', Georgia, serif; font-optical-sizing: auto; }
+    .mono    { font-family: 'JetBrains Mono', monospace; }
+
+    /* ─── Section divider marks ─── */
+    .section-mark {
+      display: inline-block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.6875rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      padding: 0.25rem 0.625rem;
+      border-radius: 2px;
+      margin-bottom: 1.5rem;
+    }
+    .sm-r { background: rgba(232,87,74,0.12); color: #e8574a; border: 1px solid rgba(232,87,74,0.25); }
+    .sm-g { background: rgba(74,184,122,0.12); color: #4ab87a; border: 1px solid rgba(74,184,122,0.25); }
+    .sm-b { background: rgba(74,143,232,0.12); color: #4a8fe8; border: 1px solid rgba(74,143,232,0.25); }
+    .sm-n { background: rgba(240,237,232,0.06); color: #8a8880; border: 1px solid rgba(240,237,232,0.1); }
+
+    /* ─── Buttons ─── */
+    .btn-primary {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      background: #f0ede8; color: #0b0c0e;
+      font-size: 0.875rem; font-weight: 600; letter-spacing: 0.01em;
+      padding: 0.75rem 1.75rem; border-radius: 3px;
+      transition: background 0.2s, transform 0.15s;
+    }
+    .btn-primary:hover { background: #fff; transform: translateY(-1px); }
+    .btn-primary:focus-visible { outline: 2px solid #4a8fe8; outline-offset: 3px; }
+
+    .btn-ghost {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      color: #8a8880; font-size: 0.875rem; font-weight: 500;
+      padding: 0.75rem 1.5rem; border-radius: 3px;
+      border: 1px solid rgba(240,237,232,0.1);
+      transition: color 0.2s, border-color 0.2s;
+    }
+    .btn-ghost:hover { color: #f0ede8; border-color: rgba(240,237,232,0.25); }
+    .btn-ghost:focus-visible { outline: 2px solid #4a8fe8; outline-offset: 3px; }
+
+    /* ─── Hero RGB motif ─── */
+    .rgb-stack { position: relative; width: 320px; height: 220px; flex-shrink: 0; }
+    .film-frame {
+      position: absolute;
+      width: 220px; height: 160px;
+      border-radius: 2px;
+      border: 1.5px solid;
+    }
+    .film-frame-r { top: 0; left: 0; border-color: rgba(232,87,74,0.6); background: rgba(232,87,74,0.06); }
+    .film-frame-g { top: 16px; left: 22px; border-color: rgba(74,184,122,0.6); background: rgba(74,184,122,0.06); }
+    .film-frame-b { top: 32px; left: 44px; border-color: rgba(74,143,232,0.6); background: rgba(74,143,232,0.06); }
+    .film-frame-composite { top: 44px; left: 58px; width: 240px; height: 160px; border-color: rgba(240,237,232,0.3); background: rgba(240,237,232,0.03); }
+    .channel-label {
+      position: absolute;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.625rem;
+      letter-spacing: 0.1em;
+      top: 6px; left: 8px;
+    }
+    .channel-dot {
+      position: absolute;
+      width: 6px; height: 6px; border-radius: 50%;
+      bottom: 6px; right: 8px;
+    }
+
+    /* small crosshair in frame */
+    .crosshair::before, .crosshair::after {
+      content: '';
+      position: absolute;
+      top: 50%; left: 50%;
+      background: rgba(240,237,232,0.08);
+    }
+    .crosshair::before { width: 1px; height: 60%; transform: translate(-50%,-50%); }
+    .crosshair::after  { width: 60%; height: 1px; transform: translate(-50%,-50%); }
+
+    /* ─── Process steps ─── */
+    .step-connector {
+      width: 2px; height: 40px;
+      background: linear-gradient(to bottom, rgba(240,237,232,0.08), rgba(240,237,232,0.2), rgba(240,237,232,0.08));
+      margin: 0 auto;
+    }
+    .step-num {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.625rem;
+      color: #5a5955;
+      letter-spacing: 0.12em;
+    }
+
+    /* ─── App mock card ─── */
+    .app-card {
+      background: #1a1c20;
+      border: 1px solid rgba(240,237,232,0.08);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .app-titlebar {
+      background: #242730;
+      padding: 0.5rem 0.875rem;
+      display: flex; align-items: center; gap: 0.5rem;
+      border-bottom: 1px solid rgba(240,237,232,0.06);
+    }
+    .titlebar-dot { width: 10px; height: 10px; border-radius: 50%; }
+    .app-tab-bar {
+      display: flex; gap: 0;
+      border-bottom: 1px solid rgba(240,237,232,0.08);
+      background: #1a1c20;
+    }
+    .app-tab {
+      font-family: 'Inter', sans-serif;
+      font-size: 0.75rem;
+      padding: 0.625rem 1.125rem;
+      color: #5a5955;
+      border-bottom: 2px solid transparent;
+      cursor: default;
+      transition: color 0.15s;
+    }
+    .app-tab.active { color: #f0ede8; border-bottom-color: #4a8fe8; }
+    .app-tab:not(.active):hover { color: #8a8880; }
+
+    /* Calibrate table */
+    .cal-table { width: 100%; border-collapse: collapse; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; }
+    .cal-table th { text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.6rem; color: #5a5955; padding: 0.5rem 0.75rem; text-align: left; border-bottom: 1px solid rgba(240,237,232,0.06); }
+    .cal-table td { padding: 0.625rem 0.75rem; border-bottom: 1px solid rgba(240,237,232,0.04); color: #d8d4cc; }
+    .cal-table tr:last-child td { border-bottom: none; }
+    .verdict { display: inline-block; font-size: 0.6rem; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; padding: 0.2rem 0.5rem; border-radius: 2px; }
+    .v-clean    { background: rgba(74,184,122,0.15); color: #4ab87a; border: 1px solid rgba(74,184,122,0.3); }
+    .v-accept   { background: rgba(232,179,74,0.12); color: #e8b34a; border: 1px solid rgba(232,179,74,0.25); }
+    .v-fail     { background: rgba(232,87,74,0.12);  color: #e8574a; border: 1px solid rgba(232,87,74,0.25); }
+
+    /* Scan status list */
+    .scan-row { display: flex; align-items: center; justify-content: space-between; padding: 0.5rem 0.75rem; border-bottom: 1px solid rgba(240,237,232,0.04); font-size: 0.75rem; }
+    .scan-row:last-child { border-bottom: none; }
+    .scan-status { font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; letter-spacing: 0.08em; }
+    .s-done { color: #4ab87a; }
+    .s-compositing { color: #e8b34a; }
+    .s-captured { color: #4a8fe8; }
+    .s-waiting { color: #5a5955; }
+
+    /* ─── Feature cards ─── */
+    .feature-card {
+      background: #111215;
+      border: 1px solid rgba(240,237,232,0.07);
+      border-radius: 4px;
+      padding: 1.5rem;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .feature-card:hover { background: #1a1c20; border-color: rgba(240,237,232,0.14); }
+    .feature-icon { width: 36px; height: 36px; border-radius: 3px; display: flex; align-items: center; justify-content: center; margin-bottom: 1rem; }
+
+    /* ─── Spec table ─── */
+    .spec-row { display: grid; grid-template-columns: 1fr 1.6fr; border-bottom: 1px solid rgba(240,237,232,0.06); }
+    .spec-row:last-child { border-bottom: none; }
+    .spec-key { font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; letter-spacing: 0.08em; color: #5a5955; padding: 0.75rem 0; text-transform: uppercase; }
+    .spec-val { font-size: 0.8125rem; color: #d8d4cc; padding: 0.75rem 0 0.75rem 1.25rem; border-left: 1px solid rgba(240,237,232,0.06); }
+
+    /* ─── Divider rule ─── */
+    .rule { border: none; height: 1px; background: rgba(240,237,232,0.07); }
+
+    /* ─── Utility ─── */
+    .text-r { color: #e8574a; }
+    .text-g { color: #4ab87a; }
+    .text-b { color: #4a8fe8; }
+
+    /* ─── Responsive strip ─── */
+    @media (max-width: 768px) {
+      .rgb-stack { width: 100%; max-width: 320px; }
+      .hero-inner { flex-direction: column !important; align-items: flex-start !important; }
+    }
+  </style>
+</head>
+
+<body class="min-h-screen">
+
+  <!-- ═══════════════════════════════════════════
+       NAV
+  ══════════════════════════════════════════════ -->
+  <header role="banner">
+    <nav aria-label="Primary navigation"
+         class="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-6 py-4"
+         style="background: rgba(11,12,14,0.88); backdrop-filter: blur(12px); border-bottom: 1px solid rgba(240,237,232,0.06);">
+      <a href="#" aria-label="Scanlight Studio home" class="flex items-center gap-2.5">
+        <!-- wordmark made of three dots + text -->
+        <span class="flex items-center gap-0.5" aria-hidden="true">
+          <span style="width:7px;height:7px;border-radius:50%;background:#e8574a;display:inline-block;"></span>
+          <span style="width:7px;height:7px;border-radius:50%;background:#4ab87a;display:inline-block;"></span>
+          <span style="width:7px;height:7px;border-radius:50%;background:#4a8fe8;display:inline-block;"></span>
+        </span>
+        <span class="display font-semibold" style="font-size:1.0625rem;letter-spacing:-0.01em;color:#f0ede8;">Scanlight</span>
+        <span class="mono" style="font-size:0.65rem;color:#5a5955;letter-spacing:0.1em;margin-top:2px;">STUDIO</span>
+      </a>
+      <div class="hidden md:flex items-center gap-8">
+        <a href="#how-it-works" class="nav-link">How it works</a>
+        <a href="#the-app"      class="nav-link">The app</a>
+        <a href="#specs"        class="nav-link">Specs</a>
+        <a href="#cta"          class="btn-primary" style="padding:0.5rem 1.25rem;font-size:0.8125rem;">Request access</a>
+      </div>
+    </nav>
+  </header>
+
+  <main role="main">
+
+    <!-- ═══════════════════════════════════════
+         HERO
+    ════════════════════════════════════════════ -->
+    <section id="hero" aria-labelledby="hero-heading"
+             class="relative pt-32 pb-28 px-6 overflow-hidden"
+             style="background: radial-gradient(ellipse 80% 60% at 70% 40%, rgba(74,143,232,0.05) 0%, transparent 70%), radial-gradient(ellipse 50% 40% at 20% 70%, rgba(74,184,122,0.04) 0%, transparent 60%), #0b0c0e;">
+
+      <!-- subtle grid texture -->
+      <div aria-hidden="true" style="position:absolute;inset:0;background-image:linear-gradient(rgba(240,237,232,0.025) 1px,transparent 1px),linear-gradient(90deg,rgba(240,237,232,0.025) 1px,transparent 1px);background-size:48px 48px;pointer-events:none;"></div>
+
+      <div class="relative max-w-6xl mx-auto">
+        <div class="hero-inner flex flex-row items-center justify-between gap-16">
+
+          <!-- text side -->
+          <div style="max-width:580px;" data-aos="fade-up" data-aos-duration="700">
+            <span class="section-mark sm-b" style="margin-bottom:1.75rem;">macOS · Film scanning · Narrowband RGB</span>
+
+            <h1 id="hero-heading" class="display"
+                style="font-size:clamp(2.75rem,6vw,5rem);font-weight:600;line-height:1.05;letter-spacing:-0.025em;color:#f0ede8;margin-bottom:1.25rem;">
+              Film scanning<br />
+              as <em style="font-style:italic;font-weight:300;color:#8a8880;">an instrument</em><br />
+              not a workflow.
+            </h1>
+
+            <p style="font-size:1.0625rem;line-height:1.65;color:#8a8880;margin-bottom:2.25rem;max-width:440px;">
+              Scanlight Studio orchestrates your Sony camera, narrowband RGB LED panel, and Valoi advancer into one precision macOS app — delivering cleaner color from film than white-light scanning ever could.
+            </p>
+
+            <div class="flex flex-wrap items-center gap-3">
+              <a href="#cta"          class="btn-primary">Request access</a>
+              <a href="#how-it-works" class="btn-ghost">
+                <span>See how it works</span>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+              </a>
+            </div>
+
+            <!-- micro-stats -->
+            <div class="flex flex-wrap gap-8 mt-12" style="border-top:1px solid rgba(240,237,232,0.07);padding-top:1.5rem;">
+              <div>
+                <div class="mono text-r" style="font-size:1.5rem;font-weight:500;line-height:1;">61 MP</div>
+                <div style="font-size:0.75rem;color:#5a5955;margin-top:0.25rem;">Sony a7CR</div>
+              </div>
+              <div>
+                <div class="mono text-g" style="font-size:1.5rem;font-weight:500;line-height:1;">3×</div>
+                <div style="font-size:0.75rem;color:#5a5955;margin-top:0.25rem;">Channels captured</div>
+              </div>
+              <div>
+                <div class="mono text-b" style="font-size:1.5rem;font-weight:500;line-height:1;">DNG</div>
+                <div style="font-size:0.75rem;color:#5a5955;margin-top:0.25rem;">Linear output</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- visual motif: RGB triplet → composite -->
+          <div class="flex-shrink-0 hidden md:block" data-aos="fade-left" data-aos-duration="900" data-aos-delay="150">
+            <div class="rgb-stack" style="width:340px;height:260px;position:relative;" aria-hidden="true">
+              <!-- R frame -->
+              <div class="film-frame film-frame-r crosshair" style="top:0;left:0;width:230px;height:168px;">
+                <span class="channel-label" style="color:#e8574a;">R</span>
+                <span class="channel-dot" style="background:#e8574a;opacity:0.6;"></span>
+                <!-- scan lines -->
+                <div style="position:absolute;inset:16px;display:flex;flex-direction:column;justify-content:space-between;opacity:0.15;">
+                  <div style="height:1px;background:#e8574a;"></div>
+                  <div style="height:1px;background:#e8574a;"></div>
+                  <div style="height:1px;background:#e8574a;"></div>
+                  <div style="height:1px;background:#e8574a;"></div>
+                </div>
+              </div>
+              <!-- G frame -->
+              <div class="film-frame film-frame-g crosshair" style="top:18px;left:24px;width:230px;height:168px;">
+                <span class="channel-label" style="color:#4ab87a;">G</span>
+                <span class="channel-dot" style="background:#4ab87a;opacity:0.6;"></span>
+                <div style="position:absolute;inset:16px;display:flex;flex-direction:column;justify-content:space-between;opacity:0.15;">
+                  <div style="height:1px;background:#4ab87a;"></div>
+                  <div style="height:1px;background:#4ab87a;"></div>
+                  <div style="height:1px;background:#4ab87a;"></div>
+                  <div style="height:1px;background:#4ab87a;"></div>
+                </div>
+              </div>
+              <!-- B frame -->
+              <div class="film-frame film-frame-b crosshair" style="top:36px;left:48px;width:230px;height:168px;">
+                <span class="channel-label" style="color:#4a8fe8;">B</span>
+                <span class="channel-dot" style="background:#4a8fe8;opacity:0.6;"></span>
+                <div style="position:absolute;inset:16px;display:flex;flex-direction:column;justify-content:space-between;opacity:0.15;">
+                  <div style="height:1px;background:#4a8fe8;"></div>
+                  <div style="height:1px;background:#4a8fe8;"></div>
+                  <div style="height:1px;background:#4a8fe8;"></div>
+                  <div style="height:1px;background:#4a8fe8;"></div>
+                </div>
+              </div>
+
+              <!-- arrow -->
+              <div style="position:absolute;bottom:14px;left:32px;display:flex;align-items:center;gap:6px;">
+                <div style="width:56px;height:1px;background:linear-gradient(to right,rgba(240,237,232,0.06),rgba(240,237,232,0.3));"></div>
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" style="flex-shrink:0;"><path d="M2 5h6M5 2l3 3-3 3" stroke="rgba(240,237,232,0.4)" stroke-width="1.2" stroke-linecap="round"/></svg>
+              </div>
+
+              <!-- composite badge -->
+              <div style="position:absolute;bottom:-6px;right:0;background:#1a1c20;border:1px solid rgba(240,237,232,0.15);border-radius:3px;padding:0.35rem 0.65rem;display:flex;align-items:center;gap:6px;">
+                <span style="width:8px;height:8px;border-radius:50%;background:linear-gradient(135deg,#e8574a 0%,#4ab87a 50%,#4a8fe8 100%);display:inline-block;"></span>
+                <span class="mono" style="font-size:0.6rem;color:#d8d4cc;letter-spacing:0.12em;">LINEAR DNG</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule max-w-6xl mx-auto" style="margin:0 auto;" />
+
+    <!-- ═══════════════════════════════════════
+         THE PROBLEM
+    ════════════════════════════════════════════ -->
+    <section id="problem" aria-labelledby="problem-heading" class="py-24 px-6"
+             style="background: #0b0c0e;">
+      <div class="max-w-6xl mx-auto">
+        <div class="grid md:grid-cols-2 gap-16 items-start">
+
+          <div data-aos="fade-up" data-aos-duration="600">
+            <span class="section-mark sm-r">The problem</span>
+            <h2 id="problem-heading" class="display"
+                style="font-size:clamp(1.75rem,3.5vw,2.75rem);font-weight:600;line-height:1.15;letter-spacing:-0.02em;color:#f0ede8;margin-bottom:1.25rem;">
+              White-light scanning muddies color. Pro workflows are a mess.
+            </h2>
+          </div>
+
+          <div data-aos="fade-up" data-aos-duration="600" data-aos-delay="100">
+            <!-- two problem cards -->
+            <div class="space-y-4">
+              <div style="border:1px solid rgba(232,87,74,0.2);border-left:3px solid #e8574a;background:rgba(232,87,74,0.05);border-radius:3px;padding:1.25rem 1.5rem;">
+                <div style="font-size:0.8125rem;font-weight:600;color:#f0ede8;margin-bottom:0.5rem;">Dye crosstalk from broadband illumination</div>
+                <p style="font-size:0.875rem;color:#8a8880;line-height:1.6;margin:0;">
+                  When you backlight a negative with a white diffuser, each film dye layer absorbs across all three color channels simultaneously. The result is color contamination — muddy skintones, shifted neutrals, wasted dynamic range from the outset.
+                </p>
+              </div>
+              <div style="border:1px solid rgba(240,237,232,0.1);border-left:3px solid #5a5955;background:rgba(240,237,232,0.02);border-radius:3px;padding:1.25rem 1.5rem;">
+                <div style="font-size:0.8125rem;font-weight:600;color:#f0ede8;margin-bottom:0.5rem;">A terminal + three tools + guesswork</div>
+                <p style="font-size:0.875rem;color:#8a8880;line-height:1.6;margin:0;">
+                  The prior art: a Python script, a browser-based Sony remote, a flat-field correction spreadsheet, and a manual compositing step — all stitched together with notes-app procedures and human error. Drop one flag and your roll is contaminated.
+                </p>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule" style="max-width:1152px;margin:0 auto;" />
+
+    <!-- ═══════════════════════════════════════
+         HOW IT WORKS
+    ════════════════════════════════════════════ -->
+    <section id="how-it-works" aria-labelledby="hiw-heading" class="py-24 px-6"
+             style="background: #0b0c0e;">
+      <div class="max-w-4xl mx-auto">
+        <div class="text-center mb-16" data-aos="fade-up">
+          <span class="section-mark sm-g">How it works</span>
+          <h2 id="hiw-heading" class="display"
+              style="font-size:clamp(1.75rem,3.5vw,2.75rem);font-weight:600;line-height:1.15;letter-spacing:-0.02em;color:#f0ede8;margin-bottom:0.75rem;">
+            A deterministic pipeline.<br />
+            <span style="color:#8a8880;font-weight:300;font-style:italic;">No steps skipped. No guesses made.</span>
+          </h2>
+        </div>
+
+        <!-- pipeline steps -->
+        <div class="space-y-0" role="list">
+
+          <!-- step 1 -->
+          <div data-aos="fade-up" data-aos-duration="500" role="listitem">
+            <div style="display:grid;grid-template-columns:48px 1fr;gap:1.25rem;align-items:start;">
+              <div style="display:flex;flex-direction:column;align-items:center;">
+                <div style="width:36px;height:36px;border-radius:50%;background:rgba(232,87,74,0.12);border:1.5px solid rgba(232,87,74,0.35);display:flex;align-items:center;justify-content:center;">
+                  <span class="mono text-r" style="font-size:0.75rem;font-weight:500;">01</span>
+                </div>
+                <div class="step-connector"></div>
+              </div>
+              <div style="padding-bottom:2rem;">
+                <div class="flex items-center gap-2 mb-1.5">
+                  <span style="font-size:0.875rem;font-weight:600;color:#f0ede8;">Narrowband triplet capture</span>
+                  <span class="flex gap-1" aria-label="R G B channels">
+                    <span style="width:7px;height:7px;border-radius:50%;background:#e8574a;"></span>
+                    <span style="width:7px;height:7px;border-radius:50%;background:#4ab87a;"></span>
+                    <span style="width:7px;height:7px;border-radius:50%;background:#4a8fe8;"></span>
+                  </span>
+                </div>
+                <p style="font-size:0.875rem;color:#8a8880;line-height:1.65;max-width:520px;">
+                  Scanlight fires your Scanlight v4 LED panel in sequence — red only, green only, blue only — triggering the Sony a7CR for each. Three RAW frames per film image, each channel clean and unmixed. A configurable settle time ensures the sensor and illumination are stable before each shutter.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <!-- step 2 -->
+          <div data-aos="fade-up" data-aos-duration="500" data-aos-delay="80" role="listitem">
+            <div style="display:grid;grid-template-columns:48px 1fr;gap:1.25rem;align-items:start;">
+              <div style="display:flex;flex-direction:column;align-items:center;">
+                <div style="width:36px;height:36px;border-radius:50%;background:rgba(74,184,122,0.12);border:1.5px solid rgba(74,184,122,0.35);display:flex;align-items:center;justify-content:center;">
+                  <span class="mono text-g" style="font-size:0.75rem;font-weight:500;">02</span>
+                </div>
+                <div class="step-connector"></div>
+              </div>
+              <div style="padding-bottom:2rem;">
+                <div style="font-size:0.875rem;font-weight:600;color:#f0ede8;margin-bottom:0.375rem;">Per-channel flat-field correction</div>
+                <p style="font-size:0.875rem;color:#8a8880;line-height:1.65;max-width:520px;">
+                  Before your scan session, Calibrate captures a blank frame under each LED. The resulting correction mask compensates for illumination falloff corner-to-corner, independently per channel. Each captured RAW is divided by its channel's FFC mask — the light is made perfectly even before compositing begins.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <!-- step 3 -->
+          <div data-aos="fade-up" data-aos-duration="500" data-aos-delay="160" role="listitem">
+            <div style="display:grid;grid-template-columns:48px 1fr;gap:1.25rem;align-items:start;">
+              <div style="display:flex;flex-direction:column;align-items:center;">
+                <div style="width:36px;height:36px;border-radius:50%;background:rgba(74,143,232,0.12);border:1.5px solid rgba(74,143,232,0.35);display:flex;align-items:center;justify-content:center;">
+                  <span class="mono text-b" style="font-size:0.75rem;font-weight:500;">03</span>
+                </div>
+                <div class="step-connector"></div>
+              </div>
+              <div style="padding-bottom:2rem;">
+                <div style="font-size:0.875rem;font-weight:600;color:#f0ede8;margin-bottom:0.375rem;">Background composite to Linear DNG</div>
+                <p style="font-size:0.875rem;color:#8a8880;line-height:1.65;max-width:520px;">
+                  The moment a triplet is complete, compositing begins in the background — while you advance the film to the next frame. The three corrected channels are merged and written as a Linear DNG with embedded camera color profiles. The composite pipeline streams continuously; by the time you scan the last frame, your roll is already done.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <!-- step 4 -->
+          <div data-aos="fade-up" data-aos-duration="500" data-aos-delay="240" role="listitem">
+            <div style="display:grid;grid-template-columns:48px 1fr;gap:1.25rem;align-items:start;">
+              <div style="display:flex;flex-direction:column;align-items:center;">
+                <div style="width:36px;height:36px;border-radius:50%;background:rgba(240,237,232,0.06);border:1.5px solid rgba(240,237,232,0.2);display:flex;align-items:center;justify-content:center;">
+                  <span class="mono" style="font-size:0.75rem;font-weight:500;color:#8a8880;">04</span>
+                </div>
+              </div>
+              <div>
+                <div style="font-size:0.875rem;font-weight:600;color:#f0ede8;margin-bottom:0.375rem;">Invert in Negative Lab Pro or Lightroom</div>
+                <p style="font-size:0.875rem;color:#8a8880;line-height:1.65;max-width:520px;">
+                  Linear DNG files drop directly into your existing negative inversion workflow. Embedded ICC profiles ensure your color space is correctly declared. Scanlight's job ends here — clean input in, clean result out.
+                </p>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule" style="max-width:1152px;margin:0 auto;" />
+
+    <!-- ═══════════════════════════════════════
+         THE APP
+    ════════════════════════════════════════════ -->
+    <section id="the-app" aria-labelledby="app-heading" class="py-24 px-6"
+             style="background: #0b0c0e;">
+      <div class="max-w-6xl mx-auto">
+
+        <div class="mb-14" data-aos="fade-up">
+          <span class="section-mark sm-b">The app</span>
+          <h2 id="app-heading" class="display"
+              style="font-size:clamp(1.75rem,3.5vw,2.75rem);font-weight:600;line-height:1.15;letter-spacing:-0.02em;color:#f0ede8;max-width:500px;">
+            Four tabs. One source of truth for your rig.
+          </h2>
+        </div>
+
+        <!-- tab descriptions + mocks -->
+        <div class="grid md:grid-cols-2 gap-8">
+
+          <!-- LEFT: tab list -->
+          <div class="space-y-5" data-aos="fade-up" data-aos-duration="600">
+
+            <div style="border:1px solid rgba(240,237,232,0.08);border-left:3px solid #e8574a;background:rgba(232,87,74,0.04);border-radius:3px;padding:1.25rem 1.5rem;">
+              <div class="mono text-r" style="font-size:0.65rem;letter-spacing:0.14em;margin-bottom:0.5rem;">LIGHT</div>
+              <div style="font-size:0.875rem;font-weight:500;color:#f0ede8;margin-bottom:0.375rem;">Direct LED panel control</div>
+              <p style="font-size:0.8125rem;color:#8a8880;line-height:1.6;margin:0;">Individual R/G/B sliders and on/off buttons give you live control of the Scanlight v4 LED unit. Use it to inspect negatives by channel or set custom balance for unusual film stocks.</p>
+            </div>
+
+            <div style="border:1px solid rgba(240,237,232,0.08);border-left:3px solid #8a8880;background:rgba(240,237,232,0.02);border-radius:3px;padding:1.25rem 1.5rem;">
+              <div class="mono" style="font-size:0.65rem;letter-spacing:0.14em;color:#5a5955;margin-bottom:0.5rem;">SETTINGS</div>
+              <div style="font-size:0.875rem;font-weight:500;color:#f0ede8;margin-bottom:0.375rem;">Every capture parameter, validated live</div>
+              <p style="font-size:0.8125rem;color:#8a8880;line-height:1.6;margin:0;">Roll name, output folder, trigger mode, per-channel LED levels, settle time, FFC calibration path, camera model, composite format — all in one panel with inline validation. No more scripts to edit.</p>
+            </div>
+
+            <div style="border:1px solid rgba(74,184,122,0.2);border-left:3px solid #4ab87a;background:rgba(74,184,122,0.04);border-radius:3px;padding:1.25rem 1.5rem;">
+              <div class="mono text-g" style="font-size:0.65rem;letter-spacing:0.14em;margin-bottom:0.5rem;">CALIBRATE</div>
+              <div style="font-size:0.875rem;font-weight:500;color:#f0ede8;margin-bottom:0.375rem;">One-button FFC with verdict readout</div>
+              <p style="font-size:0.8125rem;color:#8a8880;line-height:1.6;margin:0;">Capture flat-field references per channel. Scanlight measures illumination falloff % and uniformity %, shows a CLEAN / ACCEPTABLE / FAIL verdict per channel, then wires the calibration directly into your scan session.</p>
+            </div>
+
+            <div style="border:1px solid rgba(74,143,232,0.2);border-left:3px solid #4a8fe8;background:rgba(74,143,232,0.04);border-radius:3px;padding:1.25rem 1.5rem;">
+              <div class="mono text-b" style="font-size:0.65rem;letter-spacing:0.14em;margin-bottom:0.5rem;">SCAN</div>
+              <div style="font-size:0.875rem;font-weight:500;color:#f0ede8;margin-bottom:0.375rem;">Capture loop with streaming status</div>
+              <p style="font-size:0.8125rem;color:#8a8880;line-height:1.6;margin:0;">Start/Stop, Capture Frame, Retake, live frame counter. Each frame moves through captured → compositing → done as composites stream in the background — no end-of-roll wait.</p>
+            </div>
+
+          </div>
+
+          <!-- RIGHT: mock UI cards -->
+          <div class="space-y-6" data-aos="fade-up" data-aos-duration="600" data-aos-delay="120">
+
+            <!-- Calibrate mock -->
+            <div class="app-card" aria-label="Calibrate tab interface mock">
+              <div class="app-titlebar">
+                <div class="titlebar-dot" style="background:#e8574a;"></div>
+                <div class="titlebar-dot" style="background:#e8b34a;"></div>
+                <div class="titlebar-dot" style="background:#4ab87a;"></div>
+                <span class="mono" style="font-size:0.65rem;color:#5a5955;margin-left:auto;letter-spacing:0.1em;">Scanlight Studio</span>
+              </div>
+              <div class="app-tab-bar" role="tablist" aria-label="App tabs">
+                <div class="app-tab" role="tab" aria-selected="false">Light</div>
+                <div class="app-tab" role="tab" aria-selected="false">Settings</div>
+                <div class="app-tab active" role="tab" aria-selected="true">Calibrate</div>
+                <div class="app-tab" role="tab" aria-selected="false">Scan</div>
+              </div>
+              <div style="padding:1rem;">
+                <div style="font-size:0.7rem;color:#5a5955;letter-spacing:0.1em;text-transform:uppercase;font-family:'JetBrains Mono',monospace;margin-bottom:0.75rem;">Flat-field calibration results</div>
+                <table class="cal-table" aria-label="Calibration results">
+                  <thead>
+                    <tr>
+                      <th scope="col">Ch</th>
+                      <th scope="col">Falloff</th>
+                      <th scope="col">Uniformity</th>
+                      <th scope="col">Verdict</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td><span class="text-r" style="font-weight:600;">R</span></td>
+                      <td>3.2%</td>
+                      <td>98.1%</td>
+                      <td><span class="verdict v-clean" role="status">CLEAN</span></td>
+                    </tr>
+                    <tr>
+                      <td><span class="text-g" style="font-weight:600;">G</span></td>
+                      <td>4.7%</td>
+                      <td>96.8%</td>
+                      <td><span class="verdict v-clean" role="status">CLEAN</span></td>
+                    </tr>
+                    <tr>
+                      <td><span class="text-b" style="font-weight:600;">B</span></td>
+                      <td>8.1%</td>
+                      <td>93.2%</td>
+                      <td><span class="verdict v-accept" role="status">ACCEPTABLE</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div style="margin-top:0.875rem;display:flex;gap:0.625rem;">
+                  <button style="flex:1;background:rgba(240,237,232,0.06);border:1px solid rgba(240,237,232,0.1);color:#8a8880;font-size:0.75rem;padding:0.5rem;border-radius:2px;cursor:default;">Re-calibrate</button>
+                  <button style="flex:1;background:rgba(74,184,122,0.12);border:1px solid rgba(74,184,122,0.25);color:#4ab87a;font-size:0.75rem;padding:0.5rem;border-radius:2px;cursor:default;font-weight:500;">Use calibration →</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Scan mock -->
+            <div class="app-card" aria-label="Scan tab interface mock">
+              <div class="app-titlebar">
+                <div class="titlebar-dot" style="background:#e8574a;"></div>
+                <div class="titlebar-dot" style="background:#e8b34a;"></div>
+                <div class="titlebar-dot" style="background:#4ab87a;"></div>
+                <span class="mono" style="font-size:0.65rem;color:#5a5955;margin-left:auto;letter-spacing:0.1em;">Scanlight Studio</span>
+              </div>
+              <div class="app-tab-bar" role="tablist" aria-label="App tabs">
+                <div class="app-tab" role="tab" aria-selected="false">Light</div>
+                <div class="app-tab" role="tab" aria-selected="false">Settings</div>
+                <div class="app-tab" role="tab" aria-selected="false">Calibrate</div>
+                <div class="app-tab active" role="tab" aria-selected="true">Scan</div>
+              </div>
+              <div style="padding:1rem;">
+                <!-- counter + controls -->
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.875rem;">
+                  <div>
+                    <span class="mono" style="font-size:1.5rem;color:#f0ede8;font-weight:500;">24</span>
+                    <span class="mono" style="font-size:0.75rem;color:#5a5955;margin-left:4px;">/ 36 frames</span>
+                  </div>
+                  <div style="display:flex;gap:0.5rem;">
+                    <button style="background:rgba(240,237,232,0.06);border:1px solid rgba(240,237,232,0.1);color:#8a8880;font-size:0.7rem;padding:0.4rem 0.75rem;border-radius:2px;cursor:default;">Retake</button>
+                    <button style="background:rgba(74,143,232,0.12);border:1px solid rgba(74,143,232,0.25);color:#4a8fe8;font-size:0.7rem;padding:0.4rem 0.75rem;border-radius:2px;cursor:default;font-weight:500;">Capture frame</button>
+                  </div>
+                </div>
+                <!-- status list -->
+                <div style="background:#111215;border:1px solid rgba(240,237,232,0.05);border-radius:2px;overflow:hidden;" role="log" aria-label="Frame capture status">
+                  <div class="scan-row">
+                    <span style="color:#d8d4cc;font-size:0.8rem;">Frame 24</span>
+                    <span class="scan-status s-compositing">COMPOSITING</span>
+                  </div>
+                  <div class="scan-row">
+                    <span style="color:#d8d4cc;font-size:0.8rem;">Frame 23</span>
+                    <span class="scan-status s-done">DONE</span>
+                  </div>
+                  <div class="scan-row">
+                    <span style="color:#d8d4cc;font-size:0.8rem;">Frame 22</span>
+                    <span class="scan-status s-done">DONE</span>
+                  </div>
+                  <div class="scan-row">
+                    <span style="color:#d8d4cc;font-size:0.8rem;">Frame 21</span>
+                    <span class="scan-status s-done">DONE</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <hr class="rule" style="max-width:1152px;margin:0 auto;" />
+
+    <!-- ═══════════════════════════════════════
+         FEATURES GRID
+    ════════════════════════════════════════════ -->
+    <section id="features" aria-labelledby="features-heading" class="py-24 px-6"
+             style="background:#0b0c0e;">
+      <div class="max-w-6xl mx-auto">
+
+        <div class="mb-14 text-center" data-aos="fade-up">
+          <span class="section-mark sm-n">Capabilities</span>
+          <h2 id="features-heading" class="display"
+              style="font-size:clamp(1.75rem,3vw,2.5rem);font-weight:600;line-height:1.15;letter-spacing:-0.02em;color:#f0ede8;">
+            Built for the serious archivist.
+          </h2>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+
+          <div class="feature-card" data-aos="fade-up" data-aos-duration="500" data-aos-delay="0">
+            <div class="feature-icon" style="background:rgba(232,87,74,0.1);border:1px solid rgba(232,87,74,0.2);" aria-hidden="true">
+              <!-- prism icon -->
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e8574a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 22 20 2 20"/><line x1="12" y1="2" x2="12" y2="20"/></svg>
+            </div>
+            <div style="font-size:0.9375rem;font-weight:600;color:#f0ede8;margin-bottom:0.5rem;">Narrowband channel separation</div>
+            <p style="font-size:0.8125rem;color:#8a8880;line-height:1.65;margin:0;">Narrow-peak R/G/B LEDs illuminate each film dye layer independently, eliminating the crosstalk that makes white-light scans difficult to invert cleanly.</p>
+          </div>
+
+          <div class="feature-card" data-aos="fade-up" data-aos-duration="500" data-aos-delay="60">
+            <div class="feature-icon" style="background:rgba(74,184,122,0.1);border:1px solid rgba(74,184,122,0.2);" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4ab87a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22V12m0 0L5 7m7 5l7-5"/><path d="M5 7V3h14v4"/></svg>
+            </div>
+            <div style="font-size:0.9375rem;font-weight:600;color:#f0ede8;margin-bottom:0.5rem;">Streaming background compositing</div>
+            <p style="font-size:0.8125rem;color:#8a8880;line-height:1.65;margin:0;">Each triplet composites the moment it's captured — in the background, while you advance to the next frame. No batch wait at the end of your roll.</p>
+          </div>
+
+          <div class="feature-card" data-aos="fade-up" data-aos-duration="500" data-aos-delay="120">
+            <div class="feature-icon" style="background:rgba(74,143,232,0.1);border:1px solid rgba(74,143,232,0.2);" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4a8fe8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+            </div>
+            <div style="font-size:0.9375rem;font-weight:600;color:#f0ede8;margin-bottom:0.5rem;">Per-channel flat-field correction</div>
+            <p style="font-size:0.8125rem;color:#8a8880;line-height:1.65;margin:0;">Calibrate independently measures falloff and uniformity for R, G, and B. Each channel's correction mask is applied before compositing — even light, edge to edge.</p>
+          </div>
+
+          <div class="feature-card" data-aos="fade-up" data-aos-duration="500" data-aos-delay="0">
+            <div class="feature-icon" style="background:rgba(240,237,232,0.05);border:1px solid rgba(240,237,232,0.1);" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#d8d4cc" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M8 2v4M16 2v4M2 10h20"/></svg>
+            </div>
+            <div style="font-size:0.9375rem;font-weight:600;color:#f0ede8;margin-bottom:0.5rem;">Native macOS application</div>
+            <p style="font-size:0.8125rem;color:#8a8880;line-height:1.65;margin:0;">Not a web app, not a Python script. A proper macOS app with SwiftUI controls, hardware-safe state management, and zero terminal setup required.</p>
+          </div>
+
+          <div class="feature-card" data-aos="fade-up" data-aos-duration="500" data-aos-delay="60">
+            <div class="feature-icon" style="background:rgba(232,179,74,0.1);border:1px solid rgba(232,179,74,0.2);" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e8b34a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+            </div>
+            <div style="font-size:0.9375rem;font-weight:600;color:#f0ede8;margin-bottom:0.5rem;">Linear DNG with embedded profiles</div>
+            <p style="font-size:0.8125rem;color:#8a8880;line-height:1.65;margin:0;">Output is a standard Linear DNG with embedded camera color profiles — ready for Negative Lab Pro, Lightroom, or any raw processor that understands linear input.</p>
+          </div>
+
+          <div class="feature-card" data-aos="fade-up" data-aos-duration="500" data-aos-delay="120">
+            <div class="feature-icon" style="background:rgba(240,237,232,0.05);border:1px solid rgba(240,237,232,0.1);" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#d8d4cc" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <div style="font-size:0.9375rem;font-weight:600;color:#f0ede8;margin-bottom:0.5rem;">Hardware-safe state machine</div>
+            <p style="font-size:0.8125rem;color:#8a8880;line-height:1.65;margin:0;">An internal state machine guarantees the camera and LED panel are never claimed by two processes simultaneously. No race conditions. No corrupted frames.</p>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule" style="max-width:1152px;margin:0 auto;" />
+
+    <!-- ═══════════════════════════════════════
+         TECH SPECS
+    ════════════════════════════════════════════ -->
+    <section id="specs" aria-labelledby="specs-heading" class="py-24 px-6"
+             style="background:#0b0c0e;">
+      <div class="max-w-4xl mx-auto">
+
+        <div class="mb-12" data-aos="fade-up">
+          <span class="section-mark sm-n">Technical specifications</span>
+          <h2 id="specs-heading" class="display"
+              style="font-size:clamp(1.75rem,3vw,2.5rem);font-weight:600;line-height:1.15;letter-spacing:-0.02em;color:#f0ede8;">
+            Datasheet
+          </h2>
+        </div>
+
+        <div data-aos="fade-up" data-aos-duration="600" data-aos-delay="80">
+          <div style="border:1px solid rgba(240,237,232,0.07);border-radius:4px;overflow:hidden;">
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Camera</div>
+              <div class="spec-val">Sony a7CR · 61 MP full-frame BSI-CMOS · tethered via USB</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Lens</div>
+              <div class="spec-val">Sony FE 90mm f/2.8 Macro G OSS</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">LED panel</div>
+              <div class="spec-val">Scanlight v4 narrowband RGB (discrete R / G / B channels, per-channel PWM control)</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Film advancer</div>
+              <div class="spec-val">Valoi 360 · 35mm / medium format compatible</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Capture mode</div>
+              <div class="spec-val">Narrowband triplet (R → G → B) per film frame · configurable settle time per channel</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Flat-field corr.</div>
+              <div class="spec-val">Per-channel FFC masks · measures falloff % + uniformity % · CLEAN / ACCEPTABLE / FAIL verdict</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Output format</div>
+              <div class="spec-val">Linear DNG · embedded camera color profiles · compatible with Negative Lab Pro, Lightroom, Capture One</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Compositing</div>
+              <div class="spec-val">Background streaming · begins per-frame immediately after triplet capture · no end-of-roll wait</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Platform</div>
+              <div class="spec-val">macOS · native SwiftUI · Apple Silicon + Intel</div>
+            </div>
+            <div class="spec-row" style="padding:0 1.5rem;">
+              <div class="spec-key" style="padding:0.875rem 0;">Hardware safety</div>
+              <div class="spec-val">State machine prevents concurrent device access · camera + LED arbitration enforced at OS layer</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <hr class="rule" style="max-width:1152px;margin:0 auto;" />
+
+    <!-- ═══════════════════════════════════════
+         CLOSING CTA
+    ════════════════════════════════════════════ -->
+    <section id="cta" aria-labelledby="cta-heading" class="py-28 px-6 text-center"
+             style="background: radial-gradient(ellipse 70% 60% at 50% 50%, rgba(74,143,232,0.06) 0%, transparent 70%), #0b0c0e;">
+      <div class="max-w-2xl mx-auto" data-aos="fade-up">
+
+        <div class="flex justify-center gap-1.5 mb-8" aria-hidden="true">
+          <span style="width:8px;height:8px;border-radius:50%;background:#e8574a;"></span>
+          <span style="width:8px;height:8px;border-radius:50%;background:#4ab87a;"></span>
+          <span style="width:8px;height:8px;border-radius:50%;background:#4a8fe8;"></span>
+        </div>
+
+        <h2 id="cta-heading" class="display"
+            style="font-size:clamp(2rem,4.5vw,3.5rem);font-weight:600;line-height:1.1;letter-spacing:-0.025em;color:#f0ede8;margin-bottom:1.25rem;">
+          Precision scanning<br />deserves a precision tool.
+        </h2>
+        <p style="font-size:1.0625rem;color:#8a8880;line-height:1.65;margin-bottom:2.5rem;max-width:440px;margin-left:auto;margin-right:auto;">
+          Scanlight Studio is currently available by request to photographers with compatible rigs. Get in touch to join the early access list.
+        </p>
+
+        <div class="flex flex-wrap justify-center gap-3">
+          <a href="mailto:hello@scanlight.studio" class="btn-primary">
+            Request access
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+          </a>
+          <a href="#how-it-works" class="btn-ghost">See how it works</a>
+        </div>
+
+        <!-- compatible rig note -->
+        <p class="mono" style="font-size:0.6875rem;color:#5a5955;margin-top:2.25rem;letter-spacing:0.06em;">
+          REQUIRES: Sony a7CR · Scanlight v4 LED · Valoi 360 · macOS 13+
+        </p>
+
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ═══════════════════════════════════════
+       FOOTER
+  ════════════════════════════════════════════ -->
+  <footer role="contentinfo"
+          style="border-top:1px solid rgba(240,237,232,0.06);background:#0b0c0e;padding:2rem 1.5rem;">
+    <div class="max-w-6xl mx-auto flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+      <div class="flex items-center gap-2">
+        <span class="flex items-center gap-0.5" aria-hidden="true">
+          <span style="width:6px;height:6px;border-radius:50%;background:#e8574a;display:inline-block;"></span>
+          <span style="width:6px;height:6px;border-radius:50%;background:#4ab87a;display:inline-block;"></span>
+          <span style="width:6px;height:6px;border-radius:50%;background:#4a8fe8;display:inline-block;"></span>
+        </span>
+        <span class="display" style="font-size:0.9375rem;color:#5a5955;">Scanlight Studio</span>
+      </div>
+      <p style="font-size:0.75rem;color:#5a5955;line-height:1.5;max-width:480px;text-align:right;">
+        This is a product concept page for a real hardware/software system under development. Scanlight Studio is not yet commercially available. All specifications reflect the actual development rig. Scanning results depend on film stock, lens, and calibration quality.
+      </p>
+    </div>
+  </footer>
+
+  <!-- AOS init -->
+  <script>
+    AOS.init({
+      once: true,
+      offset: 60,
+      easing: 'ease-out-quart',
+    });
+  </script>
+
+</body>
+</html>

@@ -30,6 +30,14 @@ PICO_VID = 0x2E8A
 PICO_CDC_PIDS = {0x000A, 0x0009}  # 000A = SDK stdio CDC; 0009 = picoboot
 
 
+# Pushed to the response queues when the background reader thread exits, so an
+# in-flight _request() blocked on q.get() wakes immediately with the real cause
+# instead of waiting out its full timeout and reporting a misleading
+# TimeoutError. Mirrors the Swift driver (Scanlight.swift), which surfaces a
+# transport error to its waiters the moment the reader loop dies.
+_READER_DIED = object()
+
+
 def discover_port() -> str:
     """Best-effort auto-discovery of the Scanlight CDC serial port on macOS.
 
@@ -207,18 +215,42 @@ class Scanlight:
 
     def _request(self, h2d_header: int, d2h_header: int, decoder, timeout: float):
         q = self._response_queues[d2h_header]
-        # Drain any stale response from a prior aborted call.
+        # Drain any stale response (or death sentinel) from a prior aborted call.
         while not q.empty():
             try:
                 q.get_nowait()
             except queue.Empty:
                 break
+        # If the reader already died (serial unplugged, decode crash, or a clean
+        # stop), fail now with the real cause rather than writing into the void
+        # and waiting out the timeout before noticing.
+        if self._reader_error is not None:
+            raise self._reader_error
+        if not self._reader_thread.is_alive():
+            raise ConnectionError(
+                f"Scanlight reader thread is not running; cannot service header {h2d_header}"
+            )
         self._serial.write(proto.encode_packet(h2d_header))
         try:
             data = q.get(timeout=timeout)
         except queue.Empty:
+            # No reply within the window. If the reader died meanwhile, surface
+            # its real exception instead of a misleading "no response".
+            if self._reader_error is not None:
+                raise self._reader_error
+            if not self._reader_thread.is_alive():
+                raise ConnectionError(
+                    f"Scanlight reader thread stopped; no response to header {h2d_header}"
+                )
             raise TimeoutError(
                 f"No response to header {h2d_header} within {timeout}s"
+            )
+        if data is _READER_DIED:
+            # The reader thread exited while we were blocked — surface the cause.
+            if self._reader_error is not None:
+                raise self._reader_error
+            raise ConnectionError(
+                f"Scanlight reader stopped before responding to header {h2d_header}"
             )
         if self._reader_error is not None:
             raise self._reader_error
@@ -234,6 +266,17 @@ class Scanlight:
                     self._consume(buf)
         except BaseException as exc:  # noqa: BLE001 — surfaced to main thread
             self._reader_error = exc
+        finally:
+            # Wake any _request() blocked on q.get() so it fails fast with the
+            # real cause instead of waiting out its full timeout. _reader_error
+            # (if any) is already set above, so the sentinel handler can re-raise
+            # it. Harmless on a clean close() — the next _request just sees the
+            # reader stopped.
+            for q in self._response_queues.values():
+                try:
+                    q.put_nowait(_READER_DIED)
+                except queue.Full:
+                    pass
 
     def _consume(self, buf: bytearray) -> None:
         """Parse as many complete packets from `buf` as available, in place."""

@@ -221,6 +221,7 @@ class CompositeWorker:
                         frame_number, gen, fut,
                         self._frame_gen.get(frame_number, gen),
                         self._output_path(frame_number),
+                        self._output_format,
                     ))
                     del self._futures[frame_number]
             # Record every collected result so a second poll() caller (the
@@ -248,6 +249,7 @@ class CompositeWorker:
                 frame_number, gen, fut,
                 current_gens.get(frame_number, gen),
                 canonical_paths[frame_number],
+                self._output_format,
             ))
         # End-of-roll results belong in the history too.
         with self._lock:
@@ -261,6 +263,7 @@ class CompositeWorker:
         fut: Future,
         current_gen: int,
         canonical_path: Path,
+        output_format: str,
     ) -> CompositeResult:
         """Collect the result of a finished composite job.
 
@@ -293,6 +296,15 @@ class CompositeWorker:
         # The path the job actually wrote to (the temp path, possibly with a
         # suffix adjusted by composite_triplet, e.g. ".dng" or ".tif").
         actual_temp_path = Path(out_str)
+        # Which temp variants THIS job produced. For "both", composite_triplet
+        # wrote <temp>.tif AND <temp>.dng (returning the .tif); for tiff/dng it
+        # wrote exactly the returned path. Derive from output_format — NOT from
+        # disk existence — so a stale same-named temp left by a prior crashed run
+        # (per-process generations reset on restart) is never promoted. (Codex)
+        produced_exts = (
+            (".tif", ".dng") if output_format == "both"
+            else (actual_temp_path.suffix,)
+        )
 
         if job_gen != current_gen:
             # This job has been superseded by a retake. Discard its temp output
@@ -301,10 +313,13 @@ class CompositeWorker:
                 "composite frame %d gen %d superseded by gen %d — discarding temp output",
                 frame_number, job_gen, current_gen,
             )
-            try:
-                actual_temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Drop every temp variant THIS job produced so none is left as litter
+            # or clobbers the retake's canonical output.
+            for ext in produced_exts:
+                try:
+                    actual_temp_path.with_suffix(ext).unlink(missing_ok=True)
+                except OSError:
+                    pass
             # Report as superseded (not an error — the retake job will win).
             return CompositeResult(
                 frame_number, None,
@@ -315,9 +330,15 @@ class CompositeWorker:
         # file to the canonical output path. Derive the final canonical path
         # from the suffix of the actual temp output (composite_triplet may
         # have changed ".tif" → ".dng" based on output_format).
+        # Promote each temp variant THIS job produced to its canonical path.
+        # "both" promotes <temp>.tif + <temp>.dng (so the DNG isn't orphaned);
+        # tiff/dng promotes only the returned path. (Audit M5; scoped per Codex.)
         final_canonical = canonical_path.with_suffix(actual_temp_path.suffix)
         try:
-            actual_temp_path.replace(final_canonical)
+            for ext in produced_exts:
+                temp_variant = actual_temp_path.with_suffix(ext)
+                if temp_variant.exists():
+                    temp_variant.replace(canonical_path.with_suffix(ext))
         except OSError as exc:
             return CompositeResult(frame_number, None, f"rename failed: {exc}")
 

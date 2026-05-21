@@ -62,16 +62,26 @@ public:
     }
 
     void OnDisconnected(CrInt32u error) override {
-        std::lock_guard<std::mutex> lk(mtx_);
-        disconnected_ = true;
-        last_error_ = error;
-        cv_.notify_all();
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            disconnected_ = true;
+            last_error_ = error;
+            cv_.notify_all();
+        }
+        // A mid-capture disconnect must also wake the RemoteTransfer waits
+        // (their predicates check last_error_) so they don't stall to timeout.
+        { std::lock_guard<std::mutex> lk(contents_mutex_); contents_cv_.notify_all(); }
+        { std::lock_guard<std::mutex> lk(transfer_mutex_); transfer_cv_.notify_all(); }
     }
 
     void OnError(CrInt32u error) override {
-        std::lock_guard<std::mutex> lk(mtx_);
-        last_error_ = error;
-        cv_.notify_all();
+        last_error_ = error;  // atomic — visible to every wait predicate
+        // Wake ALL waits (connect/download AND the RemoteTransfer contents/
+        // transfer waits) so an async SDK error surfaces promptly instead of
+        // stalling to a wait's timeout. Each cv is notified under its own mutex.
+        { std::lock_guard<std::mutex> lk(mtx_);            cv_.notify_all(); }
+        { std::lock_guard<std::mutex> lk(contents_mutex_); contents_cv_.notify_all(); }
+        { std::lock_guard<std::mutex> lk(transfer_mutex_); transfer_cv_.notify_all(); }
     }
 
     void OnCompleteDownload(CrChar* filename, CrInt32u type) override {
@@ -144,8 +154,13 @@ public:
 
     bool wait_for_contents_changed(std::chrono::seconds timeout, CrInt32u& out_slot) {
         std::unique_lock<std::mutex> lk(contents_mutex_);
-        if (!contents_cv_.wait_for(lk, timeout, [this] { return contents_changed_; })) {
-            return false;
+        if (!contents_cv_.wait_for(lk, timeout, [this] {
+                return contents_changed_ || last_error_ != 0 || disconnected_;
+            })) {
+            return false;  // timed out
+        }
+        if (last_error_ != 0 || disconnected_) {
+            return false;  // woke on an async error/disconnect, not a real add
         }
         out_slot = contents_slot_;
         contents_changed_ = false;
@@ -154,8 +169,13 @@ public:
 
     bool wait_for_transfer_done(std::chrono::seconds timeout, std::string& out_filename) {
         std::unique_lock<std::mutex> lk(transfer_mutex_);
-        if (!transfer_cv_.wait_for(lk, timeout, [this] { return transfer_done_; })) {
-            return false;
+        if (!transfer_cv_.wait_for(lk, timeout, [this] {
+                return transfer_done_ || last_error_ != 0 || disconnected_;
+            })) {
+            return false;  // timed out
+        }
+        if (last_error_ != 0 || disconnected_) {
+            return false;  // woke on an async error/disconnect, not a completed transfer
         }
         out_filename = transferred_filename_;
         return true;
@@ -170,10 +190,16 @@ private:
     std::mutex mtx_;
     std::condition_variable cv_;
     bool connected_ = false;
-    bool disconnected_ = false;
+    // Atomic so the RemoteTransfer wait predicates (which hold a different
+    // mutex) can observe a mid-transfer disconnect even when it carries no
+    // error code (error == 0).
+    std::atomic<bool> disconnected_{false};
     bool downloaded_ = false;
     std::string downloaded_filename_;
-    CrInt32u last_error_ = 0;
+    // Atomic so the RemoteTransfer waits (which hold contents_mutex_/
+    // transfer_mutex_, not mtx_) can read it in their predicates without a
+    // cross-mutex data race. Set by OnError/OnDisconnected.
+    std::atomic<CrInt32u> last_error_{0};
 
     std::mutex contents_mutex_;
     std::condition_variable contents_cv_;
@@ -740,7 +766,7 @@ int main(int argc, char** argv) {
     }
 
     CrInt32u slot_raw = 0;
-    if (!cb.wait_for_contents_changed(std::chrono::seconds(60), slot_raw)) {
+    if (!cb.wait_for_contents_changed(std::chrono::seconds(args.timeout_s), slot_raw)) {
         const auto err = cb.last_error();
         if (err != 0) {
             log_err("camera reported error before RemoteTransfer contents appeared (CrError "
@@ -805,7 +831,7 @@ int main(int argc, char** argv) {
     }
 
     std::string transferred_filename;
-    if (!cb.wait_for_transfer_done(std::chrono::seconds(120), transferred_filename)) {
+    if (!cb.wait_for_transfer_done(std::chrono::seconds(args.timeout_s), transferred_filename)) {
         const auto err = cb.last_error();
         if (err != 0) {
             log_err("camera reported error during RemoteTransfer download (CrError "

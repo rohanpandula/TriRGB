@@ -456,6 +456,86 @@ final class ScanCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.frameStatuses.first?.compositeState, "done",
                        "State must not regress from 'done' back to 'captured'")
     }
+
+    // MARK: - T10: startScan refused while the port is owned by calibration
+
+    /// Regression for the audit H1 fix. startScan must refuse to spawn the
+    /// orchestrator while calibration owns the serial port (portOwner ==
+    /// .calibrating). Without the `lightPanel.portOwner == .idle` guard clause
+    /// the orchestrator would double-open the port the calibration script holds.
+    /// (Revert-check: drop that guard clause and this fails — start() runs.)
+    func testStartScanRefusedWhilePortOwnedByCalibration() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+        lightPanel.portOwner = .calibrating
+
+        await coordinator.startScan(settings: makeScanSettings())
+
+        XCTAssertEqual(coordinator.phase, .idle,
+                       "startScan must stay .idle while calibration owns the port")
+        XCTAssertFalse(client.callLog.contains("start"),
+                       "orchestrator must NOT be spawned while calibration owns the port "
+                       + "(double-open). callLog: \(client.callLog)")
+        XCTAssertFalse(lightPanel.callLog.contains("disconnect"),
+                       "a refused startScan must not touch the light panel. callLog: \(lightPanel.callLog)")
+        XCTAssertFalse(coordinator.lastError.isEmpty,
+                       "a refused startScan must set lastError")
+    }
+
+    // MARK: - T11: startScan failure releases the early-claimed portOwner
+
+    /// Regression for the audit H1 fix. startScan claims portOwner = .scanning
+    /// BEFORE the multi-second client.start() so nothing can grab the port
+    /// during the spawn window. If start() fails, that early claim MUST be
+    /// released back to .idle — otherwise a failed scan permanently locks the
+    /// light panel. (Revert-check: drop the catch-clause portOwner reset and
+    /// this fails — portOwner stays .scanning.)
+    func testStartScanFailureReleasesPortOwner() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+        client.startError = OrchestratorError.toolNotFound("mock failure")
+
+        await coordinator.startScan(settings: makeScanSettings())
+
+        XCTAssertEqual(coordinator.phase, .idle,
+                       "phase must roll back to .idle after a failed start")
+        XCTAssertEqual(lightPanel.portOwner, .idle,
+                       "portOwner must be released to .idle after a failed start — it was "
+                       + "claimed early before client.start(). Got: \(lightPanel.portOwner)")
+        XCTAssertTrue(lightPanel.callLog.contains("connect"),
+                      "the light panel must be reclaimed after a failed start")
+    }
+
+    // MARK: - T12: connect() is refused while the port is owned
+
+    /// Regression for the audit H1 fix. ScanlightViewModel.connect() must not
+    /// even attempt to open a transport while the port is owned by a scan (or
+    /// calibration). Before the fix the Light tab's Connect button was gated
+    /// only on isConnected — which is FALSE during a scan — so a manual Connect
+    /// mid-scan double-opened the serial port. The guard now lives in connect()
+    /// itself (the load-bearing layer), not just the button's .disabled.
+    /// (Revert-check: drop the guard in connect() and this fails — factory runs.)
+    func testConnectRefusedWhilePortOwned() throws {
+        var factoryCalled = false
+        let vm = ScanlightViewModel(transportFactory: {
+            factoryCalled = true
+            return .failure(OrchestratorError.toolNotFound("should not be reached"))
+        })
+
+        vm.portOwner = .scanning
+        vm.connect()
+        XCTAssertFalse(factoryCalled,
+                       "connect() must not open a transport while the port is owned by a scan")
+        XCTAssertFalse(vm.isConnected)
+        XCTAssertFalse(vm.lastError.isEmpty)
+
+        // Sanity: when the port is idle, connect() DOES attempt the transport,
+        // proving the guard does not over-block the normal path.
+        vm.portOwner = .idle
+        vm.lastError = ""
+        factoryCalled = false
+        vm.connect()
+        XCTAssertTrue(factoryCalled,
+                      "connect() must attempt the transport when the port is idle")
+    }
 }
 
 // NOTE: pollCompositeStatus() is `internal` in ScanCoordinator (visible via

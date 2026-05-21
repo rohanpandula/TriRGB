@@ -16,10 +16,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Resolve scanlightctl (Python entrypoint) and sony-capture (built binary).
 # Prefer $PATH; fall back to the repo's expected locations.
-SCANLIGHTCTL="$(command -v scanlightctl || true)"
-if [[ -z "$SCANLIGHTCTL" ]]; then
+# Use an array so the multi-word python fallback expands as separate argv
+# elements, without word-splitting a path that happens to contain spaces.
+if command -v scanlightctl >/dev/null 2>&1; then
+    SCANLIGHTCTL=(scanlightctl)
+else
     echo "scanlightctl not on \$PATH — falling back to python -m scanlight.cli"
-    SCANLIGHTCTL="python3 -m scanlight.cli"
+    SCANLIGHTCTL=(python3 -m scanlight.cli)
     export PYTHONPATH="${PYTHONPATH:-}${PYTHONPATH:+:}${REPO_ROOT}/phase1/scanlightctl"
 fi
 
@@ -61,7 +64,7 @@ run_one() {
     local label="$2"    # R|G|B (for filename)
     local out="${OUT_DIR}/Smoke_Frame001_${label}.ARW"
     echo "→ scanlightctl on $channel"
-    $SCANLIGHTCTL on "$channel"
+    "${SCANLIGHTCTL[@]}" on "$channel"
     sleep 0.05
     echo "→ sony-capture → $out"
     "$SONY_CAPTURE" --out "$out" --timeout 30
@@ -70,14 +73,14 @@ run_one() {
 
 echo
 echo "=== Phase 1 exit-criteria smoke test ==="
-trap '$SCANLIGHTCTL off || true' EXIT
+trap '"${SCANLIGHTCTL[@]}" off || true' EXIT
 
 run_one r R
 run_one g G
 run_one b B
 
 echo "→ scanlightctl off"
-$SCANLIGHTCTL off
+"${SCANLIGHTCTL[@]}" off
 
 echo
 echo "PASS — three RAW files produced in plausible size range."

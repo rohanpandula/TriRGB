@@ -212,8 +212,12 @@ final class ScanCoordinator: ObservableObject {
     ///
     /// On failure at step 2, reconnect the light panel before re-throwing.
     func startScan(settings: ScanSettings) async {
-        guard phase == .idle, !transitionInFlight else {
-            lastError = "Cannot start scan: \(phase == .idle ? "transition in flight" : "not idle")"
+        guard phase == .idle, !transitionInFlight, lightPanel.portOwner == .idle else {
+            let reason: String
+            if phase != .idle { reason = "not idle" }
+            else if transitionInFlight { reason = "transition in flight" }
+            else { reason = "serial port is busy (calibration in progress)" }
+            lastError = "Cannot start scan: \(reason)"
             return
         }
         transitionInFlight = true
@@ -225,24 +229,27 @@ final class ScanCoordinator: ObservableObject {
         frameStatuses = []
         compositePending = 0
 
-        // Step 1: Release the serial port from the light panel.
-        // This must happen BEFORE start() so the orchestrator never races the app
-        // for the port (a double-open corrupts scans silently).
+        // Step 1: Claim port ownership for the scan, THEN release the panel's
+        // connection. portOwner is set BEFORE the (multi-second) client.start()
+        // so a manual Connect or a calibration run — both gated on
+        // portOwner == .idle — cannot grab the serial port during the spawn
+        // window. disconnect() is intentionally not portOwner-guarded.
+        lightPanel.portOwner = .scanning
         lightPanel.disconnect()
 
         // Step 2: Spawn the orchestrator (it grabs the serial port).
         do {
             try await client.start(settings: settings)
         } catch {
-            // Orchestrator failed to start — reclaim the serial port.
+            // Orchestrator failed to start — release ownership and reclaim the port.
+            lightPanel.portOwner = .idle
             lightPanel.connect()
             lastError = "Failed to start scan: \(error.localizedDescription)"
             return
         }
 
-        // Step 3: Mark as scanning. The light panel is now locked.
+        // Step 3: Mark as scanning (portOwner already claimed in Step 1).
         phase = .scanning
-        lightPanel.portOwner = .scanning
 
         // Step 4: Start polling composite status every 1s.
         startCompositePolling()
@@ -309,7 +316,10 @@ final class ScanCoordinator: ObservableObject {
             let outcome = try await client.captureFrame(retake: retake)
             let frameNum = outcome.frameNumber
             if outcome.success {
-                upsertFrameStatus(frameNum, compositeState: "captured")
+                // A retake re-shoots an existing frame: reset its row to
+                // "captured" even if a prior composite advanced it to
+                // "done"/"failed", so the UI reflects the in-progress recapture.
+                upsertFrameStatus(frameNum, compositeState: "captured", resetProgress: retake)
             } else {
                 upsertFrameStatus(frameNum, compositeState: "failed")
                 lastError = outcome.error ?? "Capture failed"
@@ -377,9 +387,16 @@ final class ScanCoordinator: ObservableObject {
     // MARK: - Private: frame status helpers
 
     @MainActor
-    private func upsertFrameStatus(_ frameNumber: Int, compositeState: String) {
+    private func upsertFrameStatus(_ frameNumber: Int, compositeState: String, resetProgress: Bool = false) {
         if let idx = frameStatuses.firstIndex(where: { $0.frameNumber == frameNumber }) {
-            // Only advance state — never regress "done"/"failed" back to "captured".
+            if resetProgress {
+                // Retake: force the state regardless of rank so a re-shoot of a
+                // "done" frame shows the recapture, not the stale prior result.
+                frameStatuses[idx].compositeState = compositeState
+                return
+            }
+            // Only advance state — never regress "done"/"failed" back to "captured"
+            // on an out-of-order composite-status poll.
             let current = frameStatuses[idx].compositeState
             let rank: [String: Int] = ["captured": 0, "compositing": 1, "done": 2, "failed": 2]
             let currentRank = rank[current] ?? 0

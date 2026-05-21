@@ -65,6 +65,8 @@ public final class SerialPortTransport: ScanlightTransport {
     // MARK: - ScanlightTransport
 
     public func write(_ data: Data) throws {
+        lock.lock(); let isClosed = closed; lock.unlock()
+        if isClosed { throw OpenError.writeFailed(errno: EBADF) }
         try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Void in
             guard let base = raw.baseAddress else { return }
             var written = 0
@@ -100,6 +102,8 @@ public final class SerialPortTransport: ScanlightTransport {
     }
 
     public func readAvailable() throws -> Data {
+        lock.lock(); let isClosed = closed; lock.unlock()
+        if isClosed { throw OpenError.readFailed(errno: EBADF) }
         var buf = [UInt8](repeating: 0, count: 256)
         // Use a short poll-style read: O_NONBLOCK is set, so read returns
         // immediately with EAGAIN when nothing is available. Sleep briefly

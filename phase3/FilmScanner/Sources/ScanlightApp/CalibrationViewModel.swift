@@ -117,10 +117,17 @@ final class CalibrationViewModel: ObservableObject {
         captureProc.standardOutput = captureStdout
         captureProc.standardError = captureStderr
 
-        try captureProc.run()
-        // Await termination off the main actor via a checked continuation
-        await withCheckedContinuation { continuation in
+        // Install the termination handler BEFORE run(): if the process exits in
+        // the window between run() and handler-installation, the handler never
+        // fires and the continuation hangs forever. Setting it first — and
+        // resuming in the catch when run() itself throws — closes that race.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             captureProc.terminationHandler = { _ in continuation.resume() }
+            do {
+                try captureProc.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
         }
 
         // Drain captureStdout unconditionally after the process exits.
@@ -159,9 +166,14 @@ final class CalibrationViewModel: ObservableObject {
         inspectProc.standardOutput = inspectStdout
         inspectProc.standardError = inspectStderr
 
-        try inspectProc.run()
-        await withCheckedContinuation { continuation in
+        // Handler before run() — same race fix as the capture spawn above.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             inspectProc.terminationHandler = { _ in continuation.resume() }
+            do {
+                try inspectProc.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
         }
 
         let stdoutData = inspectStdout.fileHandleForReading.readDataToEndOfFile()
