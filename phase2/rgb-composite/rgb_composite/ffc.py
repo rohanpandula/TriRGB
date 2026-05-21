@@ -357,6 +357,11 @@ def apply_ffc_radiometric(
             f"flat_stack must be NxHxWx3 where HxWx3 matches raw_array "
             f"{raw_array.shape}, got {flat_stack.shape}"
         )
+    if flat_stack.shape[0] < 1:
+        raise ValueError(
+            f"flat_stack must contain at least 1 frame on axis 0, "
+            f"got shape {flat_stack.shape}"
+        )
     if len(black_levels) != 3:
         raise ValueError(
             f"black_levels must be a tuple of 3 ChannelCalibration objects, "
@@ -385,9 +390,13 @@ def apply_ffc_radiometric(
         flat_ref = float(positive.mean()) if positive.size else 1.0
         safe_flat = np.maximum(flat_sub, flat_ref * 0.05)
 
-        # Correct and rescale to sensor-count space so output is uint16-meaningful.
-        # A flat==raw region maps to ~raw (not ~1.0), matching apply_ffc_to_channel's
-        # reference-normalized convention.
+        # The formula outputs in black-subtracted sensor counts:
+        #   corrected = (raw − bl) / (flat − bl) * flat_ref
+        # where flat_ref = mean(flat_sub[flat_sub > 0]) ≈ (flat − bl) for a
+        # uniform-ish flat. The output range is [0, flat_ref] before clip.
+        # NOTE: output is NOT in raw sensor counts — black_level has been removed.
+        # Phase 11 inversion must NOT re-subtract black_level from this output.
+        # This differs from apply_ffc_to_channel, which preserves the black pedestal.
         corrected = (raw_sub / safe_flat) * flat_ref
 
         # Single clip covers sub-zero (negative clamp) AND overflow (mirror
