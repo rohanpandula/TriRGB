@@ -280,3 +280,124 @@ def test_load_ffc_maps_case_insensitive_extension(tmp_path, monkeypatch):
         assert maps.shape == (H, W)
     finally:
         clear_ffc_cache()
+
+
+# ---------- apply_ffc_radiometric (Phase 10 R-26 — additive radiometric path) ----------
+
+from c41_core import ChannelCalibration
+from rgb_composite import apply_ffc_radiometric
+from c41_core.fixtures import make_rebate_strip
+
+
+def _make_black_levels(bl_r: float = 0.0, bl_g: float = 0.0, bl_b: float = 0.0):
+    """Build a (ChannelCalibration, ChannelCalibration, ChannelCalibration) tuple."""
+    return (
+        ChannelCalibration(channel="R", led_level=200, black_level=bl_r, gain=1.0, clip_fraction=0.0),
+        ChannelCalibration(channel="G", led_level=180, black_level=bl_g, gain=1.0, clip_fraction=0.0),
+        ChannelCalibration(channel="B", led_level=160, black_level=bl_b, gain=1.0, clip_fraction=0.0),
+    )
+
+
+def _cv(channel_hw: np.ndarray) -> float:
+    """Coefficient of variation using the same _box_filter_2d as production code."""
+    h, w = channel_hw.shape
+    kernel = max(3, int(min(h, w) * 0.05))
+    smoothed = ffc_mod._box_filter_2d(channel_hw.astype(np.float32), kernel)
+    mean_val = float(np.mean(smoothed))
+    return float(np.std(smoothed)) / max(mean_val, 1.0)
+
+
+def test_apply_ffc_radiometric_identity_shaped():
+    """With zero black levels and a uniform flat equal to the raw, output is uniform and finite."""
+    # Build raw: uniform 30000 across all channels
+    raw = np.full((H, W, 3), 30000, dtype=np.uint16)
+    # Build a single-frame flat matching the raw exactly
+    flat_stack = np.full((1, H, W, 3), 30000, dtype=np.uint16)
+    black_levels = _make_black_levels(0.0, 0.0, 0.0)
+
+    out = apply_ffc_radiometric(raw, flat_stack, black_levels)
+    assert out.shape == (H, W, 3)
+    assert out.dtype == np.uint16
+    # Every pixel should be finite (no inf/nan after uint16 conversion)
+    assert np.all(out > 0), "uniform flat on uniform raw should produce uniform positive output"
+    assert np.all(out <= 65535)
+
+
+def test_apply_ffc_radiometric_black_subtract_math():
+    """Verify the per-channel black-subtract arithmetic against a hand-computed expected value."""
+    # raw=20000, flat=40000, bl=2000
+    # raw_sub = 20000-2000 = 18000
+    # flat_sub = 40000-2000 = 38000
+    # flat_ref = mean(flat_sub[flat_sub>0]) = 38000
+    # safe_flat = np.maximum(flat_sub, flat_ref*0.05) = 38000 (no floor needed)
+    # corrected = raw_sub/safe_flat * flat_ref = 18000/38000 * 38000 = 18000
+    bl = 2000.0
+    raw_val = 20000
+    flat_val = 40000
+
+    raw = np.full((H, W, 3), raw_val, dtype=np.uint16)
+    flat_stack = np.full((1, H, W, 3), flat_val, dtype=np.uint16)
+    black_levels = _make_black_levels(bl, bl, bl)
+
+    out = apply_ffc_radiometric(raw, flat_stack, black_levels)
+    # Expected: (raw_val - bl) = 18000 for all channels
+    expected = int(raw_val - bl)
+    assert out[0, 0, 0] == expected, f"R channel: expected {expected}, got {out[0,0,0]}"
+    assert out[0, 0, 1] == expected, f"G channel: expected {expected}, got {out[0,0,1]}"
+    assert out[0, 0, 2] == expected, f"B channel: expected {expected}, got {out[0,0,2]}"
+
+
+def test_apply_ffc_radiometric_negative_clamp():
+    """Pixels below black level produce 0, not a wrapped uint16 value."""
+    bl = 2000.0
+    raw_val = 100  # well below black level
+
+    raw = np.full((H, W, 3), raw_val, dtype=np.uint16)
+    flat_stack = np.full((1, H, W, 3), 40000, dtype=np.uint16)
+    black_levels = _make_black_levels(bl, bl, bl)
+
+    out = apply_ffc_radiometric(raw, flat_stack, black_levels)
+    # Sub-black pixel → corrected < 0 → clipped to 0
+    assert np.all(out == 0), f"expected all zeros for sub-black raw, got max={out.max()}"
+    assert out.dtype == np.uint16
+
+
+def test_apply_ffc_radiometric_shape_dtype():
+    """Output is HxWx3 uint16 regardless of N-frame stack depth."""
+    raw = np.full((H, W, 3), 20000, dtype=np.uint16)
+    flat_stack = np.full((8, H, W, 3), 40000, dtype=np.uint16)  # 8 frames
+    black_levels = _make_black_levels(500.0, 500.0, 500.0)
+
+    out = apply_ffc_radiometric(raw, flat_stack, black_levels)
+    assert out.shape == raw.shape, f"shape mismatch: {out.shape} vs {raw.shape}"
+    assert out.dtype == np.uint16
+
+
+def test_averaging_reduces_uniformity_error():
+    """SC-3: averaging N noisy frames reduces CV vs a single noisy frame (ratio > 1.5)."""
+    rng = np.random.default_rng(42)
+    base = make_rebate_strip(height=128, width=192, seed=42)  # clean uniform flat
+    n = 8
+    noise_sigma = 200.0  # deliberately high noise
+    frames = []
+    for _ in range(n):
+        noise = rng.normal(0, noise_sigma, size=(128, 192, 3)).astype(np.float32)
+        frame = np.clip(base.astype(np.float32) + noise, 0, 65535).astype(np.uint16)
+        frames.append(frame)
+
+    flat_stack = np.stack(frames, axis=0)  # (N, H, W, 3)
+
+    # CV of a single noisy frame (worst case — first frame, R channel)
+    single_cv = _cv(frames[0][..., 0])
+
+    # CV of the averaged flat (R channel)
+    avg_flat = np.mean(flat_stack.astype(np.float32), axis=0).astype(np.uint16)
+    avg_cv = _cv(avg_flat[..., 0])
+
+    assert avg_cv < single_cv, (
+        f"averaging {n} frames must reduce CV: single={single_cv:.4f}, avg={avg_cv:.4f}"
+    )
+    improvement_ratio = single_cv / max(avg_cv, 1e-9)
+    assert improvement_ratio > 1.5, (
+        f"expected >1.5x CV improvement from averaging {n} frames, got {improvement_ratio:.2f}x"
+    )
