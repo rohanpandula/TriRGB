@@ -6,6 +6,7 @@ from .orchestrator import (
     TripletAbort,
 )
 from .capture_flats import capture_flats
+from .calibrate_exposure import calibrate_exposure
 
 __all__ = [
     "Orchestrator",
@@ -13,5 +14,6 @@ __all__ = [
     "TripletResult",
     "TripletAbort",
     "capture_flats",
+    "calibrate_exposure",
 ]
 __version__ = "0.1.0"
