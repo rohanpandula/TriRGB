@@ -293,3 +293,207 @@ def test_invert_composite_rejects_wrong_shape():
     bad_2ch = np.zeros((H, W, 2), dtype=np.uint16)
     with pytest.raises(ValueError, match="HxWx3"):
         invert_composite(bad_2ch, descriptor, params)
+
+
+# ---------------------------------------------------------------------------
+# Test 9: non-uint16 dtype raises ValueError (FIX 1 — fail-closed dtype guard)
+# ---------------------------------------------------------------------------
+
+def test_invert_composite_rejects_non_uint16_dtype():
+    """A float32 (or NaN-containing) triplet must raise ValueError — fail-closed.
+
+    A float32 array passes shape validation but would silently encode NaN as
+    0 via astype(uint16).  The Step 0 dtype guard must catch this before any
+    compute.  Matches detect_rebate Phase 09 dtype discipline.
+    """
+    _, descriptor, params = _make_fixture(seed=42)
+
+    # Plain float32 triplet (correct shape, wrong dtype)
+    float_triplet = np.zeros((H, W, 3), dtype=np.float32)
+    with pytest.raises(ValueError, match="uint16"):
+        invert_composite(float_triplet, descriptor, params)
+
+    # NaN-containing float32 triplet — the primary silent-failure vector
+    nan_triplet = np.full((H, W, 3), np.nan, dtype=np.float32)
+    with pytest.raises(ValueError, match="uint16"):
+        invert_composite(nan_triplet, descriptor, params)
+
+
+# ---------------------------------------------------------------------------
+# Test 10: nonzero black_point shifts the inversion floor (FIX 2 — pinning)
+# ---------------------------------------------------------------------------
+
+def test_invert_composite_nonzero_black_point_shifts_floor():
+    """black_point_* is the inversion shadow FLOOR, NOT a second black subtraction.
+
+    Construct a 1x1 pixel with a known value and nonzero black points, then
+    assert the output matches the exact (white-x)/(white-black) formula with
+    that floor.  This pins the behaviour for Phase 14/15 consumers:
+    black_point shifts what maps to 0 in the positive, not what is subtracted
+    from the raw scan.
+
+    Formula (for each channel ch):
+      step2: work = pixel * (base_target / base_rgb[ch])       (neutralize)
+      step3: out_f = (white[ch] - work) / (white[ch] - black[ch])  then clip
+      step5: uint16 = int(out_f * 65535)    (truncation, matches astype)
+
+    Concrete values chosen so arithmetic is exact in float32:
+      pixel = 8000, base_rgb = base_target = 10000.0
+      => step2: work = 8000.0 * (10000/10000) = 8000.0
+      black_point = 1000.0, white_point = 50000.0
+      => step3: (50000 - 8000) / (50000 - 1000) = 42000 / 49000 ≈ 0.857142...
+      => step5: int(0.857142... * 65535) = int(56173.469...) = 56173
+
+    If black_point were incorrectly subtracted from the triplet FIRST:
+      pixel - 1000 = 7000 → step3: (50000-7000)/(50000-1000) = 43000/49000
+      ≈ 0.877551 → int(0.877551*65535) = 57497  ← different, would fail.
+    """
+    base_target = 10000.0
+    black_point = 1000.0
+    white_point = 50000.0
+    pixel_val = 8000
+
+    # 1x1x3 pixel, all channels identical for simplicity
+    triplet = np.array([[[pixel_val, pixel_val, pixel_val]]], dtype=np.uint16)
+
+    descriptor = BaseRegionDescriptor(
+        x=0, y=0, w=1, h=1,
+        base_rgb=(base_target, base_target, base_target),
+        uniformity_cv=0.0,
+        source="manual",
+    )
+    params = InversionParams(
+        base_target=base_target,
+        black_point_r=black_point,
+        black_point_g=black_point,
+        black_point_b=black_point,
+        white_point_r=white_point,
+        white_point_g=white_point,
+        white_point_b=white_point,
+        tone_curve_id="linear",
+        tone_curve_params=(),
+        gamma=1.0,
+    )
+    result = invert_composite(triplet, descriptor, params)
+
+    # Manual arithmetic using (white-x)/(white-black) with nonzero black:
+    # step2: work = 8000.0 * (10000/10000) = 8000.0  (no change — gain=1)
+    # step3: (50000 - 8000) / (50000 - 1000) = 42000 / 49000
+    out_f = (white_point - float(pixel_val)) / (white_point - black_point)
+    expected = int(out_f * 65535.0)  # truncation matches astype(uint16)
+
+    for ch in range(3):
+        assert result[0, 0, ch] == expected, (
+            f"channel {ch}: expected {expected} (black_point={black_point} "
+            f"shifts floor via formula, NOT subtracted from triplet), "
+            f"got {result[0, 0, ch]}"
+        )
+
+    # Confirm the result does NOT match the "incorrectly-subtracted" value
+    wrong_work = float(pixel_val) - black_point  # 7000
+    wrong_f = (white_point - wrong_work) / (white_point - black_point)
+    wrong_expected = int(wrong_f * 65535.0)
+    assert result[0, 0, 0] != wrong_expected, (
+        "result matched the wrong 'black_point subtracted from triplet' value — "
+        "black_point must only shift the inversion floor, not be subtracted"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 11: overflow/underflow is CLIPPED, not wrapped (FIX 3 — clip discipline)
+# ---------------------------------------------------------------------------
+
+def test_invert_composite_clips_not_wraps_on_overflow():
+    """Pre-cast clipping must produce exactly 65535 (ceiling) and 0 (floor).
+
+    The existing overflow test checks that output is uint16-bounded, but that
+    is tautologically true for any uint16 array.  This test proves the
+    pre-cast np.clip at Step 5 is doing real work by constructing inputs that
+    drive pre-cast float values ABOVE 65535 and BELOW 0, then asserting the
+    output is clamped — not wrapped or truncated-from-integer overflow.
+
+    Scenario A (drives output toward white — clipped to 65535):
+      A strongly UNDEREXPOSED (very low raw value) pixel relative to the base
+      inverts to a large positive, which Step 5 scales above 65535.
+      pixel = 100, base_rgb = base_target = 10000, black = 0, white = 50000
+      step2: work = 100 * (10000/10000) = 100
+      step3: (50000 - 100) / 50000 = 0.998 → clip → 0.998
+      step5: 0.998 * 65535 = 65404 (well within, no overflow for this case)
+
+      To force overflow above 65535, use white > 65535 (allowed by params
+      since white_point is raw counts, not bounded to 65535):
+      Use pixel=1, base=base_target=10000, black=0, white=70000
+      step2: work = 1.0
+      step3: (70000 - 1) / 70000 ≈ 0.99999 → step5: 0.99999*65535 ≈ 65534 OK
+
+      Simpler: drive a pixel BELOW black_point so inversion > 1.0:
+      pixel=500, black=1000, white=50000, base=base_target=10000
+      step2: work = 500
+      step3: (50000 - 500) / (50000 - 1000) = 49500/49000 ≈ 1.0102 > 1 → clips to 1
+      step5: 1.0 * 65535 = 65535.0 → uint16 = 65535  ✓
+
+    Scenario B (drives output toward black — clipped to 0):
+      A pixel ABOVE white_point inverts to a negative fraction:
+      pixel=55000, black=0, white=50000, base=base_target=10000
+      step2: work = 55000
+      step3: (50000 - 55000) / 50000 = -0.1 → clips to 0
+      step5: 0 → uint16 = 0  ✓
+    """
+    base_target = 10000.0
+
+    descriptor = BaseRegionDescriptor(
+        x=0, y=0, w=1, h=1,
+        base_rgb=(base_target, base_target, base_target),
+        uniformity_cv=0.0,
+        source="manual",
+    )
+
+    # --- Scenario A: pixel below black_point → inversion > 1 → clips to 65535 ---
+    pixel_a = np.array([[[500, 500, 500]]], dtype=np.uint16)
+    params_a = InversionParams(
+        base_target=base_target,
+        black_point_r=1000.0,
+        black_point_g=1000.0,
+        black_point_b=1000.0,
+        white_point_r=50000.0,
+        white_point_g=50000.0,
+        white_point_b=50000.0,
+        tone_curve_id="linear",
+        tone_curve_params=(),
+        gamma=1.0,
+    )
+    result_a = invert_composite(pixel_a, descriptor, params_a)
+
+    # Verify pre-cast value would have been above 65535 without clip:
+    # step3 result = 49500/49000 ≈ 1.0102 > 1 → step5 raw = 1.0102 * 65535 ≈ 66203
+    # np.clip must clamp to 65535 before astype — NOT wrap to 66203 % 65536 = 667
+    for ch in range(3):
+        assert result_a[0, 0, ch] == 65535, (
+            f"channel {ch}: expected 65535 (clipped), got {result_a[0, 0, ch]} — "
+            "pre-cast value above 65535 must be CLIPPED, not wrapped/truncated"
+        )
+
+    # --- Scenario B: pixel above white_point → inversion < 0 → clips to 0 ---
+    pixel_b = np.array([[[55000, 55000, 55000]]], dtype=np.uint16)
+    params_b = InversionParams(
+        base_target=base_target,
+        black_point_r=0.0,
+        black_point_g=0.0,
+        black_point_b=0.0,
+        white_point_r=50000.0,
+        white_point_g=50000.0,
+        white_point_b=50000.0,
+        tone_curve_id="linear",
+        tone_curve_params=(),
+        gamma=1.0,
+    )
+    result_b = invert_composite(pixel_b, descriptor, params_b)
+
+    # Verify pre-cast value would have been below 0 without clip:
+    # step3 result = (50000-55000)/50000 = -0.1 → step5 raw = -0.1 * 65535 = -6553.5
+    # np.clip must clamp to 0 before astype — NOT produce 65536 - 6553 = 58983
+    for ch in range(3):
+        assert result_b[0, 0, ch] == 0, (
+            f"channel {ch}: expected 0 (clipped), got {result_b[0, 0, ch]} — "
+            "pre-cast value below 0 must be CLIPPED, not wrapped/truncated"
+        )
