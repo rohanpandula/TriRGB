@@ -14,6 +14,7 @@ from .dng import (
 from .ffc import (
     CalibrationError,
     FFCMaps,
+    apply_ffc_radiometric,
     apply_ffc_to_channel,
     clear_cache as clear_ffc_cache,
     compute_ffc_map,
@@ -35,6 +36,7 @@ __all__ = [
     # ffc
     "load_ffc_maps",
     "compute_ffc_map",
+    "apply_ffc_radiometric",
     "apply_ffc_to_channel",
     "clear_ffc_cache",
     "FFCMaps",

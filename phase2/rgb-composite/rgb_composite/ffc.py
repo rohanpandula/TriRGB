@@ -54,6 +54,8 @@ from typing import Union
 
 import numpy as np
 
+from c41_core import ChannelCalibration
+
 
 logger = logging.getLogger("rgb-composite.ffc")
 
@@ -303,3 +305,94 @@ def apply_ffc_to_channel(channel_data: np.ndarray, ffc_map: np.ndarray) -> np.nd
 def clear_cache() -> None:
     """Clear the `load_ffc_maps` LRU cache. Useful for tests."""
     load_ffc_maps.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Radiometric FFC path (Phase 10 R-26 — additive, beside apply_ffc)
+# ---------------------------------------------------------------------------
+# This is the radiometrically-correct FFC path:
+#   corrected = (raw − black) / (avg_flat − black)
+# per channel, averaged over an N-frame flat stack captured at working
+# brightness after LED warmup.  The existing apply_ffc / compute_ffc_map /
+# load_ffc_maps / FFCMaps path remains the default production path —
+# apply_ffc_radiometric is PURELY ADDITIVE and does NOT replace it.
+
+def apply_ffc_radiometric(
+    raw_array: np.ndarray,
+    flat_stack: np.ndarray,
+    black_levels: tuple[ChannelCalibration, ChannelCalibration, ChannelCalibration],
+) -> np.ndarray:
+    """Apply radiometrically-correct flat-field correction to a raw HxWx3 array.
+
+    Averages the N-frame flat stack internally, subtracts per-channel black
+    levels from both raw and flat, divides, clamps sub-zero values to 0,
+    and returns a uint16 result.  Reuses the ``reference * 0.05`` div-zero
+    floor pattern from ``compute_ffc_map`` (ffc.py:207-209).
+
+    Args:
+        raw_array:   HxWx3 uint16 — the frame to correct.
+        flat_stack:  NxHxWx3 uint16 — N blank-light frames stacked on axis 0.
+                     Averaged internally to reduce per-pixel noise.
+        black_levels: tuple of 3 ChannelCalibration objects indexed
+                     [0]=R, [1]=G, [2]=B (locked project channel order).
+                     Each ``.black_level`` is subtracted per channel before
+                     dividing by the averaged flat.
+
+    Returns:
+        HxWx3 uint16.  Sub-black-level pixels clamp to 0; overflow clips
+        at 65535 (single ``np.clip`` covers both, mirroring
+        ``apply_ffc_to_channel``).
+
+    Raises:
+        ValueError: if raw_array or flat_stack dimensions are wrong, or
+                    ``len(black_levels) != 3``.
+    """
+    # --- preamble validation (Pitfall 1 axis-ordering + Pitfall 3 channel indexing) ---
+    if raw_array.ndim != 3 or raw_array.shape[2] != 3:
+        raise ValueError(
+            f"raw_array must be HxWx3, got shape {raw_array.shape}"
+        )
+    if flat_stack.ndim != 4 or flat_stack.shape[1:] != raw_array.shape:
+        raise ValueError(
+            f"flat_stack must be NxHxWx3 where HxWx3 matches raw_array "
+            f"{raw_array.shape}, got {flat_stack.shape}"
+        )
+    if len(black_levels) != 3:
+        raise ValueError(
+            f"black_levels must be a tuple of 3 ChannelCalibration objects, "
+            f"got len={len(black_levels)}"
+        )
+
+    # 1. Average all N flat frames in float32.  Shape: HxWx3
+    avg_flat = np.mean(flat_stack.astype(np.float32), axis=0)
+
+    # 2. Output buffer (same shape and dtype as raw_array)
+    out = np.empty_like(raw_array)
+
+    # 3. Per-channel radiometric correction
+    for ch_idx, cal in enumerate(black_levels):
+        bl = float(cal.black_level)
+        raw_ch = raw_array[..., ch_idx].astype(np.float32)
+        flat_ch = avg_flat[..., ch_idx]          # already float32
+
+        raw_sub = raw_ch - bl
+        flat_sub = flat_ch - bl
+
+        # Div-zero floor — REUSE the compute_ffc_map pattern (ffc.py:207-209):
+        #   safe = np.maximum(smoothed, reference * 0.05)
+        # Here flat_ref is the mean of the positive (non-black-subtracted) region.
+        positive = flat_sub[flat_sub > 0]
+        flat_ref = float(positive.mean()) if positive.size else 1.0
+        safe_flat = np.maximum(flat_sub, flat_ref * 0.05)
+
+        # Correct and rescale to sensor-count space so output is uint16-meaningful.
+        # A flat==raw region maps to ~raw (not ~1.0), matching apply_ffc_to_channel's
+        # reference-normalized convention.
+        corrected = (raw_sub / safe_flat) * flat_ref
+
+        # Single clip covers sub-zero (negative clamp) AND overflow (mirror
+        # apply_ffc_to_channel lines 298-300 — no separate np.maximum needed).
+        np.clip(corrected, 0.0, 65535.0, out=corrected)
+        out[..., ch_idx] = corrected.astype(np.uint16)
+
+    return out
