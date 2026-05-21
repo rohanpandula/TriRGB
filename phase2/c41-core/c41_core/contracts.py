@@ -200,8 +200,26 @@ class CalibrationResult(JsonContract):
     ffc_cal_dir: str
     schema_version: int = 1
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.r, ChannelCalibration):
+            raise TypeError(f"r must be ChannelCalibration, got {type(self.r).__name__}")
+        if not isinstance(self.g, ChannelCalibration):
+            raise TypeError(f"g must be ChannelCalibration, got {type(self.g).__name__}")
+        if not isinstance(self.b, ChannelCalibration):
+            raise TypeError(f"b must be ChannelCalibration, got {type(self.b).__name__}")
+        if not isinstance(self.base_region, BaseRegionDescriptor):
+            raise TypeError(f"base_region must be BaseRegionDescriptor, got {type(self.base_region).__name__}")
+
     @classmethod
     def from_json(cls, s: str) -> "CalibrationResult":
+        """Reconstruct CalibrationResult from JSON string.
+
+        NOTE: Unknown top-level keys in the JSON are silently dropped (forward-compat).
+        Unknown keys inside nested ChannelCalibration / BaseRegionDescriptor dicts
+        will raise TypeError (strict). This asymmetry is intentional — top-level
+        new fields from v2+ schemas are ignored, but nested-field additions require a
+        coordinated schema bump.
+        """
         d = json.loads(s)
         return cls(
             r=ChannelCalibration(**d["r"]),
@@ -250,6 +268,26 @@ class InversionParams(JsonContract):
     def __post_init__(self) -> None:
         if self.gamma <= 0:
             raise ValueError(f"gamma must be > 0, got {self.gamma}")
+        # WR-01: raw pixel counts are non-negative — reject negative black points and base_target
+        for name, val in (
+            ("base_target", self.base_target),
+            ("black_point_r", self.black_point_r),
+            ("black_point_g", self.black_point_g),
+            ("black_point_b", self.black_point_b),
+        ):
+            if val < 0:
+                raise ValueError(f"{name} must be >= 0, got {val}")
+        # CR-02: white_point must exceed black_point per channel to prevent
+        # division-by-zero in the inversion formula (pixel-black)/(white-black)
+        for ch, bp, wp in (
+            ("r", self.black_point_r, self.white_point_r),
+            ("g", self.black_point_g, self.white_point_g),
+            ("b", self.black_point_b, self.white_point_b),
+        ):
+            if wp <= bp:
+                raise ValueError(
+                    f"white_point_{ch} ({wp}) must be > black_point_{ch} ({bp})"
+                )
         # Pitfall 1: coerce from JSON list to tuple
         object.__setattr__(
             self, "tone_curve_params",

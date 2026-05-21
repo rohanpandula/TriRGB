@@ -217,3 +217,118 @@ def test_tone_curve_params_is_tuple_after_construction_from_list():
         gamma=1.0,
     )
     assert isinstance(ip.tone_curve_params, tuple)
+
+
+# ---------------------------------------------------------------------------
+# CR-01: CalibrationResult rejects dict-typed nested fields at construction time
+# ---------------------------------------------------------------------------
+
+def test_calibration_result_rejects_dict_for_r_channel():
+    """CR-01: CalibrationResult must raise TypeError when r is a plain dict."""
+    with pytest.raises(TypeError, match="ChannelCalibration"):
+        CalibrationResult(
+            r={"channel": "R", "led_level": 0, "black_level": 0.0, "gain": 1.0, "clip_fraction": 0.0},
+            g=make_channel_cal("G"),
+            b=make_channel_cal("B"),
+            base_region=make_brd(),
+            ffc_cal_dir="/tmp",
+        )
+
+
+def test_calibration_result_rejects_dict_for_base_region():
+    """CR-01: CalibrationResult must raise TypeError when base_region is a plain dict."""
+    with pytest.raises(TypeError, match="BaseRegionDescriptor"):
+        CalibrationResult(
+            r=make_channel_cal("R"),
+            g=make_channel_cal("G"),
+            b=make_channel_cal("B"),
+            base_region={"x": 0, "y": 0, "w": 10, "h": 10, "base_rgb": (1.0, 1.0, 1.0),
+                         "uniformity_cv": 1.0, "source": "auto"},
+            ffc_cal_dir="/tmp",
+        )
+
+
+def test_calibration_result_from_json_still_round_trips():
+    """CR-01: from_json must still reconstruct correctly after __post_init__ is added."""
+    cr = make_cal_result()
+    restored = CalibrationResult.from_json(cr.to_json())
+    assert restored == cr
+    assert isinstance(restored.r, ChannelCalibration)
+    assert isinstance(restored.base_region, BaseRegionDescriptor)
+
+
+# ---------------------------------------------------------------------------
+# CR-02: InversionParams rejects white_point <= black_point (div-by-zero guard)
+# ---------------------------------------------------------------------------
+
+def test_inversion_params_rejects_equal_white_black_point_r():
+    """CR-02: white_point_r == black_point_r must raise ValueError."""
+    with pytest.raises(ValueError, match="white_point_r"):
+        InversionParams(
+            base_target=10000.0,
+            black_point_r=8000.0, black_point_g=250.0, black_point_b=250.0,
+            white_point_r=8000.0, white_point_g=12097.0, white_point_b=2952.0,
+            tone_curve_id="linear", tone_curve_params=(), gamma=1.0,
+        )
+
+
+def test_inversion_params_rejects_inverted_points_g():
+    """CR-02: white_point_g < black_point_g must raise ValueError."""
+    with pytest.raises(ValueError, match="white_point_g"):
+        InversionParams(
+            base_target=10000.0,
+            black_point_r=250.0, black_point_g=12000.0, black_point_b=250.0,
+            white_point_r=8930.0, white_point_g=5000.0, white_point_b=2952.0,
+            tone_curve_id="linear", tone_curve_params=(), gamma=1.0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# WR-01: InversionParams rejects negative black_point and base_target
+# ---------------------------------------------------------------------------
+
+def test_inversion_params_rejects_negative_black_point_r():
+    """WR-01: negative black_point_r must raise ValueError."""
+    with pytest.raises(ValueError, match="black_point_r"):
+        InversionParams(
+            base_target=10000.0,
+            black_point_r=-1.0, black_point_g=250.0, black_point_b=250.0,
+            white_point_r=8930.0, white_point_g=12097.0, white_point_b=2952.0,
+            tone_curve_id="linear", tone_curve_params=(), gamma=1.0,
+        )
+
+
+def test_inversion_params_rejects_negative_base_target():
+    """WR-01: negative base_target must raise ValueError."""
+    with pytest.raises(ValueError, match="base_target"):
+        InversionParams(
+            base_target=-1.0,
+            black_point_r=250.0, black_point_g=250.0, black_point_b=250.0,
+            white_point_r=8930.0, white_point_g=12097.0, white_point_b=2952.0,
+            tone_curve_id="linear", tone_curve_params=(), gamma=1.0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# WR-02: from_json schema-evolution behavior — consistent policy test
+# ---------------------------------------------------------------------------
+
+def test_calibration_result_from_json_ignores_unknown_top_level_keys():
+    """WR-02: CalibrationResult.from_json silently drops unknown top-level keys (forward-compat)."""
+    import json as _json
+    cr = make_cal_result()
+    d = _json.loads(cr.to_json())
+    d["future_v2_field"] = "ignored"
+    # Must not raise — unknown top-level key is silently dropped
+    restored = CalibrationResult.from_json(_json.dumps(d))
+    assert restored == cr
+
+
+def test_channel_calibration_from_json_rejects_unknown_keys():
+    """WR-02: ChannelCalibration.from_json raises on unknown keys (strict nested behavior)."""
+    import json as _json
+    cc = make_channel_cal("R")
+    d = _json.loads(cc.to_json())
+    d["future_field"] = "boom"
+    with pytest.raises(TypeError):
+        ChannelCalibration.from_json(_json.dumps(d))
