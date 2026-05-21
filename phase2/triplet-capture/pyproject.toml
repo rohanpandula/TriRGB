@@ -33,3 +33,10 @@ allow-direct-references = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# FIX 1 (Phase 10): the end-to-end pipeline test imports apply_ffc_radiometric
+# from rgb_composite directly. Without this, pytest picks up the installed
+# (potentially stale) site-packages version instead of the local development
+# tree. The installed version may not have apply_ffc_radiometric yet (it is
+# Phase-10 additive). Adding ../rgb-composite to pythonpath ensures the local
+# source is found first, consistent with how rgb-composite's own tests resolve.
+pythonpath = ["../rgb-composite"]
