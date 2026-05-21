@@ -135,7 +135,12 @@ def test_inversion_params_round_trip():
 # ---------------------------------------------------------------------------
 
 def test_schema_version_present():
-    for obj in [make_brd(), make_channel_cal(), make_cal_result(), make_inversion_params()]:
+    ffr = FlatFieldResult(
+        flat_data_path="/tmp/f.npy", n_frames_averaged=1, warmup_s=0.0,
+        black_level_r=0.0, black_level_g=0.0, black_level_b=0.0,
+        working_brightness=128, uniformity_improvement=1.0,
+    )
+    for obj in [make_brd(), make_channel_cal(), make_cal_result(), make_inversion_params(), ffr]:
         d = json.loads(obj.to_json())
         assert "schema_version" in d, f"Missing schema_version in {type(obj).__name__}"
         assert d["schema_version"] == 1
