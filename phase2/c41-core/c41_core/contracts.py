@@ -382,6 +382,8 @@ class FlatFieldResult(JsonContract):
             raise ValueError(
                 f"n_frames_averaged must be >= 1, got {self.n_frames_averaged}"
             )
+        if not math.isfinite(self.warmup_s):
+            raise ValueError(f"warmup_s must be finite, got {self.warmup_s}")
         if self.warmup_s < 0:
             raise ValueError(f"warmup_s must be >= 0, got {self.warmup_s}")
         if not 0 <= self.working_brightness <= 255:

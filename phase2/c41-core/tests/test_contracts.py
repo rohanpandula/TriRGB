@@ -560,6 +560,26 @@ def test_flat_field_result_validation():
         FlatFieldResult(**{**base, "uniformity_improvement": -0.1})
 
 
+def test_flat_field_result_rejects_nan_warmup_s():
+    """FIX 4: warmup_s=nan must raise ValueError — nan<0 is False so the
+    negative guard alone is insufficient; the isfinite check must run first."""
+    import math as _math
+    base = dict(
+        flat_data_path="/tmp/flat.npy",
+        n_frames_averaged=8,
+        warmup_s=5.0,
+        black_level_r=250.0,
+        black_level_g=255.0,
+        black_level_b=240.0,
+        working_brightness=200,
+        uniformity_improvement=2.83,
+    )
+    with pytest.raises(ValueError, match="warmup_s"):
+        FlatFieldResult(**{**base, "warmup_s": _math.nan})
+    with pytest.raises(ValueError, match="warmup_s"):
+        FlatFieldResult(**{**base, "warmup_s": float("inf")})
+
+
 def test_flat_field_result_schema_version_present():
     """schema_version defaults to 1 and appears in the JSON output."""
     ffr = make_flat_field_result()
