@@ -412,3 +412,41 @@ def test_averaging_reduces_uniformity_error():
     assert improvement_ratio > 1.5, (
         f"expected >1.5x CV improvement from averaging {n} frames, got {improvement_ratio:.2f}x"
     )
+
+
+# FIX 2: over-subtracted flat raises CalibrationError -------------------
+
+def test_apply_ffc_radiometric_over_subtracted_flat_raises():
+    """FIX 2: when ALL flat pixels are at or below black (positive.size == 0),
+    we'd silently produce ~20x amplified garbage instead of catching
+    the misconfigured black level.  Confirm CalibrationError is raised."""
+    from rgb_composite.ffc import CalibrationError
+
+    # flat_val=500 < black=1000 → flat_sub entirely negative → positive.size==0
+    raw = np.full((H, W, 3), 20000, dtype=np.uint16)
+    flat_stack = np.full((1, H, W, 3), 500, dtype=np.uint16)
+    # black level (1000) exceeds every flat pixel (500)
+    black_levels = _make_black_levels(bl_r=1000.0, bl_g=1000.0, bl_b=1000.0)
+
+    with pytest.raises(CalibrationError, match="over-subtracted"):
+        apply_ffc_radiometric(raw, flat_stack, black_levels)
+
+
+# FIX 3: misordered black_levels raises ValueError -------------------
+
+def test_apply_ffc_radiometric_misordered_black_levels_raises():
+    """FIX 3: black_levels tuple must be ordered [0]=R [1]=G [2]=B.
+    Passing (G, R, B) — G-channel cal in the R slot — must raise ValueError
+    rather than silently subtracting the wrong per-channel black."""
+    raw = np.full((H, W, 3), 20000, dtype=np.uint16)
+    flat_stack = np.full((1, H, W, 3), 40000, dtype=np.uint16)
+
+    # (G, R, B) — swapped R and G
+    misordered = (
+        ChannelCalibration(channel="G", led_level=180, black_level=255.0, gain=1.0, clip_fraction=0.0),
+        ChannelCalibration(channel="R", led_level=200, black_level=250.0, gain=1.0, clip_fraction=0.0),
+        ChannelCalibration(channel="B", led_level=160, black_level=240.0, gain=1.0, clip_fraction=0.0),
+    )
+
+    with pytest.raises(ValueError, match="black_levels\\[0\\]"):
+        apply_ffc_radiometric(raw, flat_stack, misordered)

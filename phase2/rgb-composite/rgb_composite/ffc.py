@@ -378,6 +378,15 @@ def apply_ffc_radiometric(
 
     # 3. Per-channel radiometric correction
     for ch_idx, cal in enumerate(black_levels):
+        # Slot-order guard: [0]=R [1]=G [2]=B is the locked project contract.
+        # A misordered (G,R,B) tuple would silently subtract the wrong black level.
+        expected_channel = "RGB"[ch_idx]
+        if cal.channel != expected_channel:
+            raise ValueError(
+                f"black_levels[{ch_idx}] must be channel {expected_channel!r}, "
+                f"got channel={cal.channel!r}. "
+                "black_levels must be ordered [0]=R [1]=G [2]=B."
+            )
         bl = float(cal.black_level)
         raw_ch = raw_array[..., ch_idx].astype(np.float32)
         flat_ch = avg_flat[..., ch_idx]          # already float32
@@ -389,7 +398,18 @@ def apply_ffc_radiometric(
         #   safe = np.maximum(smoothed, reference * 0.05)
         # Here flat_ref is the mean of the positive (non-black-subtracted) region.
         positive = flat_sub[flat_sub > 0]
-        flat_ref = float(positive.mean()) if positive.size else 1.0
+        # Fail-closed guard: if no flat pixel is above black (entire flat at/below
+        # the black level), the black level is misconfigured or the flat is a dark
+        # frame — the 1.0 fallback would produce ~20× amplified/clipped garbage
+        # silently. Raise instead so the operator knows calibration is broken.
+        if positive.size == 0:
+            raise CalibrationError(
+                f"apply_ffc_radiometric: channel {'RGB'[ch_idx]} flat is entirely "
+                f"at or below black level {bl:.1f} after subtraction — no positive "
+                "flat pixels remain. The flat is over-subtracted (misconfigured "
+                "black_level) or is a dark frame; recapture the flat calibration."
+            )
+        flat_ref = float(positive.mean())
         safe_flat = np.maximum(flat_sub, flat_ref * 0.05)
 
         # The formula outputs in black-subtracted sensor counts:
