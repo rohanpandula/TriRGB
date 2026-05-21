@@ -117,7 +117,14 @@ def calibrate_exposure(
 
     Raises:
         RuntimeError: if any capture (dark frame or calibration frame) fails.
+        ValueError: if max_iterations < 1, or if a channel produces no signal
+            after black-level subtraction (dark frame brighter than signal or
+            black_level miscalibrated).
     """
+    # Guard: caller must allow at least one iteration
+    if max_iterations < 1:
+        raise ValueError(f"max_iterations must be >= 1, got {max_iterations}")
+
     # Derive the numeric target
     target: int = int(target_fraction * _CLIP_CEILING)
 
@@ -170,16 +177,16 @@ def calibrate_exposure(
 
         lo: int = 1       # 0 reserved for dark frame
         hi: int = 255
-        best_level: int = (lo + hi) // 2
+        probe_level: int = (lo + hi) // 2   # current bisection probe (not the best-seen)
         best_p99: float = 0.0
-        best_level_so_far: int = best_level
+        best_level_so_far: int = probe_level
         converged: bool = False
         final_roi_raw: Optional[np.ndarray] = None
         best_final_roi_raw: Optional[np.ndarray] = None
 
         for _iteration in range(max_iterations):
             # Light only this channel; keep roll_name unchanged (Pitfall 4)
-            orch.update_settings(**{level_field: best_level, **other_fields})
+            orch.update_settings(**{level_field: probe_level, **other_fields})
 
             result = orch.capture_triplet(retake=True)
             if not result.success:
@@ -207,7 +214,7 @@ def calibrate_exposure(
             # Track best-effort for non-convergence path
             if abs(p99 - target) < abs(best_p99 - target):
                 best_p99 = p99
-                best_level_so_far = best_level
+                best_level_so_far = probe_level
                 best_final_roi_raw = roi_raw.copy()
 
             final_roi_raw = roi_raw  # last iteration's raw ROI
@@ -219,24 +226,33 @@ def calibrate_exposure(
 
             # Bisection step
             if p99 < target:
-                lo = best_level + 1   # need more light
+                lo = probe_level + 1   # need more light
             else:
-                hi = best_level - 1   # too bright, back off
+                hi = probe_level - 1   # too bright, back off
 
             if lo > hi:
                 break   # search space exhausted (e.g. maxed at 255, still under target)
 
-            best_level = (lo + hi) // 2
+            probe_level = (lo + hi) // 2
 
         # ------------------------------------------------------------------
         # Post-loop: resolve converged level and compute clip_fraction
         # ------------------------------------------------------------------
-        if converged:
-            converged_level = best_level
-            clip_roi = final_roi_raw
-        else:
-            converged_level = best_level_so_far
-            clip_roi = best_final_roi_raw if best_final_roi_raw is not None else final_roi_raw
+        # Fail-closed: if every probe produced p99==0.0 the dark frame was brighter
+        # than the calibration signal — return an error rather than a silent garbage
+        # result (WR-02).
+        if best_p99 == 0.0:
+            raise ValueError(
+                f"channel {ch}: rebate signal is zero after black subtraction at every "
+                f"probe level — dark frame (black_level={black_level[ch]:.1f}) is "
+                f"brighter than the calibration signal, or black_level is miscalibrated"
+            )
+
+        # Always use best_level_so_far for both the converged and non-convergence
+        # paths (WR-01/WR-04: symmetric branches, probe_level != best_level_so_far
+        # if convergence criterion were ever loosened).
+        converged_level = best_level_so_far
+        clip_roi = best_final_roi_raw if best_final_roi_raw is not None else final_roi_raw
 
         # clip_fraction: fraction of RAW (pre-subtraction) rebate pixels at or above
         # saturation threshold (near 0 for non-convergence / never-reached-target case)
