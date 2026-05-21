@@ -454,5 +454,12 @@ class CheckResult(JsonContract):
                 raise TypeError(
                     f"deltas keys must be str, got {type(k).__name__}: {k!r}"
                 )
-            if isinstance(v, bool) or not math.isfinite(float(v)):
+            # Reject bool (an int subclass) and non-numeric values (e.g. a
+            # float-convertible string like "1.0") BEFORE the finite check: either
+            # would pass float() but then serialize as a JSON string/boolean, breaking
+            # the Swift Codable number contract at the Phase 14 boundary
+            # (NFR-15 peer review: Codex/qwen/tencent all flagged the string hole).
+            if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
+                raise ValueError(f"deltas[{k!r}] must be a finite number, got {v!r}")
+            if not math.isfinite(float(v)):
                 raise ValueError(f"deltas[{k!r}] must be a finite number, got {v!r}")

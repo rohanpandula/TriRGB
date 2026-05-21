@@ -680,3 +680,9 @@ def test_check_result_validation():
     # deltas with a bool value must raise ValueError (Fix 2)
     with pytest.raises(ValueError):
         CheckResult(**{**valid_kw, "deltas": {"d": True}})  # type: ignore[arg-type]
+
+    # deltas with a float-convertible STRING value must raise ValueError
+    # (NFR-15 peer review: float("1.0") is finite, so a str slipped the old guard
+    #  and serialized as a JSON string, breaking the Swift Codable number contract).
+    with pytest.raises(ValueError):
+        CheckResult(**{**valid_kw, "deltas": {"dx": "1.0"}})  # type: ignore[arg-type]
