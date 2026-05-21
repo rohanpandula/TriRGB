@@ -122,6 +122,19 @@ def make_c41_negative(
     Returns:
         np.ndarray: shape (height, width, 3), dtype uint16.
     """
+    if height <= 0 or width <= 0:
+        raise ValueError(f"height and width must be > 0, got height={height}, width={width}")
+    if not 0.0 < rebate_height_frac <= 1.0:
+        raise ValueError(f"rebate_height_frac must be in (0, 1], got {rebate_height_frac}")
+    if base_r < 0 or base_g < 0 or base_b < 0:
+        raise ValueError(
+            f"base levels must be non-negative, got base_r={base_r}, base_g={base_g}, base_b={base_b}"
+        )
+    if density_r < 0 or density_g < 0 or density_b < 0:
+        raise ValueError(
+            f"density values must be non-negative, got density_r={density_r}, "
+            f"density_g={density_g}, density_b={density_b}"
+        )
     rng = np.random.default_rng(seed)
     img = np.zeros((height, width, 3), dtype=np.float32)
 
@@ -172,6 +185,12 @@ def make_rebate_strip(
     Returns:
         np.ndarray: shape (height, width, 3), dtype uint16.
     """
+    if height <= 0 or width <= 0:
+        raise ValueError(f"height and width must be > 0, got height={height}, width={width}")
+    if base_r < 0 or base_g < 0 or base_b < 0:
+        raise ValueError(
+            f"base levels must be non-negative, got base_r={base_r}, base_g={base_g}, base_b={base_b}"
+        )
     rng = np.random.default_rng(seed)
     img = np.zeros((height, width, 3), dtype=np.float32)
 

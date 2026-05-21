@@ -325,10 +325,162 @@ def test_calibration_result_from_json_ignores_unknown_top_level_keys():
 
 
 def test_channel_calibration_from_json_rejects_unknown_keys():
-    """WR-02: ChannelCalibration.from_json raises on unknown keys (strict nested behavior)."""
+    """WR-02 (updated): ChannelCalibration.from_json still raises on unknown keys
+    when called DIRECTLY (the base mixin does not filter); unknown keys inside
+    CalibrationResult.from_json are filtered before passing to ChannelCalibration."""
     import json as _json
     cc = make_channel_cal("R")
     d = _json.loads(cc.to_json())
     d["future_field"] = "boom"
     with pytest.raises(TypeError):
         ChannelCalibration.from_json(_json.dumps(d))
+
+
+# ---------------------------------------------------------------------------
+# FIX 1: NaN/Infinity bypass — math.isfinite guards on all float fields
+# ---------------------------------------------------------------------------
+
+import math as _math
+
+
+def test_base_region_descriptor_rejects_nan_in_base_rgb():
+    """FIX 1: NaN in base_rgb must raise ValueError, not slip past the < 0 guard."""
+    with pytest.raises(ValueError, match="base_rgb"):
+        BaseRegionDescriptor(
+            x=0, y=0, w=10, h=10,
+            base_rgb=(_math.nan, 1.0, 1.0),
+            uniformity_cv=1.0, source="auto",
+        )
+
+
+def test_base_region_descriptor_rejects_inf_in_base_rgb():
+    """FIX 1: Infinity in base_rgb must raise ValueError."""
+    with pytest.raises(ValueError, match="base_rgb"):
+        BaseRegionDescriptor(
+            x=0, y=0, w=10, h=10,
+            base_rgb=(float("inf"), 1.0, 1.0),
+            uniformity_cv=1.0, source="auto",
+        )
+
+
+def test_channel_calibration_rejects_inf_gain():
+    """FIX 1: Infinity in gain must raise ValueError."""
+    with pytest.raises(ValueError, match="gain"):
+        ChannelCalibration(
+            channel="R", led_level=128,
+            black_level=0.0, gain=float("inf"), clip_fraction=0.0,
+        )
+
+
+def test_channel_calibration_rejects_nan_black_level():
+    """FIX 1: NaN in black_level must raise ValueError."""
+    with pytest.raises(ValueError, match="black_level"):
+        ChannelCalibration(
+            channel="R", led_level=128,
+            black_level=_math.nan, gain=1.0, clip_fraction=0.0,
+        )
+
+
+def test_inversion_params_rejects_nan_white_point_r():
+    """FIX 1: NaN in white_point_r must raise ValueError."""
+    with pytest.raises(ValueError, match="white_point_r"):
+        InversionParams(
+            base_target=10000.0,
+            black_point_r=250.0, black_point_g=250.0, black_point_b=250.0,
+            white_point_r=_math.nan, white_point_g=12097.0, white_point_b=2952.0,
+            tone_curve_id="linear", tone_curve_params=(), gamma=1.0,
+        )
+
+
+def test_inversion_params_rejects_nan_gamma():
+    """FIX 1: NaN in gamma must raise ValueError."""
+    with pytest.raises(ValueError, match="gamma"):
+        InversionParams(
+            base_target=10000.0,
+            black_point_r=250.0, black_point_g=250.0, black_point_b=250.0,
+            white_point_r=8930.0, white_point_g=12097.0, white_point_b=2952.0,
+            tone_curve_id="linear", tone_curve_params=(), gamma=_math.nan,
+        )
+
+
+def test_to_json_rejects_non_finite_at_serialize():
+    """FIX 1: allow_nan=False in to_json must raise ValueError on non-finite values
+    that bypass construction (e.g. injected via object.__setattr__ bypass)."""
+    import dataclasses as _dc
+    # Construct valid object then forcibly corrupt it to test serialization guard
+    brd = BaseRegionDescriptor(
+        x=0, y=0, w=10, h=10,
+        base_rgb=(1.0, 1.0, 1.0), uniformity_cv=1.0, source="auto",
+    )
+    # Use object.__setattr__ to bypass frozen + __post_init__ and inject nan
+    object.__setattr__(brd, "uniformity_cv", float("nan"))
+    with pytest.raises(ValueError):
+        brd.to_json()
+
+
+# ---------------------------------------------------------------------------
+# FIX 2: Nested-key forward-compat in CalibrationResult.from_json
+# ---------------------------------------------------------------------------
+
+def test_calibration_result_from_json_tolerates_unknown_nested_key_in_r():
+    """FIX 2: Unknown key inside the 'r' nested dict must NOT raise TypeError."""
+    import json as _json
+    cr = make_cal_result()
+    d = _json.loads(cr.to_json())
+    d["r"]["future_nested_field"] = "ignored"
+    # Must not raise — unknown nested key is filtered out
+    restored = CalibrationResult.from_json(_json.dumps(d))
+    assert isinstance(restored.r, ChannelCalibration)
+    assert restored.r == cr.r
+
+
+def test_calibration_result_from_json_tolerates_unknown_nested_key_in_base_region():
+    """FIX 2: Unknown key inside 'base_region' nested dict must NOT raise TypeError."""
+    import json as _json
+    cr = make_cal_result()
+    d = _json.loads(cr.to_json())
+    d["base_region"]["future_nested_field"] = "ignored"
+    # Must not raise
+    restored = CalibrationResult.from_json(_json.dumps(d))
+    assert isinstance(restored.base_region, BaseRegionDescriptor)
+    assert restored.base_region == cr.base_region
+
+
+# ---------------------------------------------------------------------------
+# FIX 3: Channel/slot consistency in CalibrationResult.__post_init__
+# ---------------------------------------------------------------------------
+
+def test_calibration_result_rejects_wrong_channel_in_r_slot():
+    """FIX 3: CalibrationResult must raise ValueError when r slot holds channel='G'."""
+    with pytest.raises(ValueError, match="r slot"):
+        CalibrationResult(
+            r=make_channel_cal("G"),  # G-channel in r slot
+            g=make_channel_cal("G"),
+            b=make_channel_cal("B"),
+            base_region=make_brd(),
+            ffc_cal_dir="/tmp",
+        )
+
+
+def test_calibration_result_rejects_wrong_channel_in_g_slot():
+    """FIX 3: CalibrationResult must raise ValueError when g slot holds channel='B'."""
+    with pytest.raises(ValueError, match="g slot"):
+        CalibrationResult(
+            r=make_channel_cal("R"),
+            g=make_channel_cal("B"),  # B-channel in g slot
+            b=make_channel_cal("B"),
+            base_region=make_brd(),
+            ffc_cal_dir="/tmp",
+        )
+
+
+def test_calibration_result_rejects_wrong_channel_in_b_slot():
+    """FIX 3: CalibrationResult must raise ValueError when b slot holds channel='R'."""
+    with pytest.raises(ValueError, match="b slot"):
+        CalibrationResult(
+            r=make_channel_cal("R"),
+            g=make_channel_cal("G"),
+            b=make_channel_cal("R"),  # R-channel in b slot
+            base_region=make_brd(),
+            ffc_cal_dir="/tmp",
+        )

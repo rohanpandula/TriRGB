@@ -22,5 +22,6 @@ __all__ = [
     "DEFAULT_SEED",
 ]
 
-# Fixtures are imported after __all__ to silence the E402 lint rule
+# noqa: E402 suppresses the "module level import not at top of file" lint warning;
+# fixtures is imported here (after contracts) so the public API is grouped cleanly.
 from .fixtures import make_c41_negative, make_rebate_strip, DEFAULT_SEED  # noqa: E402

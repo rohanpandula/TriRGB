@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from typing import Literal
 
 import numpy as np
@@ -77,7 +78,7 @@ class JsonContract:
             return super().default(obj)
 
     def to_json(self) -> str:
-        return json.dumps(dataclasses.asdict(self), cls=self._NumpyEncoder)
+        return json.dumps(dataclasses.asdict(self), cls=self._NumpyEncoder, allow_nan=False)
 
     @classmethod
     def from_json(cls, s: str) -> "JsonContract":
@@ -119,8 +120,15 @@ class BaseRegionDescriptor(JsonContract):
             raise ValueError(f"x, y must be >= 0, got x={self.x}, y={self.y}")
         if self.w <= 0 or self.h <= 0:
             raise ValueError(f"w, h must be > 0, got w={self.w}, h={self.h}")
-        if len(self.base_rgb) != 3 or any(v < 0 for v in self.base_rgb):
-            raise ValueError("base_rgb must be a 3-tuple with all values >= 0")
+        if len(self.base_rgb) != 3:
+            raise ValueError("base_rgb must be a 3-tuple")
+        for i, v in enumerate(self.base_rgb):
+            if not math.isfinite(v):
+                raise ValueError(f"base_rgb[{i}] must be finite, got {v}")
+            if v < 0:
+                raise ValueError(f"base_rgb[{i}] must be >= 0, got {v}")
+        if not math.isfinite(self.uniformity_cv):
+            raise ValueError(f"uniformity_cv must be finite, got {self.uniformity_cv}")
         if not 0.0 <= self.uniformity_cv <= 100.0:
             raise ValueError(f"uniformity_cv must be 0–100, got {self.uniformity_cv}")
         if self.source not in ("auto", "manual"):
@@ -162,10 +170,16 @@ class ChannelCalibration(JsonContract):
             raise ValueError(f"channel must be 'R', 'G', or 'B', got {self.channel!r}")
         if not 0 <= self.led_level <= 255:
             raise ValueError(f"led_level must be 0–255, got {self.led_level}")
+        if not math.isfinite(self.black_level):
+            raise ValueError(f"black_level must be finite, got {self.black_level}")
         if self.black_level < 0:
             raise ValueError(f"black_level must be >= 0, got {self.black_level}")
+        if not math.isfinite(self.gain):
+            raise ValueError(f"gain must be finite, got {self.gain}")
         if self.gain <= 0:
             raise ValueError(f"gain must be > 0, got {self.gain}")
+        if not math.isfinite(self.clip_fraction):
+            raise ValueError(f"clip_fraction must be finite, got {self.clip_fraction}")
         if not 0.0 <= self.clip_fraction <= 1.0:
             raise ValueError(f"clip_fraction must be 0–1, got {self.clip_fraction}")
 
@@ -209,23 +223,35 @@ class CalibrationResult(JsonContract):
             raise TypeError(f"b must be ChannelCalibration, got {type(self.b).__name__}")
         if not isinstance(self.base_region, BaseRegionDescriptor):
             raise TypeError(f"base_region must be BaseRegionDescriptor, got {type(self.base_region).__name__}")
+        # Channel/slot consistency: prevent a "G"-channel calibration silently
+        # occupying the r slot (or similar cross-channel mis-assignment).
+        if self.r.channel != "R":
+            raise ValueError(f"r slot must hold channel='R', got channel={self.r.channel!r}")
+        if self.g.channel != "G":
+            raise ValueError(f"g slot must hold channel='G', got channel={self.g.channel!r}")
+        if self.b.channel != "B":
+            raise ValueError(f"b slot must hold channel='B', got channel={self.b.channel!r}")
 
     @classmethod
     def from_json(cls, s: str) -> "CalibrationResult":
         """Reconstruct CalibrationResult from JSON string.
 
-        NOTE: Unknown top-level keys in the JSON are silently dropped (forward-compat).
-        Unknown keys inside nested ChannelCalibration / BaseRegionDescriptor dicts
-        will raise TypeError (strict). This asymmetry is intentional — top-level
-        new fields from v2+ schemas are ignored, but nested-field additions require a
-        coordinated schema bump.
+        Forward-compat policy: unknown keys at ALL levels (top-level and nested)
+        are silently dropped.  This allows a future Swift-evolved schema to add
+        fields to ChannelCalibration or BaseRegionDescriptor without breaking
+        older Python readers — only the known field names are unpacked into each
+        dataclass constructor.
         """
         d = json.loads(s)
+        _cc_fields = {f.name for f in dataclasses.fields(ChannelCalibration)}
+        _brd_fields = {f.name for f in dataclasses.fields(BaseRegionDescriptor)}
         return cls(
-            r=ChannelCalibration(**d["r"]),
-            g=ChannelCalibration(**d["g"]),
-            b=ChannelCalibration(**d["b"]),
-            base_region=BaseRegionDescriptor(**d["base_region"]),
+            r=ChannelCalibration(**{k: v for k, v in d["r"].items() if k in _cc_fields}),
+            g=ChannelCalibration(**{k: v for k, v in d["g"].items() if k in _cc_fields}),
+            b=ChannelCalibration(**{k: v for k, v in d["b"].items() if k in _cc_fields}),
+            base_region=BaseRegionDescriptor(
+                **{k: v for k, v in d["base_region"].items() if k in _brd_fields}
+            ),
             ffc_cal_dir=d["ffc_cal_dir"],
             schema_version=d.get("schema_version", 1),
         )
@@ -266,8 +292,22 @@ class InversionParams(JsonContract):
     schema_version: int = 1
 
     def __post_init__(self) -> None:
+        # Reject NaN/±Inf before range checks (nan < 0 is False, bypassing guards)
+        if not math.isfinite(self.gamma):
+            raise ValueError(f"gamma must be finite, got {self.gamma}")
         if self.gamma <= 0:
             raise ValueError(f"gamma must be > 0, got {self.gamma}")
+        for name, val in (
+            ("base_target", self.base_target),
+            ("black_point_r", self.black_point_r),
+            ("black_point_g", self.black_point_g),
+            ("black_point_b", self.black_point_b),
+            ("white_point_r", self.white_point_r),
+            ("white_point_g", self.white_point_g),
+            ("white_point_b", self.white_point_b),
+        ):
+            if not math.isfinite(val):
+                raise ValueError(f"{name} must be finite, got {val}")
         # WR-01: raw pixel counts are non-negative — reject negative black points and base_target
         for name, val in (
             ("base_target", self.base_target),
@@ -288,6 +328,9 @@ class InversionParams(JsonContract):
                 raise ValueError(
                     f"white_point_{ch} ({wp}) must be > black_point_{ch} ({bp})"
                 )
+        for i, v in enumerate(self.tone_curve_params):
+            if not math.isfinite(v):
+                raise ValueError(f"tone_curve_params[{i}] must be finite, got {v}")
         # Pitfall 1: coerce from JSON list to tuple
         object.__setattr__(
             self, "tone_curve_params",

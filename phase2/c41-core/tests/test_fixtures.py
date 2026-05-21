@@ -168,3 +168,37 @@ def test_make_rebate_strip_uniform():
         ch = arr[:, :, ch_idx].astype(np.float32)
         cv = ch.std() / max(ch.mean(), 1.0)
         assert cv < 0.05, f"Channel {ch_idx} CV={cv:.4f} suggests density variation (expected <5%)"
+
+
+# ---------------------------------------------------------------------------
+# FIX 4: Fixture param validation — misuse fails clearly
+# ---------------------------------------------------------------------------
+
+def test_make_c41_negative_rejects_zero_width():
+    """FIX 4: zero width must raise ValueError, not produce a numpy broadcast error."""
+    with pytest.raises(ValueError, match="width"):
+        make_c41_negative(height=128, width=0)
+
+
+def test_make_c41_negative_rejects_zero_height():
+    """FIX 4: zero height must raise ValueError."""
+    with pytest.raises(ValueError, match="height"):
+        make_c41_negative(height=0, width=192)
+
+
+def test_make_c41_negative_rejects_rebate_frac_above_one():
+    """FIX 4: rebate_height_frac > 1 must raise ValueError (fraction out of range)."""
+    with pytest.raises(ValueError, match="rebate_height_frac"):
+        make_c41_negative(rebate_height_frac=1.5)
+
+
+def test_make_c41_negative_rejects_rebate_frac_zero():
+    """FIX 4: rebate_height_frac == 0 must raise ValueError (no rebate rows)."""
+    with pytest.raises(ValueError, match="rebate_height_frac"):
+        make_c41_negative(rebate_height_frac=0.0)
+
+
+def test_make_rebate_strip_rejects_zero_width():
+    """FIX 4: zero width on make_rebate_strip must raise ValueError."""
+    with pytest.raises(ValueError, match="width"):
+        make_rebate_strip(height=128, width=0)
