@@ -12,6 +12,10 @@ license = { text = "MIT" }
 dependencies = [
     "scanlightctl",  # Scanlight class from Phase 1A
     "flask>=3.0",
+    "c41-core>=0.1.0",  # FlatFieldResult returned by capture_flats (Phase 10)
+    # NOTE: on a fresh clone, `pip install -e phase2/c41-core` must precede
+    # `pip install -e phase2/triplet-capture` (c41-core has only numpy deps,
+    # no circular dependency).
 ]
 
 [project.optional-dependencies]
