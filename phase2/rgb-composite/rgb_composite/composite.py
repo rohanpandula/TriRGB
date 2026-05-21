@@ -421,6 +421,15 @@ def invert_composite(
             f"threshold {_MIN_BASE_CHANNEL}; possible calibration error — "
             "recapture the rebate base measurement"
         )
+    # Hoist tone_curve_id check before any array allocation (IN-02): an
+    # unsupported curve would otherwise waste a full-image neutralize+invert
+    # before raising.  When a future phase adds a new curve, remove this
+    # early check alongside the matching elif in _apply_tone_curve.
+    if params.tone_curve_id != "linear":
+        raise NotImplementedError(
+            f"tone_curve_id {params.tone_curve_id!r} is not implemented; "
+            'only "linear" is supported in Phase 11'
+        )
 
     # Step 1: float32 workspace — dtype change uint16→float32 guarantees a
     # fresh allocation; caller's array is never mutated (Pitfall 3).
