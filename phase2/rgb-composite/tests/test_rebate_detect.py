@@ -134,6 +134,18 @@ def test_no_color_discrimination():
     assert 0.0 <= desc.uniformity_cv <= 100.0
 
 
+def test_detect_rebate_all_zero_green_raises():
+    """detect_rebate on all-zero green channel raises ValueError (IN-02 / CR-01 regression lock).
+
+    Verifies the fail-closed guard added for CR-01: a degenerate all-zero green
+    channel must raise ValueError with a message mentioning the green channel,
+    not silently return a descriptor at (0, 0).
+    """
+    img = np.zeros((H, W, 3), dtype=np.uint16)
+    with pytest.raises(ValueError, match="green channel"):
+        detect_rebate(img)
+
+
 # ===========================================================================
 # Task 3 tests: manual_picker
 # ===========================================================================
