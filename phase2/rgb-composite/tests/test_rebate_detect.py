@@ -134,6 +134,43 @@ def test_no_color_discrimination():
     assert 0.0 <= desc.uniformity_cv <= 100.0
 
 
+def test_detect_rebate_downsample_path():
+    """detect_rebate on a 1600x2400 image exercises scale < 1.0 downsample path (WR-02).
+
+    max(1600, 2400) = 2400 > 1500, so scale = 1500/2400 = 0.625 < 1.0.
+    The cv2.resize + bbox back-projection path must:
+      - find the planted rebate (top 160 rows in make_c41_negative at rebate_height_frac=0.1)
+      - return a bbox fully within the FULL-RESOLUTION 1600x2400 image bounds
+      - overlap the planted rebate bbox by at least 0.5
+    """
+    BIG_H, BIG_W = 1600, 2400
+    planted_rebate_h = max(1, int(BIG_H * 0.1))  # 160 rows
+    img = make_c41_negative(height=BIG_H, width=BIG_W, seed=42)
+    desc = detect_rebate(img)
+    assert isinstance(desc, BaseRegionDescriptor)
+    assert desc.source == "auto"
+    # Bbox must be within FULL-RESOLUTION image (not the downsampled proxy)
+    assert desc.x >= 0, f"x={desc.x} < 0"
+    assert desc.y >= 0, f"y={desc.y} < 0"
+    assert desc.w >= 1, f"w={desc.w} < 1"
+    assert desc.h >= 1, f"h={desc.h} < 1"
+    assert desc.x + desc.w <= BIG_W, (
+        f"bbox right edge {desc.x + desc.w} exceeds full-res width {BIG_W}"
+    )
+    assert desc.y + desc.h <= BIG_H, (
+        f"bbox bottom edge {desc.y + desc.h} exceeds full-res height {BIG_H}"
+    )
+    # Must find the planted rebate at the top of the image
+    overlap = _overlap_fraction(
+        desc.x, desc.y, desc.w, desc.h,
+        0, 0, BIG_W, planted_rebate_h,
+    )
+    assert overlap >= 0.5, (
+        f"Detected bbox ({desc.x},{desc.y},{desc.w},{desc.h}) overlaps planted rebate "
+        f"(0,0,{BIG_W},{planted_rebate_h}) by only {overlap:.3f} < 0.5"
+    )
+
+
 def test_detect_rebate_all_zero_green_raises():
     """detect_rebate on all-zero green channel raises ValueError (IN-02 / CR-01 regression lock).
 
