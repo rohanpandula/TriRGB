@@ -19,6 +19,7 @@ from .ffc import (
     compute_ffc_map,
     load_ffc_maps,
 )
+from .rebate_detect import detect_rebate, manual_picker
 
 __all__ = [
     # composite
@@ -38,5 +39,8 @@ __all__ = [
     "clear_ffc_cache",
     "FFCMaps",
     "CalibrationError",
+    # rebate_detect (Phase 09)
+    "detect_rebate",
+    "manual_picker",
 ]
 __version__ = "0.2.0"
