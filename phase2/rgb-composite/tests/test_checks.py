@@ -246,6 +246,6 @@ def test_sc4_no_perceptual_color_logic():
         ["grep", "-niE", r"hue|saturation|perceptual|colou?r[- ]name", checks_path],
         capture_output=True, text=True,
     )
-    assert result.returncode != 0, (
-        f"SC-4 violation: color-vision logic found in checks.py:\n{result.stdout}"
+    assert result.returncode == 1, (  # 1 = no match (clean); 0 = SC-4 violation; 2 = grep error
+        f"SC-4 violation or grep error (rc={result.returncode}): {result.stdout or result.stderr}"
     )

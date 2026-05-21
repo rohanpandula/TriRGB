@@ -443,7 +443,7 @@ class CheckResult(JsonContract):
             raise ValueError(f"name must be non-empty, got {self.name!r}")
         if not isinstance(self.passed, bool):
             raise TypeError(f"passed must be bool, got {type(self.passed).__name__}")
-        if not isinstance(self.schema_version, int) or self.schema_version < 1:
+        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version < 1:
             raise ValueError(
                 f"schema_version must be int >= 1, got {self.schema_version!r}"
             )
@@ -454,5 +454,5 @@ class CheckResult(JsonContract):
                 raise TypeError(
                     f"deltas keys must be str, got {type(k).__name__}: {k!r}"
                 )
-            if not math.isfinite(float(v)):
-                raise ValueError(f"deltas[{k!r}] must be finite, got {v}")
+            if isinstance(v, bool) or not math.isfinite(float(v)):
+                raise ValueError(f"deltas[{k!r}] must be a finite number, got {v!r}")

@@ -672,3 +672,11 @@ def test_check_result_validation():
     assert cr.name == "registration"
     assert cr.passed is True
     assert cr.schema_version == 1
+
+    # schema_version=True (bool subclass of int) must raise ValueError (Fix 1)
+    with pytest.raises(ValueError, match="schema_version"):
+        CheckResult(**{**valid_kw, "schema_version": True})  # type: ignore[arg-type]
+
+    # deltas with a bool value must raise ValueError (Fix 2)
+    with pytest.raises(ValueError):
+        CheckResult(**{**valid_kw, "deltas": {"d": True}})  # type: ignore[arg-type]
