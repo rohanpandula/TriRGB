@@ -161,6 +161,14 @@ def detect_rebate(
     """
     H, W, _ = img.shape  # HxWx3 uint16
 
+    # Guard: degenerate all-zero green channel cannot produce a meaningful score.
+    # Fail closed (consistent with project "fail closed" pattern) so callers get
+    # a diagnosable error rather than a silently wrong descriptor at (0, 0).
+    if int(img[:, :, 1].max()) == 0:
+        raise ValueError(
+            "green channel is all-zero; cannot locate rebate"
+        )
+
     # 1. Downsample green channel for efficient scoring.
     #    The else branch MUST set new_h, new_w (not just green_s) — fixture
     #    images are 128x192 so scale == 1.0 on every fixture test; omitting
@@ -197,7 +205,8 @@ def detect_rebate(
     )
 
     # 6. Normalise all three to [0, 1] (equal weights -- no tunable constants).
-    b = (mean_map.astype(np.float32) / float(mean_map.max())).clip(0, 1)
+    #    Guard denominator with max(..., 1e-9) consistent with lines below.
+    b = (mean_map.astype(np.float32) / max(float(mean_map.max()), 1e-9)).clip(0, 1)
     c = (cv_map / max(float(cv_map.max()), 1e-9)).clip(0, 1)
     d = (detail_map / max(float(detail_map.max()), 1e-9)).clip(0, 1)
     score = b - c - d  # higher = brighter, more uniform, less detail
