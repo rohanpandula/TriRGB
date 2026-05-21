@@ -1,0 +1,219 @@
+"""Tests for c41_core.contracts — JSON round-trip, schema_version, and validation.
+
+Each contract type gets exactly one round-trip test (NFR-13 requirement).
+The CalibrationResult round-trip explicitly checks nested-type reconstruction
+(Pitfall 2: from_json must rebuild ChannelCalibration and BaseRegionDescriptor
+from dicts, not silently store them as plain dicts).
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from c41_core.contracts import (
+    BaseRegionDescriptor,
+    CalibrationResult,
+    ChannelCalibration,
+    InversionParams,
+    JsonContract,
+)
+import c41_core
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_brd() -> BaseRegionDescriptor:
+    return BaseRegionDescriptor(
+        x=10, y=20, w=50, h=30,
+        base_rgb=(8930.0, 12097.0, 2952.0),
+        uniformity_cv=2.3,
+        source="auto",
+    )
+
+
+def make_channel_cal(channel: str = "R") -> ChannelCalibration:
+    return ChannelCalibration(
+        channel=channel,
+        led_level=128,
+        black_level=250.0,
+        gain=1.25,
+        clip_fraction=0.002,
+    )
+
+
+def make_cal_result() -> CalibrationResult:
+    return CalibrationResult(
+        r=make_channel_cal("R"),
+        g=make_channel_cal("G"),
+        b=make_channel_cal("B"),
+        base_region=make_brd(),
+        ffc_cal_dir="/tmp/cal",
+    )
+
+
+def make_inversion_params() -> InversionParams:
+    return InversionParams(
+        base_target=10000.0,
+        black_point_r=250.0,
+        black_point_g=250.0,
+        black_point_b=250.0,
+        white_point_r=8930.0,
+        white_point_g=12097.0,
+        white_point_b=2952.0,
+        tone_curve_id="linear",
+        tone_curve_params=(1.0, 0.0),
+        gamma=1.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Package-level smoke test
+# ---------------------------------------------------------------------------
+
+def test_package_version():
+    assert c41_core.__version__ == "0.1.0"
+
+
+# ---------------------------------------------------------------------------
+# Round-trip tests (one per contract type — NFR-13)
+# ---------------------------------------------------------------------------
+
+def test_base_region_descriptor_round_trip():
+    brd = make_brd()
+    restored = BaseRegionDescriptor.from_json(brd.to_json())
+    assert restored == brd
+    assert restored.schema_version == 1
+    assert isinstance(restored.base_rgb, tuple), "base_rgb must be tuple after round-trip"
+    assert isinstance(restored, BaseRegionDescriptor)
+
+
+def test_channel_calibration_round_trip_r():
+    cc = make_channel_cal("R")
+    restored = ChannelCalibration.from_json(cc.to_json())
+    assert restored == cc
+    assert isinstance(restored, ChannelCalibration)
+
+
+def test_channel_calibration_round_trip_g():
+    cc = make_channel_cal("G")
+    restored = ChannelCalibration.from_json(cc.to_json())
+    assert restored == cc
+
+
+def test_channel_calibration_round_trip_b():
+    cc = make_channel_cal("B")
+    restored = ChannelCalibration.from_json(cc.to_json())
+    assert restored == cc
+
+
+def test_calibration_result_round_trip():
+    """CalibrationResult.from_json must reconstruct nested types, not store dicts."""
+    cr = make_cal_result()
+    restored = CalibrationResult.from_json(cr.to_json())
+    assert restored == cr
+    # Pitfall 2: verify nested types are reconstructed correctly
+    assert isinstance(restored.r, ChannelCalibration), "r must be ChannelCalibration not dict"
+    assert isinstance(restored.g, ChannelCalibration), "g must be ChannelCalibration not dict"
+    assert isinstance(restored.b, ChannelCalibration), "b must be ChannelCalibration not dict"
+    assert isinstance(restored.base_region, BaseRegionDescriptor), "base_region must be BaseRegionDescriptor not dict"
+    assert restored.ffc_cal_dir == "/tmp/cal"
+
+
+def test_inversion_params_round_trip():
+    ip = make_inversion_params()
+    restored = InversionParams.from_json(ip.to_json())
+    assert restored == ip
+    assert isinstance(restored.tone_curve_params, tuple), "tone_curve_params must be tuple after round-trip"
+
+
+# ---------------------------------------------------------------------------
+# schema_version present in all serialized contracts (NFR-13)
+# ---------------------------------------------------------------------------
+
+def test_schema_version_present():
+    for obj in [make_brd(), make_channel_cal(), make_cal_result(), make_inversion_params()]:
+        d = json.loads(obj.to_json())
+        assert "schema_version" in d, f"Missing schema_version in {type(obj).__name__}"
+        assert d["schema_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# __post_init__ validation rejects invalid construction
+# ---------------------------------------------------------------------------
+
+def test_channel_calibration_rejects_bad_led_level():
+    with pytest.raises(ValueError, match="led_level"):
+        ChannelCalibration(channel="R", led_level=300, black_level=0.0, gain=1.0, clip_fraction=0.0)
+
+
+def test_channel_calibration_rejects_bad_channel():
+    with pytest.raises(ValueError, match="channel"):
+        ChannelCalibration(channel="X", led_level=128, black_level=0.0, gain=1.0, clip_fraction=0.0)
+
+
+def test_channel_calibration_rejects_zero_gain():
+    with pytest.raises(ValueError, match="gain"):
+        ChannelCalibration(channel="R", led_level=128, black_level=0.0, gain=0.0, clip_fraction=0.0)
+
+
+def test_channel_calibration_rejects_clip_fraction_overflow():
+    with pytest.raises(ValueError, match="clip_fraction"):
+        ChannelCalibration(channel="R", led_level=128, black_level=0.0, gain=1.0, clip_fraction=1.5)
+
+
+def test_base_region_descriptor_rejects_zero_width():
+    with pytest.raises(ValueError, match="w"):
+        BaseRegionDescriptor(
+            x=0, y=0, w=0, h=10,
+            base_rgb=(1.0, 1.0, 1.0), uniformity_cv=1.0, source="auto",
+        )
+
+
+def test_base_region_descriptor_rejects_bad_source():
+    with pytest.raises(ValueError, match="source"):
+        BaseRegionDescriptor(
+            x=0, y=0, w=10, h=10,
+            base_rgb=(1.0, 1.0, 1.0), uniformity_cv=1.0, source="green",
+        )
+
+
+def test_inversion_params_rejects_zero_gamma():
+    with pytest.raises(ValueError, match="gamma"):
+        InversionParams(
+            base_target=1000.0,
+            black_point_r=0.0, black_point_g=0.0, black_point_b=0.0,
+            white_point_r=8000.0, white_point_g=8000.0, white_point_b=8000.0,
+            tone_curve_id="linear",
+            tone_curve_params=(),
+            gamma=0.0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tuple-coercion: base_rgb and tone_curve_params survive list→tuple round-trip
+# ---------------------------------------------------------------------------
+
+def test_base_rgb_is_tuple_after_construction_from_list():
+    """Pitfall 1: base_rgb passed as list must be coerced to tuple by __post_init__."""
+    brd = BaseRegionDescriptor(
+        x=0, y=0, w=10, h=10,
+        base_rgb=[8930.0, 12097.0, 2952.0],  # type: ignore[arg-type]  # deliberate list
+        uniformity_cv=1.0, source="auto",
+    )
+    assert isinstance(brd.base_rgb, tuple)
+
+
+def test_tone_curve_params_is_tuple_after_construction_from_list():
+    """Pitfall 1 (InversionParams): tone_curve_params passed as list must be coerced."""
+    ip = InversionParams(
+        base_target=1000.0,
+        black_point_r=0.0, black_point_g=0.0, black_point_b=0.0,
+        white_point_r=8000.0, white_point_g=8000.0, white_point_b=8000.0,
+        tone_curve_id="linear",
+        tone_curve_params=[1.0, 0.0],  # type: ignore[arg-type]  # deliberate list
+        gamma=1.0,
+    )
+    assert isinstance(ip.tone_curve_params, tuple)
