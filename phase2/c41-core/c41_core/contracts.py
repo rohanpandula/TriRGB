@@ -48,6 +48,7 @@ __all__ = [
     "CalibrationResult",
     "InversionParams",
     "FlatFieldResult",
+    "CheckResult",
 ]
 
 
@@ -403,3 +404,55 @@ class FlatFieldResult(JsonContract):
                 raise ValueError(f"{name} must be finite, got {val}")
             if val < 0:
                 raise ValueError(f"{name} must be >= 0, got {val}")
+
+
+# ---------------------------------------------------------------------------
+# CheckResult
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class CheckResult(JsonContract):
+    """Generic pass/fail + deltas result for numeric QA checks (Phase 13 R-28).
+
+    Reused by check_registration, check_base_neutrality, check_frame_anomaly.
+
+    No from_json override needed: dict[str, float] round-trips through the
+    default mixin (cls(**json.loads(s))) natively — do NOT add one (Pitfall 4).
+    Adding a custom from_json here would be copying CalibrationResult's
+    nested-reconstruction override unnecessarily; all fields are primitives.
+
+    to_json(allow_nan=False) is inherited — a non-finite delta also fails at
+    serialization, so a NaN/inf numeric can never cross to the Swift wizard.
+    __post_init__ catches it first at construction time.
+
+    Fields
+    ------
+    name           : non-empty identifier string (e.g. "registration").
+    passed         : bool verdict — True = PASS, False = FAIL.
+    deltas         : dict[str, float] of named numeric deviations (all finite).
+    schema_version : bumped when fields are added.  Default 1.
+    """
+
+    name: str
+    passed: bool
+    deltas: dict[str, float]
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.name.strip():
+            raise ValueError(f"name must be non-empty, got {self.name!r}")
+        if not isinstance(self.passed, bool):
+            raise TypeError(f"passed must be bool, got {type(self.passed).__name__}")
+        if not isinstance(self.schema_version, int) or self.schema_version < 1:
+            raise ValueError(
+                f"schema_version must be int >= 1, got {self.schema_version!r}"
+            )
+        if not isinstance(self.deltas, dict):
+            raise TypeError(f"deltas must be dict, got {type(self.deltas).__name__}")
+        for k, v in self.deltas.items():
+            if not isinstance(k, str):
+                raise TypeError(
+                    f"deltas keys must be str, got {type(k).__name__}: {k!r}"
+                )
+            if not math.isfinite(float(v)):
+                raise ValueError(f"deltas[{k!r}] must be finite, got {v}")
