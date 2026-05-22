@@ -34,12 +34,13 @@ from pathlib import Path
 
 
 # Phase 06 added picker-/stepper-/toggle- control kinds (Settings + Calibration
-# views). Phase 07 added list- (the frame-status LazyVStack). parse_swift_enum
-# is prefix-agnostic, so the md parser must recognize the same prefixes or the
+# views). Phase 07 added list- (the frame-status LazyVStack). Phase 14 added
+# indicator- (the 4-step wizard progress circles). parse_swift_enum is
+# prefix-agnostic, so the md parser must recognize the same prefixes or the
 # two sources falsely diverge.
 _KNOWN_PREFIXES = (
     "btn-", "field-", "lbl-", "slider-", "scroll-",
-    "picker-", "stepper-", "toggle-", "list-",
+    "picker-", "stepper-", "toggle-", "list-", "indicator-",
 )
 _DEFAULT_SWIFT = "phase3/FilmScanner/Sources/ScanlightApp/AccessibilityIDs.swift"
 _DEFAULT_MD = "docs/ax-id-reference.md"

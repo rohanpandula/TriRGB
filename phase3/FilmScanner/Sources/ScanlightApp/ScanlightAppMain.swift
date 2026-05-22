@@ -5,19 +5,18 @@
 // bypass hardware. The ViewModel calls the factory on each connect() so
 // a fresh transport is created per connection attempt.
 //
-// Phase 07 four-tab shell:
+// Phase 14 four-tab shell:
 //   [0] Light     — ScanlightView (unchanged)
 //   [1] Settings  — ScanSettingsView
-//   [2] Calibrate — CalibrationView
+//   [2] Calibrate — CalibrationWizardView (Phase 14: 4-step guided calibration wizard)
 //   [3] Scan      — ScanView (Phase 07: scanning loop UI + port-state machine)
 //
 // All shared objects live in ScanHubRootView as @StateObjects so every tab
 // shares the same instance. The App's body just presents ScanHubRootView.
 //
-// Design note: ScanCoordinator references OrchestratorClient + ScanlightViewModel
-// passed at init time. Both are created first and passed in. SwiftUI guarantees
-// @StateObjects in a View are initialized before body is evaluated, so the
-// dependency order is safe.
+// Design note: ScanCoordinator and CalibrationWizardViewModel both reference
+// the SAME OrchestratorClient (created first in init) so the wizard and the
+// scan loop share the same server connection and _lock.
 //
 // No business logic lives here — this file only wires View + ViewModel.
 
@@ -43,28 +42,29 @@ struct ScanlightAppMain: App {
 /// SwiftUI processes @StateObject declarations top-to-bottom within a single
 /// view initializer, and our custom init creates the coordinator last.
 struct ScanHubRootView: View {
-    @StateObject private var settingsStore    = SettingsStore()
-    @StateObject private var orchestratorClient = OrchestratorClient()
-    @StateObject private var scanlightViewModel = ScanlightViewModel(
+    @StateObject private var settingsStore              = SettingsStore()
+    @StateObject private var orchestratorClient         = OrchestratorClient()
+    @StateObject private var scanlightViewModel         = ScanlightViewModel(
         transportFactory: FakeBridge.makeTransport
     )
-    // ScanCoordinator must be constructed AFTER the two objects it owns. We
-    // use a StateObject with a wrappedValue closure so Swift evaluates all three
-    // let-bindings in order before the StateObject's constructor runs. In a
-    // struct's synthesised memberwise init, @StateObject closures are evaluated
-    // lazily in property-declaration order, so scanCoordinator is created last.
+    // ScanCoordinator and CalibrationWizardViewModel must be constructed AFTER
+    // the two objects they depend on (client, lightVM). We use explicit init()
+    // to guarantee the construction order.
     @StateObject private var scanCoordinator: ScanCoordinator
+    @StateObject private var calibrationWizardViewModel: CalibrationWizardViewModel
 
     init() {
-        // Build the shared objects here so we can pass them into ScanCoordinator.
-        let client = OrchestratorClient()
+        // Build shared objects first so they can be passed to the coordinators.
+        let client  = OrchestratorClient()
         let lightVM = ScanlightViewModel(transportFactory: FakeBridge.makeTransport)
-        let coordinator = ScanCoordinator(client: client, lightViewModel: lightVM)
+        let coordinator       = ScanCoordinator(client: client, lightViewModel: lightVM)
+        let wizardVM          = CalibrationWizardViewModel(orchestratorClient: client)
 
-        _settingsStore        = StateObject(wrappedValue: SettingsStore())
-        _orchestratorClient   = StateObject(wrappedValue: client)
-        _scanlightViewModel   = StateObject(wrappedValue: lightVM)
-        _scanCoordinator      = StateObject(wrappedValue: coordinator)
+        _settingsStore                = StateObject(wrappedValue: SettingsStore())
+        _orchestratorClient           = StateObject(wrappedValue: client)
+        _scanlightViewModel           = StateObject(wrappedValue: lightVM)
+        _scanCoordinator              = StateObject(wrappedValue: coordinator)
+        _calibrationWizardViewModel   = StateObject(wrappedValue: wizardVM)
     }
 
     var body: some View {
@@ -75,7 +75,7 @@ struct ScanHubRootView: View {
             ScanSettingsView(store: settingsStore, orchestratorClient: orchestratorClient)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
 
-            CalibrationView(store: settingsStore, viewModel: scanlightViewModel)
+            CalibrationWizardView(viewModel: calibrationWizardViewModel, store: settingsStore)
                 .tabItem { Label("Calibrate", systemImage: "scope") }
 
             ScanView(coordinator: scanCoordinator, store: settingsStore)

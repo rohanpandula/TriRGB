@@ -3,14 +3,16 @@
 // Covers:
 //   R-20: Settings form validates input; Save Settings pushes applyRuntimeSettings
 //         when the orchestrator is running (testSaveSettingsPushesRuntimeSettings).
-//   R-21: CalibrationViewModel renders verdict table with injected stub runner
-//         (testCalibrationViewModelRendersVerdictWithStubRunner).
-//   NFR-09: Every new AX-ID has >= 1 rendered element (testNewAccessibilityIDsRendered).
+//   NFR-09: Every new Phase 06 AX-ID has >= 1 rendered element (testNewAccessibilityIDsRendered).
 //
-// Test strategy: unit tests (no app launch) for validation logic, CalibrationViewModel,
-// and the applyRuntimeSettings runtime push. A single XCUIApplication test
-// (testNewAccessibilityIDsRendered) covers the AX-ID coverage gate; it skips
-// gracefully in headless CI.
+// Note: R-21 (CalibrationViewModel stub-runner test) was removed in Phase 14 when
+// CalibrationView/CalibrationViewModel were replaced by the guided CalibrationWizardView.
+// The wizard's view-model is tested in CalibrationWizardViewModelTests.swift.
+//
+// Test strategy: unit tests (no app launch) for validation logic and the
+// applyRuntimeSettings runtime push. A single XCUIApplication test
+// (testNewAccessibilityIDsRendered) covers the Settings AX-ID coverage gate; it
+// skips gracefully in headless CI.
 //
 // URLProtocol injection for testSaveSettingsPushesRuntimeSettings mirrors the exact
 // pattern from OrchestratorClientTests (StubURLProtocol + makeStubSession).
@@ -32,10 +34,14 @@ final class SettingsCalibrationUITests: XCTestCase {
         StubURLProtocol.lastBody = nil
     }
 
-    // MARK: - AX-ID array (all 22 new cases)
+    // MARK: - AX-ID array (16 Settings-view cases)
 
-    /// All 22 new AccessibilityID string values introduced in Phase 06.
+    /// The 16 Settings-view AccessibilityID string values introduced in Phase 06.
     /// Using the type constants (not string literals) so a rename fails at compile time.
+    ///
+    /// Note: the 6 old Calibration-view IDs (calCaptureBtn, calVerdictR/G/B,
+    /// calOverallLabel, calUseBtn) were removed in Phase 14 along with
+    /// CalibrationView.swift/CalibrationViewModel.swift.
     private let newAccessibilityIDs: [String] = [
         // Settings view (16)
         AccessibilityID.settingsRollNameField,
@@ -54,22 +60,18 @@ final class SettingsCalibrationUITests: XCTestCase {
         AccessibilityID.settingsStreamToggle,
         AccessibilityID.settingsCompositeFormat,
         AccessibilityID.settingsSaveBtn,
-        // Calibration view (6)
-        AccessibilityID.calCaptureBtn,
-        AccessibilityID.calVerdictR,
-        AccessibilityID.calVerdictG,
-        AccessibilityID.calVerdictB,
-        AccessibilityID.calOverallLabel,
-        AccessibilityID.calUseBtn,
     ]
 
     // MARK: - Test 1: AX-ID coverage gate (requires window server)
 
-    /// Verify that every new AX-ID has at least one rendered SwiftUI element.
+    /// Verify that every Phase 06 Settings AX-ID has at least one rendered SwiftUI element.
     ///
     /// Requires accessibility permissions and a window server. Skips gracefully
-    /// when neither is available (headless CI, SSH). Navigates to both the
-    /// Settings and Calibrate tabs to cover all 22 IDs.
+    /// when neither is available (headless CI, SSH). Navigates to the Settings tab
+    /// to cover the 16 Settings IDs.
+    ///
+    /// Note: the 6 old Calibration-view IDs were removed in Phase 14.
+    /// The new wizard IDs are covered by CalibrationWizardUITests.
     func testNewAccessibilityIDsRendered() throws {
         let app = try makeFakeApp()
         app.launch()
@@ -83,25 +85,11 @@ final class SettingsCalibrationUITests: XCTestCase {
         let settingsTab = app.tabs["Settings"]
         if settingsTab.exists { settingsTab.click() }
 
-        let settingsIDs = Array(newAccessibilityIDs.prefix(16))
-        for id in settingsIDs {
+        for id in newAccessibilityIDs {
             let matches = app.descendants(matching: .any).matching(identifier: id)
             XCTAssertGreaterThanOrEqual(
                 matches.count, 1,
                 "New Settings AccessibilityID '\(id)' has zero rendered descendants"
-            )
-        }
-
-        // Navigate to the Calibrate tab and check the 6 Calibration AX-IDs.
-        let calibrateTab = app.tabs["Calibrate"]
-        if calibrateTab.exists { calibrateTab.click() }
-
-        let calIDs = Array(newAccessibilityIDs.suffix(6))
-        for id in calIDs {
-            let matches = app.descendants(matching: .any).matching(identifier: id)
-            XCTAssertGreaterThanOrEqual(
-                matches.count, 1,
-                "New Calibration AccessibilityID '\(id)' has zero rendered descendants"
             )
         }
     }
@@ -158,78 +146,7 @@ final class SettingsCalibrationUITests: XCTestCase {
                      "SDK trigger should not require iedInbox, got: \(errors["iedInbox"] ?? "nil")")
     }
 
-    // MARK: - Test 6: CalibrationViewModel renders verdict table with stub runner
-
-    /// Unit test — no app launch.
-    /// Injects a stub runner that returns a known CalibrationResult and verifies
-    /// that runCalibration() populates @Published result/isRunning correctly.
-    func testCalibrationViewModelRendersVerdictWithStubRunner() async throws {
-        // Build a known CalibrationResult with three distinct verdicts.
-        let stubResult = CalibrationResult(
-            channels: [
-                "R": ChannelCalResult(falloffPct: 5.0, uniformityPct: 1.0, verdict: "clean"),
-                "G": ChannelCalResult(falloffPct: 8.0, uniformityPct: 2.0, verdict: "acceptable"),
-                "B": ChannelCalResult(falloffPct: 4.0, uniformityPct: 1.5, verdict: "fail"),
-            ],
-            overall: "fail"
-        )
-
-        let viewModel = CalibrationViewModel()
-        // Inject stub runner. The real runner would spawn processes; this closure
-        // returns a canned result. The calDir param is a real directory (runCalibration
-        // creates it on disk); the stub ignores the path and returns stubResult.
-        viewModel.calibrationRunner = { _ in return stubResult }
-
-        await viewModel.runCalibration()
-
-        XCTAssertFalse(viewModel.isRunning,
-                       "isRunning must be false after runCalibration() completes")
-        XCTAssertNotNil(viewModel.result,
-                        "result must be non-nil after a successful run")
-        XCTAssertEqual(viewModel.result?.overall, "fail",
-                       "Expected overall 'fail', got: \(viewModel.result?.overall ?? "nil")")
-        XCTAssertEqual(viewModel.result?.channelR?.verdict, "clean",
-                       "Expected R verdict 'clean', got: \(viewModel.result?.channelR?.verdict ?? "nil")")
-        XCTAssertEqual(viewModel.result?.channelG?.verdict, "acceptable",
-                       "Expected G verdict 'acceptable', got: \(viewModel.result?.channelG?.verdict ?? "nil")")
-        XCTAssertEqual(viewModel.result?.channelB?.verdict, "fail",
-                       "Expected B verdict 'fail', got: \(viewModel.result?.channelB?.verdict ?? "nil")")
-        XCTAssertNil(viewModel.lastError,
-                     "lastError should be nil after a successful run, got: \(viewModel.lastError ?? "nil")")
-    }
-
-    // MARK: - Test 7: "Use this calibration" sets FFC path
-
-    /// Unit test — no app launch.
-    /// After a successful runCalibration(), applyCalibration(to:) must write the
-    /// session directory path to store.settings.ffcCalibration and
-    /// store.lastCalibrationDir.
-    func testUseCalibrationSetsFfcPath() async throws {
-        let store = SettingsStore()
-        let viewModel = CalibrationViewModel()
-
-        let stubResult = CalibrationResult(
-            channels: [
-                "R": ChannelCalResult(falloffPct: 5.0, uniformityPct: 1.0, verdict: "clean"),
-                "G": ChannelCalResult(falloffPct: 8.0, uniformityPct: 2.0, verdict: "acceptable"),
-                "B": ChannelCalResult(falloffPct: 4.0, uniformityPct: 1.5, verdict: "fail"),
-            ],
-            overall: "fail"
-        )
-        viewModel.calibrationRunner = { _ in return stubResult }
-
-        await viewModel.runCalibration()
-        viewModel.applyCalibration(to: store)
-
-        XCTAssertNotNil(viewModel.lastCalDir,
-                        "lastCalDir must be non-nil after a successful run")
-        XCTAssertEqual(store.settings.ffcCalibration, viewModel.lastCalDir?.path,
-                       "store.settings.ffcCalibration must equal lastCalDir.path")
-        XCTAssertEqual(store.lastCalibrationDir, viewModel.lastCalDir?.path,
-                       "store.lastCalibrationDir must equal lastCalDir.path")
-    }
-
-    // MARK: - Test 8: Save Settings pushes applyRuntimeSettings when orchestrator is running
+    // MARK: - Test 6: Save Settings pushes applyRuntimeSettings when orchestrator is running
 
     /// Unit test — no app launch.
     ///

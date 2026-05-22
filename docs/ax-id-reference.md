@@ -7,7 +7,7 @@ has exactly one row. For the GUI ↔ CLI mapping and the schema explanation, see
 `docs/automation.md`. A consistency-check script enforces that this file and
 the Swift enum agree.
 
-**Schema version:** 1
+**Schema version:** 2
 
 ### Connection
 
@@ -78,17 +78,6 @@ the Swift enum agree.
 | picker-composite-format | Composite format | picker |
 | btn-save-settings | Save Settings | button |
 
-### Calibration (Phase 06)
-
-| ID constant | Display label | Type/control |
-|---|---|---|
-| btn-capture-calibration | Capture Calibration | button |
-| lbl-cal-verdict-r | Red channel verdict | label |
-| lbl-cal-verdict-g | Green channel verdict | label |
-| lbl-cal-verdict-b | Blue channel verdict | label |
-| lbl-cal-overall | Overall verdict | label |
-| btn-use-calibration | Use this calibration | button |
-
 ### Scan (Phase 07)
 
 | ID constant | Display label | Type/control |
@@ -102,6 +91,55 @@ the Swift enum agree.
 | lbl-composite-queue | Composite queue depth | label |
 | lbl-light-locked | Light locked (controlled by scan) | label |
 | btn-reconnect-light | Reconnect Light | button |
+
+### Calibration Wizard (Phase 14)
+
+| ID constant | Display label | Type/control |
+|---|---|---|
+| indicator-wizard-step-1 | Step 1 — Rig Check | step indicator circle |
+| indicator-wizard-step-2 | Step 2 — Exposure | step indicator circle |
+| indicator-wizard-step-3 | Step 3 — Flat Field | step indicator circle |
+| indicator-wizard-step-4 | Step 4 — Results | step indicator circle |
+| btn-wizard-back | Back | button |
+| btn-wizard-next | Next / primary action | button |
+| btn-wizard-rerun | Re-run | button |
+| lbl-rig-light | Light panel status | label |
+| lbl-rig-firmware | Firmware status | label |
+| lbl-rig-camera | Camera reachable status | label |
+| lbl-rig-folder | Output folder status | label |
+| lbl-exp-clip-r | R channel clip fraction | label |
+| lbl-exp-clip-g | G channel clip fraction | label |
+| lbl-exp-clip-b | B channel clip fraction | label |
+| lbl-exp-level-r | R channel LED level | label |
+| lbl-exp-level-g | G channel LED level | label |
+| lbl-exp-level-b | B channel LED level | label |
+| lbl-exp-verdict-r | R channel exposure verdict | label |
+| lbl-exp-verdict-g | G channel exposure verdict | label |
+| lbl-exp-verdict-b | B channel exposure verdict | label |
+| lbl-exp-overall | Overall exposure verdict | label |
+| picker-rebate | Rebate region picker | label |
+| btn-rebate-clear | Auto-detect rebate | button |
+| lbl-ffc-falloff-r | R channel falloff | label |
+| lbl-ffc-falloff-g | G channel falloff | label |
+| lbl-ffc-falloff-b | B channel falloff | label |
+| lbl-ffc-uniformity-r | R channel uniformity | label |
+| lbl-ffc-uniformity-g | G channel uniformity | label |
+| lbl-ffc-uniformity-b | B channel uniformity | label |
+| lbl-ffc-verdict-r | R channel FFC verdict | label |
+| lbl-ffc-verdict-g | G channel FFC verdict | label |
+| lbl-ffc-verdict-b | B channel FFC verdict | label |
+| lbl-ffc-overall | Overall FFC verdict | label |
+| lbl-ffc-frames | Frames averaged | label |
+| btn-ffc-use | Use this calibration | button |
+| lbl-results-shift-rg | R-G registration shift | label |
+| lbl-results-shift-gb | G-B registration shift | label |
+| lbl-results-reg-verdict | Registration verdict | label |
+| lbl-results-base-dev | Base deviation | label |
+| lbl-results-base-verdict | Base neutrality verdict | label |
+| lbl-results-gain-r | R channel gain | label |
+| lbl-results-gain-g | G channel gain | label |
+| lbl-results-gain-b | B channel gain | label |
+| lbl-results-roll-verdict | Roll-level calibration verdict | label |
 
 To add a new AX-ID, add the constant to `AccessibilityIDs.swift` first, then
 add a row here. The consistency-check script

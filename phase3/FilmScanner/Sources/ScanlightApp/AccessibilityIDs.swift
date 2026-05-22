@@ -27,7 +27,7 @@ public enum AccessibilityID {
     /// Version of the AX-ID schema. AI agents and external tests should
     /// check this matches what they expect before relying on individual
     /// IDs. Bump when an existing ID is renamed or removed.
-    public static let schemaVersion = "1"
+    public static let schemaVersion = "2"
 
     // MARK: - Connection
 
@@ -87,15 +87,6 @@ public enum AccessibilityID {
     public static let settingsStreamToggle       = "toggle-stream-composite"
     public static let settingsCompositeFormat    = "picker-composite-format"
     public static let settingsSaveBtn            = "btn-save-settings"
-
-    // MARK: - Calibration view
-
-    public static let calCaptureBtn              = "btn-capture-calibration"
-    public static let calVerdictR                = "lbl-cal-verdict-r"
-    public static let calVerdictG                = "lbl-cal-verdict-g"
-    public static let calVerdictB                = "lbl-cal-verdict-b"
-    public static let calOverallLabel            = "lbl-cal-overall"
-    public static let calUseBtn                  = "btn-use-calibration"
 
     // MARK: - Calibration Wizard (Phase 14)
 
