@@ -27,10 +27,7 @@ struct CalibrationWizardView: View {
             VStack(spacing: Theme.Space.section) {
 
                 // --- Sticky progress indicator ---
-                WizardProgressView(
-                    currentStep: viewModel.currentStep,
-                    completedSteps: viewModel.currentStep - 1
-                )
+                WizardProgressView(currentStep: viewModel.currentStep)
 
                 // --- Active step container ---
                 Group {
@@ -193,10 +190,17 @@ private struct Step1RigCheckView: View {
 
     @ViewBuilder
     private func rigCheckRows(state: OrchestratorState) -> some View {
+        // Pre-hardware, OrchestratorState exposes no per-device health; light/camera/firmware
+        // all reflect scanner-service availability (isRunning). Real per-device probes are an
+        // M2 refinement (see 14-VALIDATION.md manual-only). The duplication is intentional and
+        // documented here so a future contributor knows to wire real per-device fields from
+        // OrchestratorState when the hardware API is extended.
         let lightConnected = viewModel.orchestratorClient.isRunning
         let firmwareText: String = state.levelR > 0 ? "OK" : "UNKNOWN"
         let firmwareTint: Color = state.levelR > 0 ? Theme.State.success : Theme.State.warning
         let cameraReachable = viewModel.orchestratorClient.isRunning
+        // Output-folder probe is a genuine distinct signal: non-empty means the Python server
+        // has a configured working directory (different from the scanner-service liveness check).
         let folderOK = !state.outputFolder.isEmpty
 
         // Light panel probe
@@ -350,8 +354,8 @@ private struct Step2ExposureView: View {
 
         Divider()
 
-        // Overall verdict
-        let allPass = result.r.clipFraction < 0.95 && result.g.clipFraction < 0.95 && result.b.clipFraction < 0.95
+        // Overall verdict — PASS = under-clipped: <5% of rebate pixels saturated (clip_fraction near 0 is well-exposed)
+        let allPass = result.r.clipFraction < 0.05 && result.g.clipFraction < 0.05 && result.b.clipFraction < 0.05
         let overallVerdict = allPass ? "PASS" : "FAIL"
         LabeledValue(label: "Overall") {
             Chip(
@@ -372,7 +376,8 @@ private struct Step2ExposureView: View {
         verdictID: String
     ) -> some View {
         let clipPct = cal.clipFraction * 100.0
-        let passed = cal.clipFraction < 0.95
+        // PASS = under-clipped: <5% of rebate pixels saturated (clip_fraction near 0 is well-exposed)
+        let passed = cal.clipFraction < 0.05
 
         HStack {
             // Channel initial — plain text, NO colored dot (SC-2)

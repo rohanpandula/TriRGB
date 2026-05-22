@@ -13,7 +13,7 @@ import SwiftUI
 struct WizardProgressView: View {
 
     let currentStep: Int       // 1–4, the active step
-    let completedSteps: Int    // number of steps fully completed (0–3)
+    // completedSteps removed — circleState(for:) derives completion from currentStep alone
 
     var body: some View {
         HStack(spacing: 0) {
