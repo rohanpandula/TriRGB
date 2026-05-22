@@ -516,11 +516,13 @@ final class OrchestratorClient: ObservableObject {
             let body = String(data: data, encoding: .utf8) ?? ""
             throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
         }
-        // Use a plain JSONDecoder (no .convertFromSnakeCase) so that
-        // CalibrationResult's explicit CodingKeys for falloff_pct/uniformity_pct
-        // are matched against the original JSON keys rather than the already-converted
-        // camelCase forms. FlatFieldResponse and WizardFlatFieldResult use explicit
-        // CodingKeys for their own snake_case → camelCase mapping.
+        // Use a plain JSONDecoder (no .convertFromSnakeCase) for FlatFieldResponse.
+        // BOTH nested types use explicit CodingKeys with snake_case raw values:
+        //   - WizardFlatFieldResult: explicit CodingKeys ("flat_data_path", etc.)
+        //   - CalibrationResult: explicit CodingKeys ("falloff_pct", "uniformity_pct", etc.)
+        // Adding .convertFromSnakeCase would transform JSON keys BEFORE matching explicit
+        // CodingKeys, breaking both types (the decoder would look for already-camelCased
+        // keys but the raw values in CodingKeys still reference the original snake_case).
         let decoder = JSONDecoder()
         return try decoder.decode(FlatFieldResponse.self, from: data)
     }

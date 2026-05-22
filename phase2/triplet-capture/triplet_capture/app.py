@@ -79,10 +79,11 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     @app.post("/api/calibrate/exposure")
     def post_calibrate_exposure():
         orch = app.config["ORCHESTRATOR"]
-        # 409 if a capture is already in flight (non-blocking lock probe)
+        # Best-effort concurrent-scan check (409). Not a hard barrier — capture_triplet's
+        # internal _lock is the true serializer. This probe is a UX convenience only.
         lock_acquired = orch._lock.acquire(blocking=False)
         if not lock_acquired:
-            return jsonify({"error": "capture in progress — try again after scan completes"}), 409
+            return jsonify({"error": "A scan is in progress — wait for it to finish."}), 409
         orch._lock.release()
 
         data = request.get_json(force=True, silent=True) or {}
@@ -143,9 +144,11 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     @app.post("/api/calibrate/ffc")
     def post_calibrate_ffc():
         orch = app.config["ORCHESTRATOR"]
+        # Best-effort concurrent-scan check (409). Not a hard barrier — capture_triplet's
+        # internal _lock is the true serializer. This probe is a UX convenience only.
         lock_acquired = orch._lock.acquire(blocking=False)
         if not lock_acquired:
-            return jsonify({"error": "capture in progress — try again after scan completes"}), 409
+            return jsonify({"error": "A scan is in progress — wait for it to finish."}), 409
         orch._lock.release()
 
         data = request.get_json(force=True, silent=True) or {}
@@ -180,6 +183,13 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             # `from rgb_composite.ffc import _box_filter_2d` inside _cv().
             # Once "rgb_composite.ffc" is in sys.modules Python finds the cached
             # module without executing __init__.py.
+            #
+            # WR-02 note: this bypass keeps the route hardware-free for TESTS (via the
+            # injected FLAT_DEMOSAIC_FN). The PRODUCTION real-demosaic path calls
+            # _demosaic_cal_frame → `from .composite import demosaic_linear` (relative
+            # import inside ffc.py), which requires rawpy at runtime. rawpy IS present on
+            # real hardware (M2). Do NOT pre-load rgb_composite.composite here — composite.py
+            # imports rawpy at module level, which would break the hardware-free invariant.
             if "rgb_composite.ffc" not in sys.modules:
                 _ffc_path = _phase2_rgb / "rgb_composite" / "ffc.py"
                 _ffc_spec = _util.spec_from_file_location("rgb_composite.ffc", str(_ffc_path))
@@ -265,7 +275,14 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                 _cspec = _util.spec_from_file_location("_rgb_composite_checks", str(_checks_path))
                 _checks_mod = _util.module_from_spec(_cspec)
                 sys.modules["_rgb_composite_checks"] = _checks_mod
-                _cspec.loader.exec_module(_checks_mod)
+                try:
+                    _cspec.loader.exec_module(_checks_mod)
+                except ImportError as _ie:
+                    # cv2 (or another checks.py dependency) is missing; return a clean error
+                    # rather than an opaque traceback. cv2 is present via rgb-composite on real
+                    # hardware, so this is a defensive guard for non-standard environments.
+                    del sys.modules["_rgb_composite_checks"]
+                    return jsonify({"error": f"checks module missing dependency: {_ie}"}), 500
             check_base_neutrality = _checks_mod.check_base_neutrality
             check_registration = _checks_mod.check_registration
             # frame_anomaly (per-frame vs roll baseline) is a roll-level check — deferred
