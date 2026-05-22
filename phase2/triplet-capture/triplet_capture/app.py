@@ -152,12 +152,25 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
         orch._lock.release()
 
         data = request.get_json(force=True, silent=True) or {}
-        n_frames = int(data.get("n_frames", 8))
+        try:
+            n_frames = int(data.get("n_frames", 8))
+        except (ValueError, TypeError):
+            return jsonify({"error": "n_frames must be an integer"}), 400
 
         # Get black levels from last calibration or defaults
         last_cal = app.config.get("LAST_CAL_RESULT", None)
         if last_cal is not None:
             black_levels = (last_cal.r, last_cal.g, last_cal.b)
+            # FIX-C: restore the orchestrator to calibrated per-channel LED levels before
+            # capturing flats. calibrate_exposure leaves the orchestrator at its last
+            # single-channel probe state (only one channel lit at a time), so flats would
+            # be captured at wrong/dark levels on hardware without this restore.
+            # Pre-hardware tests use an injected FLAT_DEMOSAIC_FN so levels don't affect them.
+            orch.update_settings(
+                level_r=last_cal.r.led_level,
+                level_g=last_cal.g.led_level,
+                level_b=last_cal.b.led_level,
+            )
         else:
             from c41_core import ChannelCalibration
             black_levels = (

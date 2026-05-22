@@ -599,29 +599,60 @@ private struct Step4ResultsView: View {
         // Sub-section A: Registration
         Text("Registration").font(.headline)
 
-        let rgShift = regCheck?.deltas["rg_shift"] ?? 0.0
-        let gbShift = regCheck?.deltas["gb_shift"] ?? 0.0
+        // FIX-B: Phase 13 check_registration emits component keys (g_vs_r_dx/dy, b_vs_r_dx/dy).
+        // Compute magnitude per pair; fall back to 0 so the format string stays numeric.
+        let regDeltas = regCheck?.deltas ?? [:]
+        let rgShift = regDeltas.isEmpty ? nil : hypot(regDeltas["g_vs_r_dx"] ?? 0.0, regDeltas["g_vs_r_dy"] ?? 0.0)
+        let gbShift = regDeltas.isEmpty ? nil : hypot(regDeltas["b_vs_r_dx"] ?? 0.0, regDeltas["b_vs_r_dy"] ?? 0.0)
+        // FIX-A: registration with empty deltas = "not available" (no captured frames yet).
+        // Show a neutral info row rather than a 0.00 px PASS/FAIL Chip.
         let regPassed = regCheck?.passed ?? false
+        let regAvailable = !regDeltas.isEmpty
 
-        LabeledValue(label: "R-G shift") {
-            Text(String(format: "%.2f px", rgShift))
-                .font(.body.monospacedDigit())
-                .accessibilityIdentifier(AccessibilityID.resultsShiftRG)
-                .accessibilityValue(String(format: "%.2f px", rgShift))
-        }
-        LabeledValue(label: "G-B shift") {
-            Text(String(format: "%.2f px", gbShift))
-                .font(.body.monospacedDigit())
-                .accessibilityIdentifier(AccessibilityID.resultsShiftGB)
-                .accessibilityValue(String(format: "%.2f px", gbShift))
-        }
-        LabeledValue(label: "Registration") {
-            Chip(
-                text: regPassed ? "PASS" : "FAIL",
-                tint: regPassed ? Theme.State.success : Theme.State.danger
-            )
-            .accessibilityIdentifier(AccessibilityID.resultsRegVerdict)
-            .accessibilityValue(regPassed ? "PASS" : "FAIL")
+        if regAvailable, let rgMag = rgShift, let gbMag = gbShift {
+            LabeledValue(label: "G vs R shift") {
+                Text(String(format: "%.2f px", rgMag))
+                    .font(.body.monospacedDigit())
+                    .accessibilityIdentifier(AccessibilityID.resultsShiftRG)
+                    .accessibilityValue(String(format: "%.2f px", rgMag))
+            }
+            LabeledValue(label: "B vs R shift") {
+                Text(String(format: "%.2f px", gbMag))
+                    .font(.body.monospacedDigit())
+                    .accessibilityIdentifier(AccessibilityID.resultsShiftGB)
+                    .accessibilityValue(String(format: "%.2f px", gbMag))
+            }
+            LabeledValue(label: "Registration") {
+                Chip(
+                    text: regPassed ? "PASS" : "FAIL",
+                    tint: regPassed ? Theme.State.success : Theme.State.danger
+                )
+                .accessibilityIdentifier(AccessibilityID.resultsRegVerdict)
+                .accessibilityValue(regPassed ? "PASS" : "FAIL")
+            }
+        } else {
+            // No captured frames yet — registration runs on hardware (M2) against a real triplet.
+            LabeledValue(label: "G vs R shift") {
+                Text("—")
+                    .font(.body.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier(AccessibilityID.resultsShiftRG)
+                    .accessibilityValue("not available")
+            }
+            LabeledValue(label: "B vs R shift") {
+                Text("—")
+                    .font(.body.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier(AccessibilityID.resultsShiftGB)
+                    .accessibilityValue("not available")
+            }
+            LabeledValue(label: "Registration") {
+                Text("Not available — needs captured frames (runs on hardware, M2)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier(AccessibilityID.resultsRegVerdict)
+                    .accessibilityValue("not available")
+            }
         }
 
         Divider()
@@ -675,7 +706,11 @@ private struct Step4ResultsView: View {
         }
 
         // Sub-section D: Roll-Level Summary
-        let rollPassed = checks.allSatisfy { $0.passed }
+        // FIX-A: exclude checks with empty deltas ("not available") from the verdict.
+        // Registration has empty deltas pre-hardware; base_neutrality always has real
+        // deltas and is the effective gate. allSatisfy on an empty collection is true,
+        // which is the correct neutral fallback when nothing is measurable yet.
+        let rollPassed = checks.filter { !$0.deltas.isEmpty }.allSatisfy { $0.passed }
         LabeledValue(label: "Calibration") {
             Chip(
                 text: rollPassed ? "PASS" : "FAIL",

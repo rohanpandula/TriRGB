@@ -207,6 +207,19 @@ def test_calibrate_ffc_route(app_and_orch):
         assert "verdict" in ch_data, f"missing verdict in inspection.channels.{ch}"
 
 
+def test_calibrate_ffc_n_frames_bad_input_returns_400(app_and_orch):
+    """FIX-D: non-integer n_frames must return 400, not 500."""
+    app, _ = app_and_orch
+    client = app.test_client()
+
+    r = client.post("/api/calibrate/ffc", json={"n_frames": "not_an_int"})
+    assert r.status_code == 400, (
+        f"expected 400 for non-int n_frames, got {r.status_code}: {r.data}"
+    )
+    body = r.get_json()
+    assert "error" in body, f"expected {{error}} key in 400 response, got: {body}"
+
+
 def test_calibrate_checks_route(app_and_orch):
     """POST /api/calibrate/checks returns 200 with a CheckResult array after prior exposure."""
     app, _ = app_and_orch

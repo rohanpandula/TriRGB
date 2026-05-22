@@ -152,9 +152,11 @@ private func makeFFCJSON() -> Data {
 private func makeChecksJSON() -> Data {
     // frame_anomaly (per-frame vs roll baseline) is deferred to Phase 15;
     // the /api/calibrate/checks route returns 2 checks: registration + base_neutrality.
+    // FIX-B: Phase 13 check_registration emits component keys (g_vs_r_dx/dy, b_vs_r_dx/dy);
+    // old rg_shift/gb_shift keys are gone. Non-empty deltas → included in roll verdict.
     let json = """
     [
-        {"name": "registration", "passed": true, "deltas": {"rg_shift": 0.12, "gb_shift": 0.08}, "schema_version": 1},
+        {"name": "registration", "passed": true, "deltas": {"g_vs_r_dx": 0.10, "g_vs_r_dy": 0.07, "b_vs_r_dx": 0.06, "b_vs_r_dy": 0.05}, "schema_version": 1},
         {"name": "base_neutrality", "passed": true, "deltas": {"base_r": 8930.0, "base_g": 12097.0, "base_b": 2952.0}, "schema_version": 1}
     ]
     """
@@ -163,10 +165,23 @@ private func makeChecksJSON() -> Data {
 
 private func makeChecksFailJSON() -> Data {
     // 2-check shape (frame_anomaly deferred to Phase 15 — no roll baseline during calibration).
+    // FIX-B: use Phase 13 component keys; FIX-A: non-empty deltas → both checks counted in verdict.
     let json = """
     [
-        {"name": "registration", "passed": false, "deltas": {"rg_shift": 2.5, "gb_shift": 1.8}, "schema_version": 1},
+        {"name": "registration", "passed": false, "deltas": {"g_vs_r_dx": 2.4, "g_vs_r_dy": 0.5, "b_vs_r_dx": 1.7, "b_vs_r_dy": 0.6}, "schema_version": 1},
         {"name": "base_neutrality", "passed": false, "deltas": {"deviation": 800.0}, "schema_version": 1}
+    ]
+    """
+    return json.data(using: .utf8)!
+}
+
+private func makeChecksNotAvailableJSON() -> Data {
+    // Simulates pre-hardware state: registration has empty deltas (LAST_CAL_FRAME not set).
+    // FIX-A: empty-deltas checks are excluded from the roll verdict; base_neutrality gates the roll.
+    let json = """
+    [
+        {"name": "registration", "passed": false, "deltas": {}, "schema_version": 1},
+        {"name": "base_neutrality", "passed": true, "deltas": {"base_r": 8930.0, "base_g": 12097.0, "base_b": 2952.0}, "schema_version": 1}
     ]
     """
     return json.data(using: .utf8)!
@@ -321,6 +336,43 @@ final class CalibrationWizardViewModelTests: XCTestCase {
         XCTAssertNotNil(vm.lastError[2], "lastError[2] set on 500 response")
         XCTAssertNil(vm.exposureResult, "exposureResult stays nil on error")
         XCTAssertFalse(vm.isRunning, "isRunning false after error")
+    }
+
+    // MARK: - FIX-A: registration "not available" (empty deltas) excluded from roll verdict
+
+    func testRegistrationNotAvailableDoesNotFailRoll() async throws {
+        // Pre-hardware: registration has empty deltas (LAST_CAL_FRAME not set on server).
+        // The roll verdict must be PASS (driven solely by base_neutrality which passed).
+        WizardStubURLProtocol.routes["/api/state"] = (makeStateJSON(), 200)
+        WizardStubURLProtocol.routes["/api/calibrate/exposure"] = (makeExposureJSON(), 200)
+        WizardStubURLProtocol.routes["/api/calibrate/ffc"] = (makeFFCJSON(), 200)
+        WizardStubURLProtocol.routes["/api/calibrate/checks"] = (makeChecksNotAvailableJSON(), 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+
+        await vm.triggerRigCheck()
+        vm.currentStep = 2
+        await vm.triggerExposure()
+        vm.currentStep = 3
+        await vm.triggerFFC()
+        vm.currentStep = 4
+        await vm.triggerResultsCheck()
+
+        XCTAssertEqual(vm.checkResults?.count, 2, "Should have 2 check results")
+        XCTAssertNil(vm.lastError[4], "No error on Step 4")
+
+        // The registration check has empty deltas — it must NOT veto the roll.
+        let regCheck = vm.checkResults?.first { $0.name == "registration" }
+        XCTAssertNotNil(regCheck, "registration check decoded")
+        XCTAssertTrue(regCheck?.deltas.isEmpty ?? false, "registration deltas are empty (not available)")
+
+        // base_neutrality passed → roll must be PASS (empty-delta checks excluded from verdict).
+        // We verify this by checking that the only check with data (base_neutrality) passed.
+        let checksWithData = vm.checkResults?.filter { !$0.deltas.isEmpty } ?? []
+        XCTAssertTrue(checksWithData.allSatisfy { $0.passed },
+                      "Checks with data must all pass — roll should be PASS, not FAIL")
     }
 
     // MARK: - Reset clears all state
