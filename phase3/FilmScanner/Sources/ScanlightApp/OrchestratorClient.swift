@@ -444,6 +444,115 @@ final class OrchestratorClient: ObservableObject {
         return try decoder.decode(TripletOutcome.self, from: data)
     }
 
+    // MARK: - Calibration wizard methods (Phase 14)
+
+    /// Run exposure calibration via POST /api/calibrate/exposure.
+    ///
+    /// - Parameters:
+    ///   - rebateCol: Optional column index of the rebate region (auto-detect when nil).
+    ///   - rebateRow: Optional row index of the rebate region (auto-detect when nil).
+    ///   - rebateW: Rebate region width in pixels (default 100).
+    ///   - rebateH: Rebate region height in pixels (default 20).
+    /// - Returns: `ExposureCalibrationResult` decoded from the snake_case JSON.
+    /// - Throws: `OrchestratorError.httpError` for non-200 responses (includes 409 conflict).
+    func calibrateExposure(
+        rebateCol: Int? = nil,
+        rebateRow: Int? = nil,
+        rebateW: Int = 100,
+        rebateH: Int = 20
+    ) async throws -> ExposureCalibrationResult {
+        let url = URL(string: "http://127.0.0.1:\(webPort)/api/calibrate/exposure")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        var body: [String: Any] = ["rebate_w": rebateW, "rebate_h": rebateH]
+        if let col = rebateCol, let row = rebateRow {
+            body["rebate_col"] = col
+            body["rebate_row"] = row
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OrchestratorError.invalidResponse(statusCode: 0)
+        }
+        guard http.statusCode == 200 else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(ExposureCalibrationResult.self, from: data)
+    }
+
+    /// Capture flat frames via POST /api/calibrate/ffc.
+    ///
+    /// - Parameter exposureResult: The result of the prior exposure calibration,
+    ///   used to send led_level_{r,g,b} + black_level_{r,g,b} in the request body.
+    /// - Returns: `FlatFieldResponse` with flat_field metadata and the inspection dict.
+    /// - Throws: `OrchestratorError.httpError` for non-200 responses.
+    func calibrateFFC(exposureResult: ExposureCalibrationResult) async throws -> FlatFieldResponse {
+        let url = URL(string: "http://127.0.0.1:\(webPort)/api/calibrate/ffc")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: Any] = [
+            "led_level_r":   exposureResult.r.ledLevel,
+            "led_level_g":   exposureResult.g.ledLevel,
+            "led_level_b":   exposureResult.b.ledLevel,
+            "black_level_r": exposureResult.r.blackLevel,
+            "black_level_g": exposureResult.g.blackLevel,
+            "black_level_b": exposureResult.b.blackLevel,
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OrchestratorError.invalidResponse(statusCode: 0)
+        }
+        guard http.statusCode == 200 else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
+        }
+        // Use a plain JSONDecoder (no .convertFromSnakeCase) so that
+        // CalibrationResult's explicit CodingKeys for falloff_pct/uniformity_pct
+        // are matched against the original JSON keys rather than the already-converted
+        // camelCase forms. FlatFieldResponse and WizardFlatFieldResult use explicit
+        // CodingKeys for their own snake_case → camelCase mapping.
+        let decoder = JSONDecoder()
+        return try decoder.decode(FlatFieldResponse.self, from: data)
+    }
+
+    /// Run calibration checks via POST /api/calibrate/checks.
+    ///
+    /// Swift sends an empty body; the route reads app.config["LAST_CAL_RESULT"]
+    /// set by the prior exposure route. Must be called after calibrateExposure.
+    ///
+    /// - Returns: Array of `WizardCheckResult` (registration, base_neutrality, frame_anomaly).
+    /// - Throws: `OrchestratorError.httpError` for non-200 responses (includes 409 if
+    ///   no prior exposure result is stored).
+    func calibrateChecks() async throws -> [WizardCheckResult] {
+        let url = URL(string: "http://127.0.0.1:\(webPort)/api/calibrate/checks")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [:])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OrchestratorError.invalidResponse(statusCode: 0)
+        }
+        guard http.statusCode == 200 else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode([WizardCheckResult].self, from: data)
+    }
+
     /// Fetch composite-worker status.
     func compositeStatus() async throws -> CompositeStatus {
         let url = URL(string: "http://127.0.0.1:\(webPort)/api/composite-status")!

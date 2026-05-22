@@ -97,6 +97,64 @@ public enum AccessibilityID {
     public static let calOverallLabel            = "lbl-cal-overall"
     public static let calUseBtn                  = "btn-use-calibration"
 
+    // MARK: - Calibration Wizard (Phase 14)
+
+    // Progress indicator (always rendered)
+    public static let wizardStep1Indicator      = "indicator-wizard-step-1"
+    public static let wizardStep2Indicator      = "indicator-wizard-step-2"
+    public static let wizardStep3Indicator      = "indicator-wizard-step-3"
+    public static let wizardStep4Indicator      = "indicator-wizard-step-4"
+
+    // Navigation buttons (always rendered in footer)
+    public static let wizardBackBtn             = "btn-wizard-back"
+    public static let wizardNextBtn             = "btn-wizard-next"
+    public static let wizardRerunBtn            = "btn-wizard-rerun"
+
+    // Rig Check (Step 1)
+    public static let rigCheckLightLabel        = "lbl-rig-light"
+    public static let rigCheckFirmwareLabel     = "lbl-rig-firmware"
+    public static let rigCheckCameraLabel       = "lbl-rig-camera"
+    public static let rigCheckFolderLabel       = "lbl-rig-folder"
+
+    // Exposure (Step 2)
+    public static let exposureClipR             = "lbl-exp-clip-r"
+    public static let exposureClipG             = "lbl-exp-clip-g"
+    public static let exposureClipB             = "lbl-exp-clip-b"
+    public static let exposureLevelR            = "lbl-exp-level-r"
+    public static let exposureLevelG            = "lbl-exp-level-g"
+    public static let exposureLevelB            = "lbl-exp-level-b"
+    public static let exposureVerdictR          = "lbl-exp-verdict-r"
+    public static let exposureVerdictG          = "lbl-exp-verdict-g"
+    public static let exposureVerdictB          = "lbl-exp-verdict-b"
+    public static let exposureOverall           = "lbl-exp-overall"
+    public static let rebatePicker              = "picker-rebate"
+    public static let rebateClearBtn            = "btn-rebate-clear"
+
+    // Flat Field (Step 3)
+    public static let ffcFalloffR               = "lbl-ffc-falloff-r"
+    public static let ffcFalloffG               = "lbl-ffc-falloff-g"
+    public static let ffcFalloffB               = "lbl-ffc-falloff-b"
+    public static let ffcUniformityR            = "lbl-ffc-uniformity-r"
+    public static let ffcUniformityG            = "lbl-ffc-uniformity-g"
+    public static let ffcUniformityB            = "lbl-ffc-uniformity-b"
+    public static let ffcVerdictR               = "lbl-ffc-verdict-r"
+    public static let ffcVerdictG               = "lbl-ffc-verdict-g"
+    public static let ffcVerdictB               = "lbl-ffc-verdict-b"
+    public static let ffcOverall                = "lbl-ffc-overall"
+    public static let ffcFramesLabel            = "lbl-ffc-frames"
+    public static let ffcUseBtn                 = "btn-ffc-use"
+
+    // Results (Step 4)
+    public static let resultsShiftRG            = "lbl-results-shift-rg"
+    public static let resultsShiftGB            = "lbl-results-shift-gb"
+    public static let resultsRegVerdict         = "lbl-results-reg-verdict"
+    public static let resultsBaseDeviation      = "lbl-results-base-dev"
+    public static let resultsBaseVerdict        = "lbl-results-base-verdict"
+    public static let resultsGainR              = "lbl-results-gain-r"
+    public static let resultsGainG              = "lbl-results-gain-g"
+    public static let resultsGainB              = "lbl-results-gain-b"
+    public static let resultsRollVerdict        = "lbl-results-roll-verdict"
+
     // MARK: - Scan view (Phase 07)
 
     public static let scanStartBtn               = "btn-start-scan"
