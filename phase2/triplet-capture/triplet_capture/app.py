@@ -167,8 +167,25 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
 
         try:
             import json as _json
+            import importlib.util as _util
             from pathlib import Path as _Path
             from triplet_capture.capture_flats import capture_flats
+
+            _phase2_rgb = _Path(__file__).resolve().parent.parent.parent.parent / "phase2" / "rgb-composite"
+            _script_path = _Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "inspect-calibration.py"
+
+            # Pre-load rgb_composite.ffc directly (bypassing rgb_composite/__init__.py which
+            # eagerly imports composite.py → rawpy via its __all__ re-exports).
+            # Must happen BEFORE calling capture_flats, which lazily imports
+            # `from rgb_composite.ffc import _box_filter_2d` inside _cv().
+            # Once "rgb_composite.ffc" is in sys.modules Python finds the cached
+            # module without executing __init__.py.
+            if "rgb_composite.ffc" not in sys.modules:
+                _ffc_path = _phase2_rgb / "rgb_composite" / "ffc.py"
+                _ffc_spec = _util.spec_from_file_location("rgb_composite.ffc", str(_ffc_path))
+                _ffc_mod = _util.module_from_spec(_ffc_spec)
+                sys.modules["rgb_composite.ffc"] = _ffc_mod
+                _ffc_spec.loader.exec_module(_ffc_mod)
 
             flat_stack, meta = capture_flats(
                 orch._scanlight,
@@ -183,8 +200,6 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             # Build inspection dict matching inspect-calibration.py --json output
             # Import measure_channel + _channel_verdict + classify from the script.
             # Use importlib.util with a sanitised module name to avoid the hyphen.
-            import importlib.util as _util
-            _script_path = _Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "inspect-calibration.py"
             _ic = sys.modules.get("_inspect_calibration_mod")
             if _ic is None:
                 _spec = _util.spec_from_file_location("_inspect_calibration_mod", str(_script_path))
@@ -238,12 +253,22 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
 
         try:
             import json as _json
-            from rgb_composite.checks import (
-                check_base_neutrality,
-                check_frame_anomaly,
-                check_registration,
-            )
+            import importlib.util as _util
+            from pathlib import Path as _Path
             from c41_core.contracts import CheckResult
+
+            # Import checks.py directly (bypassing rgb_composite/__init__.py which
+            # eagerly imports rawpy via composite.py — breaking the hardware-free invariant).
+            _checks_path = _Path(__file__).resolve().parent.parent.parent.parent / "phase2" / "rgb-composite" / "rgb_composite" / "checks.py"
+            _checks_mod = sys.modules.get("_rgb_composite_checks")
+            if _checks_mod is None:
+                _cspec = _util.spec_from_file_location("_rgb_composite_checks", str(_checks_path))
+                _checks_mod = _util.module_from_spec(_cspec)
+                sys.modules["_rgb_composite_checks"] = _checks_mod
+                _cspec.loader.exec_module(_checks_mod)
+            check_base_neutrality = _checks_mod.check_base_neutrality
+            check_frame_anomaly = _checks_mod.check_frame_anomaly
+            check_registration = _checks_mod.check_registration
 
             checks: list = []
 
