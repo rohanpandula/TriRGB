@@ -76,6 +76,196 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             "next_frame": orchestrator.settings.frame_number,
         }), (200 if result.success else 500)
 
+    @app.post("/api/calibrate/exposure")
+    def post_calibrate_exposure():
+        orch = app.config["ORCHESTRATOR"]
+        # 409 if a capture is already in flight (non-blocking lock probe)
+        lock_acquired = orch._lock.acquire(blocking=False)
+        if not lock_acquired:
+            return jsonify({"error": "capture in progress — try again after scan completes"}), 409
+        orch._lock.release()
+
+        data = request.get_json(force=True, silent=True) or {}
+
+        # Parse + validate optional rebate coordinates (T-14-01)
+        try:
+            rebate_col = int(data["rebate_col"]) if "rebate_col" in data else None
+            rebate_row = int(data["rebate_row"]) if "rebate_row" in data else None
+            rebate_w = int(data.get("rebate_w", 100))
+            rebate_h = int(data.get("rebate_h", 20))
+        except (ValueError, TypeError) as e:
+            return jsonify({"error": f"rebate parameter must be an integer: {e}"}), 400
+
+        if rebate_col is not None and rebate_col < 0:
+            return jsonify({"error": f"rebate_col must be >= 0, got {rebate_col}"}), 400
+        if rebate_row is not None and rebate_row < 0:
+            return jsonify({"error": f"rebate_row must be >= 0, got {rebate_row}"}), 400
+        if rebate_w <= 0:
+            return jsonify({"error": f"rebate_w must be > 0, got {rebate_w}"}), 400
+        if rebate_h <= 0:
+            return jsonify({"error": f"rebate_h must be > 0, got {rebate_h}"}), 400
+
+        from c41_core.contracts import BaseRegionDescriptor
+        if rebate_col is not None and rebate_row is not None:
+            base_region = BaseRegionDescriptor(
+                x=rebate_col, y=rebate_row, w=rebate_w, h=rebate_h,
+                base_rgb=(8930.0, 12097.0, 2952.0),
+                uniformity_cv=1.5,
+                source="manual",
+            )
+        else:
+            # Default centre strip
+            base_region = BaseRegionDescriptor(
+                x=4, y=4, w=100, h=20,
+                base_rgb=(8930.0, 12097.0, 2952.0),
+                uniformity_cv=1.5,
+                source="auto",
+            )
+
+        demosaic_factory = app.config.get("DEMOSAIC_FACTORY", None)
+
+        try:
+            import json as _json
+            from triplet_capture.calibrate_exposure import calibrate_exposure
+            result = calibrate_exposure(
+                orch._scanlight,
+                orch.settings,
+                base_region,
+                orchestrator=orch,
+                sleep=lambda _: None,
+                demosaic_factory=demosaic_factory,
+            )
+            app.config["LAST_CAL_RESULT"] = result
+            return jsonify(_json.loads(result.to_json()))
+        except (RuntimeError, ValueError) as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.post("/api/calibrate/ffc")
+    def post_calibrate_ffc():
+        orch = app.config["ORCHESTRATOR"]
+        lock_acquired = orch._lock.acquire(blocking=False)
+        if not lock_acquired:
+            return jsonify({"error": "capture in progress — try again after scan completes"}), 409
+        orch._lock.release()
+
+        data = request.get_json(force=True, silent=True) or {}
+        n_frames = int(data.get("n_frames", 8))
+
+        # Get black levels from last calibration or defaults
+        last_cal = app.config.get("LAST_CAL_RESULT", None)
+        if last_cal is not None:
+            black_levels = (last_cal.r, last_cal.g, last_cal.b)
+        else:
+            from c41_core import ChannelCalibration
+            black_levels = (
+                ChannelCalibration(channel="R", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
+                ChannelCalibration(channel="G", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
+                ChannelCalibration(channel="B", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
+            )
+
+        flat_demosaic_fn = app.config.get("FLAT_DEMOSAIC_FN", None)
+
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            from triplet_capture.capture_flats import capture_flats
+
+            flat_stack, meta = capture_flats(
+                orch._scanlight,
+                orch.settings,
+                black_levels,
+                n_frames=n_frames,
+                sleep=lambda _: None,
+                sony_capture_runner=orch._explicit_runner,
+                demosaic_fn=flat_demosaic_fn,
+            )
+
+            # Build inspection dict matching inspect-calibration.py --json output
+            # Import measure_channel + _channel_verdict + classify from the script.
+            # Use importlib.util with a sanitised module name to avoid the hyphen.
+            import importlib.util as _util
+            _script_path = _Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "inspect-calibration.py"
+            _ic = sys.modules.get("_inspect_calibration_mod")
+            if _ic is None:
+                _spec = _util.spec_from_file_location("_inspect_calibration_mod", str(_script_path))
+                _ic = _util.module_from_spec(_spec)
+                # Register before exec so nested imports can resolve cls.__module__
+                sys.modules["_inspect_calibration_mod"] = _ic
+                _spec.loader.exec_module(_ic)
+
+            # flat_stack is NxHxWx3; average to get HxWx3
+            flat_avg = flat_stack.mean(axis=0).astype(flat_stack.dtype)
+            ch_stats = {}
+            for ch, ch_idx in (("R", 0), ("G", 1), ("B", 2)):
+                stats = _ic.measure_channel(flat_avg[:, :, ch_idx].astype("uint16"), ch)
+                verdict = _ic._channel_verdict(stats)
+                ch_stats[ch] = {
+                    "falloff_pct": round(stats.falloff_pct, 2),
+                    "uniformity_pct": round(stats.uniformity_pct, 2),
+                    "verdict": verdict,
+                }
+            all_stats = (
+                _ic.measure_channel(flat_avg[:, :, 0].astype("uint16"), "R"),
+                _ic.measure_channel(flat_avg[:, :, 1].astype("uint16"), "G"),
+                _ic.measure_channel(flat_avg[:, :, 2].astype("uint16"), "B"),
+            )
+            overall_msg, _ = _ic.classify(all_stats)
+            # Extract the leading word (CLEAN / FAIL / OK-with-FFC)
+            overall = overall_msg.split("—")[0].strip() if "—" in overall_msg else overall_msg.strip()
+
+            inspection = {"channels": ch_stats, "overall": overall}
+            return jsonify({
+                "flat_field": _json.loads(meta.to_json()),
+                "inspection": inspection,
+            })
+        except (RuntimeError, ValueError) as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.post("/api/calibrate/checks")
+    def post_calibrate_checks():
+        orch = app.config["ORCHESTRATOR"]
+        last_cal = app.config.get("LAST_CAL_RESULT", None)
+        if last_cal is None:
+            # fail-closed: return a well-formed CheckResult indicating "no calibration"
+            from c41_core.contracts import CheckResult
+            import json as _json
+            no_cal = CheckResult(
+                name="base_neutrality",
+                passed=False,
+                deltas={"base_r": 0.0, "base_g": 0.0, "base_b": 0.0},
+            )
+            return jsonify([_json.loads(no_cal.to_json())]), 409
+
+        try:
+            import json as _json
+            from rgb_composite.checks import (
+                check_base_neutrality,
+                check_frame_anomaly,
+                check_registration,
+            )
+            from c41_core.contracts import CheckResult
+
+            checks: list = []
+
+            # check_registration requires a HxWx3 float array (LAST_CAL_FRAME)
+            last_frame = app.config.get("LAST_CAL_FRAME", None)
+            if last_frame is not None:
+                reg = check_registration(last_frame)
+                checks.append(reg)
+            else:
+                # fail-closed but well-formed — registration not available pre-roll
+                checks.append(CheckResult(name="registration", passed=False, deltas={}))
+
+            bn = check_base_neutrality(last_cal.base_region)
+            checks.append(bn)
+
+            fa = check_frame_anomaly(last_cal.base_region, last_cal.base_region)
+            checks.append(fa)
+
+            return jsonify([_json.loads(c.to_json()) for c in checks])
+        except (RuntimeError, ValueError) as e:
+            return jsonify({"error": str(e)}), 500
+
     @app.get("/api/composite-status")
     def get_composite_status():
         if composite_worker is None:
