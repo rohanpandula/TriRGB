@@ -71,6 +71,7 @@ def calibrate_exposure(
     sony_capture_runner: Optional[Callable[[str, Path, int], int]] = None,
     sleep: Callable[[float], None] = time.sleep,
     demosaic_factory: Optional[Callable[["Orchestrator"], Callable[[Path], np.ndarray]]] = None,
+    orchestrator: Optional["Orchestrator"] = None,
 ) -> CalibrationResult:
     """Auto-tune each LED channel's exposure referenced to the rebate histogram.
 
@@ -117,6 +118,12 @@ def calibrate_exposure(
                            ``_demosaic_cal_frame`` from ``rgb_composite.ffc``
                            is used via lazy import (so rawpy is never touched
                            when a factory is injected — Pitfall 5).
+        orchestrator:      Optional live Orchestrator to reuse instead of
+                           constructing a new one at STEP 0.  When provided,
+                           the route handler's shared Orchestrator (and its
+                           ``_lock``) is reused so calibration captures cannot
+                           interleave with a concurrent /api/capture scan.
+                           Default None preserves all Phase-12 behaviour.
 
     Returns:
         CalibrationResult with three ChannelCalibration records (r/g/b),
@@ -137,15 +144,21 @@ def calibrate_exposure(
 
     # ------------------------------------------------------------------
     # STEP 0: Warmup sleep + construct ONE Orchestrator (NFR-14 pattern)
+    # When an orchestrator is injected (e.g. by the Flask calibrate route)
+    # reuse it directly so calibration captures share the existing _lock
+    # with /api/capture and cannot interleave with a live scan.
     # ------------------------------------------------------------------
     sleep(warmup_s)
 
-    orch = Orchestrator(
-        scanlight,
-        settings,
-        sony_capture_runner=sony_capture_runner,
-        sleep=sleep,
-    )
+    if orchestrator is not None:
+        orch = orchestrator
+    else:
+        orch = Orchestrator(
+            scanlight,
+            settings,
+            sony_capture_runner=sony_capture_runner,
+            sleep=sleep,
+        )
 
     # ------------------------------------------------------------------
     # STEP 0b: Resolve demosaic seam (Pitfall 5 — lazy import)
