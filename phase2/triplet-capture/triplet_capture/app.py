@@ -267,8 +267,9 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                 sys.modules["_rgb_composite_checks"] = _checks_mod
                 _cspec.loader.exec_module(_checks_mod)
             check_base_neutrality = _checks_mod.check_base_neutrality
-            check_frame_anomaly = _checks_mod.check_frame_anomaly
             check_registration = _checks_mod.check_registration
+            # frame_anomaly (per-frame vs roll baseline) is a roll-level check — deferred
+            # to Phase 15; no roll baseline exists during single-calibration.
 
             checks: list = []
 
@@ -283,9 +284,6 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
 
             bn = check_base_neutrality(last_cal.base_region)
             checks.append(bn)
-
-            fa = check_frame_anomaly(last_cal.base_region, last_cal.base_region)
-            checks.append(fa)
 
             return jsonify([_json.loads(c.to_json()) for c in checks])
         except (RuntimeError, ValueError) as e:

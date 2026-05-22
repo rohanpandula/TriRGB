@@ -150,22 +150,23 @@ private func makeFFCJSON() -> Data {
 }
 
 private func makeChecksJSON() -> Data {
+    // frame_anomaly (per-frame vs roll baseline) is deferred to Phase 15;
+    // the /api/calibrate/checks route returns 2 checks: registration + base_neutrality.
     let json = """
     [
         {"name": "registration", "passed": true, "deltas": {"rg_shift": 0.12, "gb_shift": 0.08}, "schema_version": 1},
-        {"name": "base_neutrality", "passed": true, "deltas": {"base_r": 8930.0, "base_g": 12097.0, "base_b": 2952.0}, "schema_version": 1},
-        {"name": "frame_anomaly", "passed": true, "deltas": {}, "schema_version": 1}
+        {"name": "base_neutrality", "passed": true, "deltas": {"base_r": 8930.0, "base_g": 12097.0, "base_b": 2952.0}, "schema_version": 1}
     ]
     """
     return json.data(using: .utf8)!
 }
 
 private func makeChecksFailJSON() -> Data {
+    // 2-check shape (frame_anomaly deferred to Phase 15 — no roll baseline during calibration).
     let json = """
     [
         {"name": "registration", "passed": false, "deltas": {"rg_shift": 2.5, "gb_shift": 1.8}, "schema_version": 1},
-        {"name": "base_neutrality", "passed": false, "deltas": {"deviation": 800.0}, "schema_version": 1},
-        {"name": "frame_anomaly", "passed": true, "deltas": {}, "schema_version": 1}
+        {"name": "base_neutrality", "passed": false, "deltas": {"deviation": 800.0}, "schema_version": 1}
     ]
     """
     return json.data(using: .utf8)!
@@ -196,29 +197,36 @@ final class CalibrationWizardViewModelTests: XCTestCase {
         client.webPort = 9999
         let vm = CalibrationWizardViewModel(orchestratorClient: client)
 
-        // Step 1 — rig check
+        // Step 1 — rig check: trigger sets the result; navigation is driven by "Next" button
+        // (WizardNavFooter.primaryAction), not by the trigger itself (IN-03 fix).
         await vm.triggerRigCheck()
         XCTAssertNotNil(vm.rigCheckResult, "rigCheckResult should be set after Step 1")
-        XCTAssertEqual(vm.currentStep, 2, "Step should advance to 2")
+        XCTAssertEqual(vm.currentStep, 1, "trigger must NOT auto-advance — operator must press Next")
         XCTAssertNil(vm.lastError[1], "No error on Step 1")
+        // Simulate the "Next" button (WizardNavFooter.primaryAction → currentStep = 2)
+        vm.currentStep = 2
 
         // Step 2 — exposure
         await vm.triggerExposure()
         XCTAssertNotNil(vm.exposureResult, "exposureResult should be set after Step 2")
         XCTAssertEqual(vm.exposureResult?.r.ledLevel, 180, "R LED level should decode")
-        XCTAssertEqual(vm.currentStep, 3, "Step should advance to 3")
+        XCTAssertEqual(vm.currentStep, 2, "trigger must NOT auto-advance — operator must press Next")
         XCTAssertNil(vm.lastError[2], "No error on Step 2")
+        // Simulate the "Next" button
+        vm.currentStep = 3
 
         // Step 3 — FFC
         await vm.triggerFFC()
         XCTAssertNotNil(vm.ffcResult, "ffcResult should be set after Step 3")
         XCTAssertEqual(vm.ffcResult?.flatField.nFramesAveraged, 8)
-        XCTAssertEqual(vm.currentStep, 4, "Step should advance to 4")
+        XCTAssertEqual(vm.currentStep, 3, "trigger must NOT auto-advance — operator must press Next")
         XCTAssertNil(vm.lastError[3], "No error on Step 3")
+        // Simulate the "Next" button
+        vm.currentStep = 4
 
-        // Step 4 — results checks
+        // Step 4 — results checks (2 checks: registration + base_neutrality; frame_anomaly deferred to Phase 15)
         await vm.triggerResultsCheck()
-        XCTAssertEqual(vm.checkResults?.count, 3, "Should have 3 check results")
+        XCTAssertEqual(vm.checkResults?.count, 2, "Should have 2 check results (frame_anomaly deferred to Phase 15)")
         XCTAssertNil(vm.lastError[4], "No error on Step 4")
 
         // isRunning should be false after all steps
@@ -284,12 +292,16 @@ final class CalibrationWizardViewModelTests: XCTestCase {
         let vm = CalibrationWizardViewModel(orchestratorClient: client)
 
         await vm.triggerRigCheck()
+        vm.currentStep = 2   // simulate "Next" (triggers no longer auto-advance — IN-03 fix)
         await vm.triggerExposure()
+        vm.currentStep = 3
         await vm.triggerFFC()
+        vm.currentStep = 4
         await vm.triggerResultsCheck()
 
         // All checks failed but the view model should still hold the results (not crash)
-        XCTAssertEqual(vm.checkResults?.count, 3)
+        // 2-check shape: registration + base_neutrality (frame_anomaly deferred to Phase 15)
+        XCTAssertEqual(vm.checkResults?.count, 2)
         let failedCount = vm.checkResults?.filter { !$0.passed }.count ?? 0
         XCTAssertGreaterThan(failedCount, 0, "Some checks failed")
         XCTAssertFalse(vm.isRunning, "isRunning should be false — FAIL does not block")
@@ -324,7 +336,9 @@ final class CalibrationWizardViewModelTests: XCTestCase {
         let vm = CalibrationWizardViewModel(orchestratorClient: client)
 
         await vm.triggerRigCheck()
+        vm.currentStep = 2   // simulate "Next" (triggers no longer auto-advance — IN-03 fix)
         await vm.triggerExposure()
+        vm.currentStep = 3   // simulate "Next"
 
         XCTAssertNotNil(vm.rigCheckResult)
         XCTAssertNotNil(vm.exposureResult)

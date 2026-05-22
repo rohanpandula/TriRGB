@@ -530,7 +530,9 @@ final class OrchestratorClient: ObservableObject {
     /// Swift sends an empty body; the route reads app.config["LAST_CAL_RESULT"]
     /// set by the prior exposure route. Must be called after calibrateExposure.
     ///
-    /// - Returns: Array of `WizardCheckResult` (registration, base_neutrality, frame_anomaly).
+    /// - Returns: Array of `WizardCheckResult` (registration, base_neutrality).
+    ///   frame_anomaly (per-frame vs roll baseline) is deferred to Phase 15 — no roll baseline
+    ///   exists during a single calibration.
     /// - Throws: `OrchestratorError.httpError` for non-200 responses (includes 409 if
     ///   no prior exposure result is stored).
     func calibrateChecks() async throws -> [WizardCheckResult] {

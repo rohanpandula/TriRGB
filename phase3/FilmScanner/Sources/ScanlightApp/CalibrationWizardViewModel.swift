@@ -68,7 +68,8 @@ final class CalibrationWizardViewModel: ObservableObject {
         do {
             let state = try await orchestratorClient.fetchState()
             rigCheckResult = state
-            currentStep = max(currentStep, 2)
+            // Navigation to step 2 is handled by WizardNavFooter.primaryAction().
+            // The trigger only sets the result; the operator must press "Next" to advance.
         } catch {
             lastError[1] = errorCopy(for: error, step: 1)
         }
@@ -86,7 +87,7 @@ final class CalibrationWizardViewModel: ObservableObject {
                 rebateRow: rebateCoord?.row
             )
             exposureResult = result
-            currentStep = max(currentStep, 3)
+            // Navigation to step 3 is handled by WizardNavFooter.primaryAction().
         } catch {
             lastError[2] = errorCopy(for: error, step: 2)
         }
@@ -106,7 +107,7 @@ final class CalibrationWizardViewModel: ObservableObject {
         do {
             let result = try await orchestratorClient.calibrateFFC(exposureResult: exp)
             ffcResult = result
-            currentStep = max(currentStep, 4)
+            // Navigation to step 4 is handled by WizardNavFooter.primaryAction().
         } catch {
             lastError[3] = errorCopy(for: error, step: 3)
         }
