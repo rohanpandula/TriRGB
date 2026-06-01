@@ -46,6 +46,17 @@ def _fake_job_failure(r, g, b, out, fmt, ffc, model):
     return (None, "RuntimeError: simulated composite failure")
 
 
+def _fake_job_success_with_positive(r, g, b, out, fmt, ffc, model, positive_profile_json):
+    """Simulate a successful composite plus *_positive.tif sibling."""
+    p = Path(out)
+    if fmt == "dng":
+        p = p.with_suffix(".dng")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"FAKE-DNG")
+    p.with_name(p.stem + "_positive.tif").write_bytes(b"FAKE-POSITIVE")
+    return (str(p), None)
+
+
 def _worker(out_dir, roll="Roll001", *, job=_fake_job_success, max_workers=2, **kw):
     """Build a CompositeWorker with an injected thread pool + fake job."""
     return CompositeWorker(
@@ -82,6 +93,26 @@ def test_submit_and_drain_produces_outputs(tmp_path):
     assert all(r.ok for r in results)
     for frame in (1, 2, 3):
         assert (out_dir / f"Roll001_Frame{frame:03d}.dng").exists()
+
+
+def test_positive_sibling_is_promoted_with_primary_output(tmp_path):
+    out_dir = tmp_path / "composites"
+    worker = _worker(
+        out_dir,
+        output_format="dng",
+        job=_fake_job_success_with_positive,
+        positive_profile_json='{"base_region": {"x": 0, "y": 0, "w": 1, "h": 1, "base_rgb": [1, 1, 1], "uniformity_cv": 0, "source": "manual"}}',
+    )
+
+    worker.submit(1, _make_triplet(tmp_path, 1))
+    results = worker.drain(timeout=30)
+    worker.shutdown(wait=True)
+
+    assert len(results) == 1
+    assert results[0].ok
+    assert results[0].positive_path == out_dir / "Roll001_Frame001_positive.tif"
+    assert (out_dir / "Roll001_Frame001.dng").exists()
+    assert (out_dir / "Roll001_Frame001_positive.tif").read_bytes() == b"FAKE-POSITIVE"
 
 
 def test_poll_returns_only_finished(tmp_path):

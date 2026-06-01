@@ -1,6 +1,6 @@
 # Calibration notes
 
-Per-stock R/G/B Scanlight levels and shutter speeds. Fill this in during the optical dry run for each film stock you scan, then load the values into `triplet-capture` before a roll.
+Per-stock R/G/B Scanlight levels and shutter speeds. Current SDK calibration can solve these automatically from the selected film-base/rebate ROI: ISO stays at 100, the lens stays at f/8/manual focus, and the app only changes Sony shutter speed plus Scanlight LED level per channel.
 
 A stock's "working levels" are the ones where, viewed on the camera's RGB histogram:
 - The film base (clear/dense unexposed area, fully developed) sits near 255 but doesn't clip.
@@ -22,11 +22,11 @@ Levels drift over time as the LEDs age and as you vary lens/aperture/distance. R
 
 ## Per-channel sanity expectations
 
-- **R level (665 nm)**: usually the highest of the three for color negatives because the orange mask is densest in the blue-absorbing layer, but for color-neg film the *blue* channel typically needs the highest level — the orange mask absorbs blue light.
+- **R level (665 nm)**: usually the *lowest* of the three for color negatives (the orange mask passes red freely, so red needs the least drive to reach the base target), and roughly equal to the others for B&W (no mask).
 - **G level (525 nm)**: usually middle.
 - **B level (455 nm)**: usually the highest for color negatives (orange mask absorbs blue), the lowest for B&W (no mask).
 
-If you find yourself wanting to push a single channel above 240, drop shutter speed instead — keeps highlights from clipping.
+If the solver would need a single channel above about 240, it slows that channel's shutter and trims the final value with LED brightness. In manual/IED fallback modes, set shutter on the camera yourself and only trust the returned LED levels.
 
 ## Sensor temperature note
 

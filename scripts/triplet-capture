@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+LOCAL_PYTHONPATH=(
+  "$ROOT/phase1/scanlightctl"
+  "$ROOT/phase2/c41-core"
+  "$ROOT/phase2/rgb-composite"
+  "$ROOT/phase2/triplet-capture"
+)
+
+IFS=:
+export PYTHONPATH="${LOCAL_PYTHONPATH[*]}${PYTHONPATH:+:$PYTHONPATH}"
+unset IFS
+
+required_modules=(serial flask numpy rawpy tifffile)
+
+python_candidates=()
+if [[ -n "${SCANLIGHT_PYTHON:-}" ]]; then
+  python_candidates+=("$SCANLIGHT_PYTHON")
+fi
+python_candidates+=(
+  "/opt/homebrew/opt/python@3.14/bin/python3.14"
+  "/opt/homebrew/bin/python3"
+  "/usr/local/bin/python3"
+)
+if command -v python3 >/dev/null 2>&1; then
+  python_candidates+=("$(command -v python3)")
+fi
+
+selected_python=""
+missing_report=""
+for candidate in "${python_candidates[@]}"; do
+  [[ -x "$candidate" ]] || continue
+  if "$candidate" - "${required_modules[@]}" <<'PY' >/tmp/triplet-capture-python-check.out 2>&1
+import importlib
+import sys
+
+missing = []
+for name in sys.argv[1:]:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        missing.append(f"{name} ({exc})")
+
+if missing:
+    print(", ".join(missing))
+    raise SystemExit(1)
+
+print(sys.executable)
+PY
+  then
+    selected_python="$candidate"
+    break
+  else
+    missing_report+="${candidate}: $(cat /tmp/triplet-capture-python-check.out)"$'\n'
+  fi
+done
+rm -f /tmp/triplet-capture-python-check.out
+
+if [[ -z "$selected_python" ]]; then
+  cat >&2 <<EOF
+triplet-capture: no usable Python interpreter found.
+Required modules: ${required_modules[*]}
+
+Checked:
+${missing_report}
+
+Fix:
+  /opt/homebrew/bin/python3 -m pip install pyserial flask numpy rawpy tifffile imagecodecs opencv-python scipy
+or set SCANLIGHT_PYTHON=/path/to/python with those modules installed.
+EOF
+  exit 1
+fi
+
+exec "$selected_python" -m triplet_capture.app "$@"

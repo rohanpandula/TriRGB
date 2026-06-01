@@ -30,10 +30,10 @@ will fail; fix the code or the doc before merging.
 | `scanlight-swift-cli` | Swift CLI (`phase3/FilmScanner/Sources/ScanlightSwiftCLI/`) | Headless CI, AI agents, JSON-consuming harnesses; also `selftest` without hardware | optional (`--fake` or `selftest` needs none) |
 | `rgb-composite` | Python CLI (`phase2/rgb-composite/`) | Composite a single R/G/B RAW triplet into a 16-bit TIFF or Linear DNG | no (needs ARW files, not hardware) |
 | `batch-composite` | Python CLI (`phase2/batch-composite/`) | Composite an entire roll directory | no (needs ARW files, not hardware) |
-| `triplet-capture` | Python Flask app + CLI (`phase2/triplet-capture/`) | Per-frame capture orchestration; provides the scanning web UI | yes (`--trigger-mode sdk` or `hw`) |
+| `triplet-capture` | Python Flask app + CLI (`phase2/triplet-capture/`) | Per-frame capture orchestration; provides the scanning web UI/backend used by Swift | yes (`--trigger-mode manual`, `hw`, or `sdk`) |
 | `scripts/inspect-calibration.py` | Python script | Quantitative vignette/saturation check on a captured FFC calibration triplet | no (needs cal ARWs) |
 | `scripts/test_swift_cli.py` | Python pytest harness | Regression CI for the Swift CLI via subprocess; canonical Python-driving example | no (`--fake` transport) |
-| SwiftUI app (`phase3/FilmScanner/`) | macOS app | Live-preview and framing UI; driven via XCTest UI or cua-driver | yes (Phase 01 work-in-flight) |
+| SwiftUI app (`phase3/FilmScanner/`) | macOS app | Unified operator surface for Light, Settings, Calibrate, and Scan tabs; driven via XCTest UI or cua-driver | yes for real scanning, no for fake-transport tests |
 
 ### CLI entry points
 
@@ -105,10 +105,11 @@ batch-composite /Volumes/SSD/Scans/Roll001 \
 triplet-capture \
   --roll-name Roll001 \
   --output-folder /Volumes/SSD/Scans \
-  --trigger-mode sdk
+  --trigger-mode manual \
+  --ied-inbox /Volumes/SSD/_ied_inbox
 # Opens web UI at http://127.0.0.1:8765
 
-# Hardware-trigger mode (Wi-Fi tether via Imaging Edge Desktop):
+# Hardware-pulse mode (IED tether + Scanlight 3.5mm shutter pulse):
 triplet-capture \
   --roll-name Roll001 \
   --output-folder /Volumes/SSD/Scans \
@@ -116,6 +117,16 @@ triplet-capture \
   --ied-inbox /Volumes/SSD/_ied_inbox \
   --shutter-pulse-ms 100 \
   --capture-timeout-s 30
+
+# Sony SDK path (Swift SDK mode uses the same CLI boundary):
+triplet-capture \
+  --roll-name Roll001 \
+  --output-folder /Volumes/SSD/Scans \
+  --trigger-mode sdk \
+  --sony-ip-address 10.0.0.247 \
+  --sony-mac-address 10:32:2C:26:1A:3F \
+  --sony-user USER \
+  --sony-password PASSWORD
 ```
 
 **scripts/inspect-calibration.py**:
@@ -256,9 +267,14 @@ exercise any GUI action from a shell command.
 | `btn-blue-on` | Turn blue on / button | `scanlight-swift-cli on b --level N` | Turn blue channel on at slider value |
 | `btn-white-on` | Turn white on / button | `scanlight-swift-cli on w --level N` | Turn white channel on at slider value |
 | `btn-off` | All channels off / button | `scanlight-swift-cli off` | Set all channels to 0 |
-| `btn-set-rgb` | Set RGB / button | `scanlight-swift-cli set --r N --g N --b N` | Set red, green, blue simultaneously |
 | `field-pulse-ms` | Pulse length (ms) / text field | positional `<ms>` argument to `scanlight-swift-cli pulse <ms>` | Provides the millisecond value for the next pulse |
 | `btn-fire-pulse` | Fire shutter pulse / button | `scanlight-swift-cli pulse <ms>` (ms from field-pulse-ms) | Fire the 3.5mm shutter trigger output |
+| `btn-sony-connect` | Check Sony SDK connection / button | `sony-capture --connect-only --ip-address IP --user USER --password PW` | Probe the Wi-Fi SDK Access Auth path without firing the shutter |
+| `lbl-sony-connection-status` | Sony SDK connection status / label | `sony-capture --connect-only` exit code and stdout/stderr | Show the most recent non-shooting SDK probe result |
+| `btn-sony-live-view-start` | Open Sony SDK live-view preview / button | `sony-capture --live-view-stream-out PATH --ip-address IP --user USER --password PW` | Open one SDK session and refresh preview JPEG frames without firing the shutter |
+| `btn-sony-live-view-stop` | Close Sony SDK live-view preview / button | SIGTERM the `sony-capture --live-view-stream-out` process | Stop live-view streaming and release the SDK session |
+| `lbl-sony-live-view-status` | Sony SDK live-view status / label | stream process state and stderr | Show whether live view is opening, open, stopped, or failed |
+| `img-sony-live-view` | Sony SDK live-view image / image | JPEG refreshed by `sony-capture --live-view-stream-out PATH` | Display the latest live-view frame |
 | `lbl-last-error` | Last error / label | (GUI-only convenience) — CLI surfaces errors on stderr + exit code 1 | Mirror the most recent error message |
 | `scroll-log` | Log / scroll view | (GUI-only, intentional) — CLI streams to stderr per command | Per-command diagnostic log |
 | `btn-clear-log` | Clear log / button | (GUI-only, intentional) — no CLI equivalent | Clear the log scroll view |
@@ -274,6 +290,10 @@ exercise any GUI action from a shell command.
   the GUI operator has no need to run a transport self-test manually.
   (`phase3/FilmScanner/Sources/ScanlightSwiftCLI/main.swift` `runSelftest`)
 
+- **`scanlight-swift-cli set --r N --g N --b N`** — mixed RGB command. Kept
+  CLI-only because scan and calibration expose one channel at a time, and mixed
+  RGB is not part of the normal film workflow.
+
 ---
 
 ## AX-ID schema
@@ -281,11 +301,11 @@ exercise any GUI action from a shell command.
 The contract source is
 `phase3/FilmScanner/Sources/ScanlightApp/AccessibilityIDs.swift`.
 
-`schemaVersion` is currently `"1"` (see `AccessibilityIDs.swift:30`). External
+`schemaVersion` is currently `"4"` (see `AccessibilityIDs.swift:30`). External
 tests and AI agents should check this value before relying on individual IDs:
 
 ```swift
-AccessibilityID.schemaVersion  // currently "1"
+AccessibilityID.schemaVersion  // currently "4"
 ```
 
 Rules for schema maintenance:
@@ -475,7 +495,7 @@ For the full live reference, see `scripts/test_swift_cli.py`.
 | Quantitative calibration verification | `scripts/inspect-calibration.py` | Reports per-channel vignette, saturation, tint drift with decision tiers |
 | Composite a single R/G/B triplet | `rgb-composite` | Direct: three ARWs in, one TIFF/DNG out; optional FFC |
 | Composite a whole roll | `batch-composite` | Walks roll dir, parallelizes per-frame compositing, writes composites/ |
-| Per-frame capture orchestration | `triplet-capture` | Flask web UI; sequences R/G/B; advances frame counter on success only |
+| Per-frame capture orchestration | SwiftUI app → `triplet-capture` | Swift app is the operator surface; Python backend sequences R/G/B and advances frame counter on success only |
 
 ---
 
@@ -527,15 +547,15 @@ time after `scripts/capture-calibration.sh` has produced a calibration dir.
 
 - A frame **aborts without advancing the frame counter** if any RAW is the
   wrong size (outside the plausible band in `orchestrator.py`
-  `PLAUSIBLE_RAW_MIN_BYTES` / `PLAUSIBLE_RAW_MAX_BYTES`), or in `hw` mode
+  `PLAUSIBLE_RAW_MIN_BYTES` / `PLAUSIBLE_RAW_MAX_BYTES`), or in `hw`/`manual` mode
   if no file lands in `--ied-inbox` within `--capture-timeout-s`.
-- The **ambiguous-inbox guard** refuses to start if extant `.ARW` files are
-  already in `--ied-inbox`. Clear the inbox before starting.
+- The **ambiguous-inbox guard** aborts a channel if more than one new `.ARW`
+  becomes stable at the same time. Existing `.ARW` files are quarantined at
+  frame start so a stale file cannot be assigned to the wrong channel.
 - Stale or late files that arrive after the timeout are quarantined (moved
   aside), not processed.
-- **Hardware absent:** `triplet-capture` requires hardware unless the operator
-  pre-populates `--ied-inbox` manually (hw mode only) or the SDK path finds a
-  camera.
+- **Hardware absent:** `triplet-capture` requires hardware unless tests inject
+  a fake runner or the operator deliberately pre-populates `--ied-inbox`.
 
 ### rgb-composite
 

@@ -27,7 +27,7 @@ public enum AccessibilityID {
     /// Version of the AX-ID schema. AI agents and external tests should
     /// check this matches what they expect before relying on individual
     /// IDs. Bump when an existing ID is renamed or removed.
-    public static let schemaVersion = "2"
+    public static let schemaVersion = "4"
 
     // MARK: - Connection
 
@@ -56,7 +56,6 @@ public enum AccessibilityID {
     public static let whiteOnButton          = "btn-white-on"
 
     public static let allChannelsOffButton   = "btn-off"
-    public static let setAllRGBButton        = "btn-set-rgb"
 
     // MARK: - Shutter trigger
 
@@ -77,16 +76,34 @@ public enum AccessibilityID {
     public static let settingsTriggerModePicker  = "picker-trigger-mode"
     public static let settingsPickInboxBtn       = "btn-pick-inbox"
     public static let settingsInboxPathLabel     = "lbl-inbox-path"
-    public static let settingsLevelRSlider       = "slider-level-r"
-    public static let settingsLevelGSlider       = "slider-level-g"
-    public static let settingsLevelBSlider       = "slider-level-b"
     public static let settingsSettleStepper      = "stepper-settle-ms"
     public static let settingsPickFfcBtn         = "btn-pick-ffc"
     public static let settingsFfcPathLabel       = "lbl-ffc-path"
     public static let settingsCameraModelPicker  = "picker-camera-model"
+    public static let settingsSonyIpField        = "field-sony-ip"
+    public static let settingsSonyMacField       = "field-sony-mac"
+    public static let settingsSonyUserField      = "field-sony-user"
+    public static let settingsSonyPasswordField  = "field-sony-password"
+    public static let settingsSonyConnectButton  = "btn-sony-connect"
+    public static let settingsSonyConnectionStatusLabel = "lbl-sony-connection-status"
+    public static let settingsSonyLiveViewStartButton = "btn-sony-live-view-start"
+    public static let settingsSonyLiveViewStopButton = "btn-sony-live-view-stop"
+    public static let settingsSonyLiveViewStatusLabel = "lbl-sony-live-view-status"
+    public static let settingsSonyLiveViewImage = "img-sony-live-view"
+    public static let settingsSonyLiveViewInvertToggle = "toggle-sony-live-view-invert"
+    public static let settingsSonyLiveViewMirrorToggle = "toggle-sony-live-view-mirror"
+    public static let settingsSonyLiveViewFlipToggle = "toggle-sony-live-view-flip"
+    public static let settingsSonyLiveViewRotatePicker = "picker-sony-live-view-rotate"
+    public static let settingsSonyLiveViewZoomSlider = "slider-sony-live-view-zoom"
+    public static let settingsSonyLiveViewWhiteLightToggle = "toggle-sony-live-view-white"
     public static let settingsStreamToggle       = "toggle-stream-composite"
     public static let settingsCompositeFormat    = "picker-composite-format"
-    public static let settingsSaveBtn            = "btn-save-settings"
+    public static let stockManagerList           = "list-stock-manager"
+    public static let stockManagerNameField      = "field-stock-manager-name"
+    public static let stockManagerSaveButton     = "btn-stock-manager-save"
+    public static let stockManagerDeleteButton   = "btn-stock-manager-delete"
+    public static let stockManagerUseCurrentButton = "btn-stock-manager-use-current"
+    public static let stockManagerStatusLabel    = "lbl-stock-manager-status"
 
     // MARK: - Calibration Wizard (Phase 14)
 
@@ -120,6 +137,10 @@ public enum AccessibilityID {
     public static let exposureOverall           = "lbl-exp-overall"
     public static let rebatePicker              = "picker-rebate"
     public static let rebateClearBtn            = "btn-rebate-clear"
+    public static let stockProfileNameField     = "field-stock-profile-name"
+    public static let stockProfileSaveBtn       = "btn-stock-profile-save"
+    public static let stockProfilePicker        = "picker-stock-profile"
+    public static let stockProfileApplyBtn      = "btn-stock-profile-apply"
 
     // Flat Field (Step 3)
     public static let ffcFalloffR               = "lbl-ffc-falloff-r"
@@ -153,8 +174,31 @@ public enum AccessibilityID {
     public static let scanCaptureFrameBtn        = "btn-capture-frame"
     public static let scanRetakeBtn              = "btn-retake-frame"
     public static let scanFrameCounterLabel      = "lbl-frame-counter"
+    public static let scanNextFrameLabel         = "lbl-next-frame"
     public static let scanFrameStatusList        = "list-frame-status"
     public static let scanCompositeQueueLabel    = "lbl-composite-queue"
     public static let scanLightLockedLabel       = "lbl-light-locked"
     public static let scanReconnectLightBtn      = "btn-reconnect-light"
+    public static let scanStockProfilePicker     = "picker-scan-stock-profile"
+    public static let scanStockProfileApplyBtn   = "btn-scan-stock-profile-apply"
+    public static let scanStockProfileStatus     = "lbl-scan-stock-profile-status"
+    public static let scanSonyLiveViewStartButton = "btn-scan-sony-live-view-start"
+    public static let scanSonyLiveViewStopButton = "btn-scan-sony-live-view-stop"
+    public static let scanSonyLiveViewStatusLabel = "lbl-scan-sony-live-view-status"
+    public static let scanSonyLiveViewImage      = "img-scan-sony-live-view"
+    public static let scanSonyLiveViewInvertToggle = "toggle-scan-sony-live-view-invert"
+    public static let scanSonyLiveViewMirrorToggle = "toggle-scan-sony-live-view-mirror"
+    public static let scanSonyLiveViewFlipToggle = "toggle-scan-sony-live-view-flip"
+    public static let scanSonyLiveViewRotatePicker = "picker-scan-sony-live-view-rotate"
+    public static let scanSonyLiveViewZoomSlider = "slider-scan-sony-live-view-zoom"
+    public static let scanSonyLiveViewWhiteLightToggle = "toggle-scan-sony-live-view-white"
+
+    // MARK: - Positive inversion view
+
+    public static let invertPickFilesButton       = "btn-invert-pick-files"
+    public static let invertPickOutputButton      = "btn-invert-pick-output"
+    public static let invertRunButton             = "btn-invert-run"
+    public static let invertStatusLabel           = "lbl-invert-status"
+    public static let invertOutputPathLabel       = "lbl-invert-output-path"
+    public static let invertLogScrollView         = "scroll-invert-log"
 }

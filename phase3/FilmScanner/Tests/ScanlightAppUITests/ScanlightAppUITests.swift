@@ -151,20 +151,6 @@ final class ScanlightAppUITests: XCTestCase {
         XCTAssertEqual(errVal, "", "Unexpected error after white on: '\(errVal)'")
     }
 
-    func testSetAllRGBButton() throws {
-        let app = try launchAppFake()
-        defer { app.terminate() }
-
-        connect(app)
-        app.sliders[AccessibilityID.redSlider].adjust(toNormalizedSliderPosition: 0.4)
-        app.sliders[AccessibilityID.greenSlider].adjust(toNormalizedSliderPosition: 0.3)
-        app.sliders[AccessibilityID.blueSlider].adjust(toNormalizedSliderPosition: 0.2)
-        app.buttons[AccessibilityID.setAllRGBButton].tap()
-
-        let errVal = value(of: app.staticTexts[AccessibilityID.lastErrorLabel]) ?? ""
-        XCTAssertEqual(errVal, "", "Unexpected error after set RGB: '\(errVal)'")
-    }
-
     func testAllOffButton() throws {
         let app = try launchAppFake()
         defer { app.terminate() }

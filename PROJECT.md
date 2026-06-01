@@ -14,7 +14,7 @@ The user is fluent in photography and software. This system is for their persona
 
 ## Hardware in the system
 
-- **Sony a7CR** (61 MP full-frame, USB-C, supported by Sony Camera Remote SDK v1.10+). Connected to Mac via USB-C data cable for tethered capture and download.
+- **Sony a7CR** (61 MP full-frame, USB-C, supported by Sony Camera Remote SDK v1.10+). Current verified control path is Wi-Fi PC Remote via Sony Camera Remote SDK host-PC auto-download; Imaging Edge Desktop remains the manual fallback.
 - **Sony NP-FZ100 dummy battery / AC coupler** powering the camera (no battery during sessions; eliminates a failure mode).
 - **Sony FE 90mm Macro** as primary scanning lens. Pentax 120mm adapted as fallback.
 - **Scanlight v4** by jackw01. Has **two separate USB-C ports**:
@@ -23,21 +23,27 @@ The user is fluent in photography and software. This system is for their persona
   - Has nine each of 665nm red, 525nm green, 455nm blue, and 5000K 95-CRI white LEDs. The white channel is independently controllable but firmware blocks RGB+W simultaneous operation.
   - Has a 3.5mm shutter jack. **Conditional on tether transport:**
     - If the camera tethers to the Mac over **USB**, do not use the jack. Wiring the jack to the camera's trigger pin while both devices are USB-connected to the same Mac closes a ground loop.
-    - If the camera tethers over **Wi-Fi** (via Imaging Edge Desktop), the jack is safe — no USB closed loop. This is the path Phase 2 enables via `--trigger-mode hw`.
+    - If the camera tethers over **Wi-Fi** (via Sony SDK or Imaging Edge Desktop), the jack is safe — no USB closed loop. Phase 2 enables this via `--trigger-mode hw` for IED-backed capture.
 - **Valoi 360 Advancer**, manually operated. Mounted on the Scanlight Valoi adapter. User advances the film by hand between frames; no motor.
 - **Mac (Apple Silicon)** running macOS. Sony Camera Remote SDK in user's possession.
 - **(Optional)** Sony USB-C → 3.5mm trigger cable. Used only with the Wi-Fi-tether path described above.
 
 ### Hardware architecture
 
-Two supported configurations.
+Three supported configurations.
 
-**Configuration A — USB tether, SDK-fired shutter (default, `--trigger-mode sdk`)**
+**Current direction (2026-05-22):** Sony SDK capture works over Wi-Fi using
+host-PC auto-download, and the Swift app passes SDK settings through
+`triplet-capture` to `sony-capture`. Configuration C (`--trigger-mode manual`)
+remains the safest fallback. Configuration B is optional if the Scanlight
+3.5mm shutter pulse proves reliable.
+
+**Configuration A — Wi-Fi Sony SDK trigger/download (`sony-capture`, CLI verified)**
 
 ```
 Mac
- ├── USB-C ──► Sony a7CR (PC Remote mode; capture + download)
- ├── USB-C ──► Scanlight v4 LEFT port (CDC serial control)
+ ├── Wi-Fi ◄──► Sony a7CR (PC Remote mode; SDK capture + host-PC download)
+ ├── USB-A/C ──► Scanlight v4 LEFT port (CDC serial control)
  └── Local SSD ──► output folder for RAWs and composites
 
 Scanlight v4 RIGHT port ◄── USB-C ─── Wall PSU (5V/2A+)
@@ -45,7 +51,9 @@ Valoi 360 ──► seated on Scanlight via official v4 adapter
 a7CR ◄── dummy battery ◄── wall power
 ```
 
-Camera and Scanlight are both on the Mac via USB but operate independently. No 3.5mm jack involved.
+The camera is not USB-tethered to the Mac in this configuration, so the
+3.5mm ground-loop concern does not apply. The current verified command is
+`sony-capture --out PATH --ip-address 10.0.0.247 --mac-address 10:32:2C:26:1A:3F --user USER --password PW`.
 
 **Configuration B — Wi-Fi tether, hardware-fired shutter (`--trigger-mode hw`)**
 
@@ -63,12 +71,31 @@ a7CR ◄── dummy battery ◄── wall power
 
 In Configuration B the Mac issues a `PKT_H2D_SHUTTER_PULSE` to the Scanlight, the Scanlight fires the camera's shutter directly via the 3.5mm jack, and the resulting RAW arrives in IED's inbox over Wi-Fi. The orchestrator (`triplet-capture --trigger-mode hw --ied-inbox PATH`) watches the inbox and moves the file into the roll's canonical naming. The ground loop concern from Configuration A does not apply because there is no USB tether between camera and Mac to close the loop through.
 
+**Configuration C — Wi-Fi tether, manual IED shutter (`--trigger-mode manual`)**
+
+```
+Mac
+ ├── USB-A/C ──► Scanlight v4 LEFT port (CDC serial control)
+ ├── Wi-Fi ◄──► Sony a7CR (Imaging Edge Desktop, save to inbox folder)
+ └── Local SSD ──► IED inbox + roll output folder
+
+Scanlight v4 RIGHT port ◄── USB-C ─── Wall PSU (5V/2A+)
+Valoi 360 ──► seated on Scanlight via official v4 adapter
+a7CR ◄── dummy battery ◄── wall power
+```
+
+In Configuration C the orchestrator sets R/G/B on the Scanlight and waits
+for the next new RAW in IED's inbox. The operator manually fires the
+camera in IED once per lit channel. This is the safest fallback if the
+3.5mm shutter pulse path is not working.
+
 ---
 
 ## Critical do's and don'ts
 
 **Do:**
-- Use the Sony Camera Remote SDK v1.10+ for camera control. The a7CR is officially supported as of v1.10 (Sept 2023). The SDK exposes capture, settings, live view monitoring, and focus position.
+- Use the Swift app's SDK trigger mode for Sony SDK Wi-Fi capture, or Imaging Edge Desktop + watched inbox as the fallback. Manual IED trigger is the safest fallback; the Scanlight 3.5mm pulse path is optional after hardware verification.
+- Treat Sony SDK host-PC auto-download as the working SDK path. RemoteTransfer card contents listing is not reliable on the tested a7CR session.
 - Use the Scanlight CDC serial binary protocol documented in `automation/bsl_control_interface.md` of the scanlight repo.
 - Use 16-bit linear ProPhoto-RGB TIFFs as the composite output format.
 - Treat the 200ms unsolicited telemetry packets (LED_TEMP, VBUS) from Scanlight as a continuous background stream. Read them in a separate thread/task and dispatch by header byte. Do not assume the next byte you read is a response to your last command.
@@ -118,15 +145,15 @@ CLI that drives a single capture and download via the Sony Camera Remote SDK.
   1. Write a small C++ executable that takes args and emits status, build once with the SDK's CMake examples as a starting point. Cleanest.
   2. Build a Python binding (pybind11) around the bits we need. More work now, pays off later.
 - Recommend **option 1 for Phase 1** to keep blast radius small. Phase 3's native Swift app links the SDK directly anyway.
-- Interface: `sony-capture --out /path/to/file.ARW [--timeout 30]`
+- Interface: `sony-capture --out /path/to/file.ARW [--timeout 30] [--ip-address IP --user USER --password PW]`
 - Behavior:
   - Enumerate devices, connect to first/only camera.
-  - Set the camera to save destination "Host" (PC tether mode).
+  - Set SDK save info to a scratch host-PC download folder.
   - Trigger shutter release.
   - Wait for the image-ready notification from the SDK.
   - Download the RAW to `--out`. Atomically (write to `.tmp` then rename) so partial files never look complete.
   - Exit 0 on success, nonzero on any failure with a clear stderr message.
-- The camera must be set to PC Remote mode beforehand. The user handles camera settings; the CLI does not change capture settings in Phase 1.
+- The camera must be set to PC Remote mode beforehand. The user handles camera settings; the CLI does not change capture settings in Phase 1. On the tested a7CR, host-PC auto-download works; RemoteTransfer contents listing returns `36101`.
 
 ### Deliverable 1C — Optical dry run protocol
 
@@ -164,7 +191,8 @@ scanlightctl off
 
 ### Deliverable 2A — `triplet-capture` orchestrator
 
-Disposable. Python CLI or small local web app (Flask + a single page is fine). This UI will be replaced in Phase 3 by a native Swift app; do not over-invest.
+Python CLI / Flask backend. The Swift app is now the primary operator
+surface and starts this backend; the Flask page remains a fallback.
 
 - State:
   - `roll_name` (e.g., `Roll001`)
@@ -174,9 +202,12 @@ Disposable. Python CLI or small local web app (Flask + a single page is fine). T
 - Single primary action: **Capture Triplet**
   1. Set Scanlight R only.
   2. Sleep `settle_ms` (default 50ms; configurable).
-  3. Call `sony-capture --out {output_folder}/{roll_name}_Frame{NNN}_R.ARW`.
-  4. Set Scanlight G only. Sleep. Capture as `_G.ARW`.
-  5. Set Scanlight B only. Sleep. Capture as `_B.ARW`.
+  3. Capture/wait according to trigger mode:
+     - `manual`: wait for the operator-fired IED RAW to appear in `--ied-inbox`.
+     - `hw`: pulse the Scanlight shutter output, then wait for the IED RAW.
+     - `sdk`: call `sony-capture` (deferred/reference path).
+  4. Set Scanlight G only. Sleep. Capture/wait as `_G.ARW`.
+  5. Set Scanlight B only. Sleep. Capture/wait as `_B.ARW`.
   6. Set Scanlight off (or back to W for next-frame framing).
   7. Verify all three files exist and are within plausible size range (40–120MB each). If not, surface a clear error and DO NOT advance the frame counter.
   8. On success, advance `frame_number`.
@@ -186,7 +217,7 @@ Disposable. Python CLI or small local web app (Flask + a single page is fine). T
   - Set roll name (resets frame to 1 unless overridden).
   - Set per-channel level/exposure overrides.
 - All operations logged to `{output_folder}/scan_log.jsonl`: timestamp, action, channel, file path, file size, success/fail, error message.
-- The orchestrator imports the `Scanlight` class from Phase 1 (not shelling out to `scanlightctl` for every command — that's slow and ignores telemetry continuity). It DOES shell out to `sony-capture` because the SDK wrapping lives in a separate process.
+- The orchestrator imports the `Scanlight` class from Phase 1 (not shelling out to `scanlightctl` for every command — that's slow and ignores telemetry continuity). It shells out to `sony-capture` in SDK mode.
 
 ### Deliverable 2B — `rgb-composite`
 
@@ -230,32 +261,28 @@ The 36 TIFFs are 16-bit linear ProPhoto-RGB. Imported into FilmLab or NLP, inver
 
 ---
 
-## Phase 3 — Live preview app
+## Phase 3 — Swift app + future live preview
 
-**Goal:** Replace the Phase 2 disposable UI with a native macOS app that adds an inverted live preview during framing and unifies framing + capture in one tool.
+**Current goal:** Use the native macOS app as the unified operator surface
+for Light, Settings, Calibrate, and Scan while wrapping the tested Python
+pipeline. Live inverted preview remains a future hardware-gated goal.
 
 ### Architecture
 
 Swift / SwiftUI macOS app. Apple Silicon target.
 
-- The Sony Camera Remote SDK is C++; wrap it in an Objective-C++ bridging module exposed to Swift.
+- The Sony Camera Remote SDK bridge is still CLI-based. The app launches `triplet-capture`, which routes SDK mode through the verified `sony-capture` Wi-Fi path.
 - The Scanlight serial protocol is re-implemented in Swift (it's tiny — six host-to-device packets, simple framing).
-- Two modes, toggled by a button in the UI:
-  - **Framing mode:**
-    - Scanlight set to white channel only (e.g., W=200, RGB=0).
-    - Sony SDK live view started. Live view delivers JPEG frames; verify resolution/fps at runtime from the SDK.
-    - Each frame decoded via `CGImageSource` → `CIImage`.
-    - Core Image filter chain applied on Metal:
-      1. `CIColorMatrix` for per-film WB neutralization (gain on each channel; user-tunable, saved as per-film presets).
-      2. `CIColorInvert`.
-      3. `CIToneCurve` for a sensible display curve.
-    - Result rendered into an `MTKView` at the live view's native frame rate.
-    - Used for framing, alignment, dust spotting. Focus is done on the camera's EVF/LCD using body-side peaking — the Mac preview is downsampled JPEG and is strictly worse for focus.
-  - **Capture mode:**
-    - Stop live view.
-    - Run the triplet logic from Phase 2 (Scanlight R → capture → G → capture → B → capture → off).
-    - Return to framing mode (white on, live view restart) automatically.
-- Same on-disk output as Phase 2, same naming, same compositor. The compositor remains a separate CLI tool; the app can offer a "composite this roll now" button that shells out to `batch-composite`.
+- Current tabs:
+  - **Light:** manual Scanlight serial control and shutter-pulse test surface.
+  - **Settings:** roll/output/trigger/composite/calibration settings. Default trigger is `manual`.
+  - **Calibrate:** guided rig check, exposure calibration, FFC capture, and numeric checks.
+  - **Scan:** starts/stops the Python orchestrator, captures/retakes frames, and polls composite status.
+- Future live-preview mode:
+  - Scanlight set to white channel only (e.g., W=200, RGB=0).
+  - A camera live-view bridge delivers frames for a Core Image invert/tone pipeline.
+  - Focus remains body-side; Mac preview is for framing, alignment, and dust spotting.
+- Same on-disk output as Phase 2, same naming, same compositor. The Swift app should keep wrapping the Python pipeline rather than rewriting the compositor in Swift.
 
 ### Phase 3 exit criteria
 

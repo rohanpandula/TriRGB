@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from c41_core import BaseRegionDescriptor, InversionParams, make_c41_negative
-from rgb_composite.composite import invert_composite
+from rgb_composite.composite import auto_positive_from_composite, invert_composite
 
 
 # ---------------------------------------------------------------------------
@@ -497,3 +497,38 @@ def test_invert_composite_clips_not_wraps_on_overflow():
             f"channel {ch}: expected 0 (clipped), got {result_b[0, 0, ch]} — "
             "pre-cast value below 0 must be CLIPPED, not wrapped/truncated"
         )
+
+
+def test_auto_positive_uses_base_balance_and_inverts_polarity():
+    """Auto-positive should turn denser negative pixels into lighter output."""
+    triplet = np.zeros((H, W, 3), dtype=np.uint16)
+    rebate_h = max(1, int(H * 0.1))
+    base_rgb = (9000.0, 12000.0, 3000.0)
+
+    triplet[:, :, 0] = 8200
+    triplet[:, :, 1] = 10400
+    triplet[:, :, 2] = 2300
+    triplet[:rebate_h, :, 0] = int(base_rgb[0])
+    triplet[:rebate_h, :, 1] = int(base_rgb[1])
+    triplet[:rebate_h, :, 2] = int(base_rgb[2])
+
+    descriptor = BaseRegionDescriptor(
+        x=0,
+        y=0,
+        w=W,
+        h=rebate_h,
+        base_rgb=base_rgb,
+        uniformity_cv=1.0,
+        source="manual",
+    )
+
+    positive, meta = auto_positive_from_composite(triplet, descriptor)
+
+    assert positive.dtype == np.uint16
+    assert positive.shape == triplet.shape
+    assert meta["profile_base_rgb"] == base_rgb
+    assert meta["frame_base_rgb"] == base_rgb
+
+    rebate_mean = float(positive[:rebate_h, :, :].mean())
+    body_mean = float(positive[rebate_h:, :, :].mean())
+    assert body_mean > rebate_mean + 1000

@@ -2,14 +2,15 @@
 
 Why this exists
 ---------------
-In hardware-trigger mode the Mac doesn't issue the shutter command — the
-Scanlight does, via its 3.5mm jack into the camera's USB-C trigger pins.
-Imaging Edge Desktop (or any Sony PC Remote receiver) is the thing that
-actually picks the resulting RAW up off the camera and writes it to disk.
+In the IED-backed modes the Sony SDK does not own capture. Either the
+Scanlight fires the camera via its 3.5mm jack (``trigger_mode="hw"``), or
+the operator manually presses the shutter button in Imaging Edge Desktop
+(``trigger_mode="manual"``). Imaging Edge Desktop is the thing that actually
+picks the resulting RAW up off the camera and writes it to disk.
 
 The orchestrator's job per channel is then:
   1. Set Scanlight color.
-  2. Pulse the Scanlight's shutter output.
+  2. Fire the shutter by the selected trigger path (hardware pulse or manual IED).
   3. Wait for a new `.ARW` to land in IED's save folder.
   4. Move it to our roll's `{roll}_Frame{NNN}_{channel}.ARW` path.
 

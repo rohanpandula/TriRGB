@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "rawpy>=0.20",
     "numpy>=1.24",
+    "pillow>=10.0",
     "tifffile>=2023.7.0",
     "imagecodecs>=2023.1.23",  # tifffile uses imagecodecs for zlib compression backend
     # Phase 09 additions — already present in env; declared here for correctness.
@@ -26,6 +27,7 @@ dev = ["pytest>=7.0"]
 
 [project.scripts]
 rgb-composite = "rgb_composite.composite:main"
+scanlight-triplet-positive = "rgb_composite.triplet_positive:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["rgb_composite"]

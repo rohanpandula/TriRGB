@@ -170,6 +170,32 @@ def test_channel_calibration_rejects_clip_fraction_overflow():
         ChannelCalibration(channel="R", led_level=128, black_level=0.0, gain=1.0, clip_fraction=1.5)
 
 
+def test_channel_calibration_accepts_clip_limited_status():
+    cal = ChannelCalibration(
+        channel="R",
+        led_level=147,
+        black_level=250.0,
+        gain=1.0,
+        clip_fraction=0.0,
+        exposure_status="clip_limited",
+    )
+
+    assert cal.exposure_status == "clip_limited"
+
+
+def test_channel_calibration_accepts_source_limited_status():
+    cal = ChannelCalibration(
+        channel="R",
+        led_level=255,
+        black_level=250.0,
+        gain=1.0,
+        clip_fraction=0.0,
+        exposure_status="source_limited",
+    )
+
+    assert cal.exposure_status == "source_limited"
+
+
 def test_base_region_descriptor_rejects_zero_width():
     with pytest.raises(ValueError, match="w"):
         BaseRegionDescriptor(

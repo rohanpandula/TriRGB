@@ -15,8 +15,11 @@ import XCTest
 final class WizardStubURLProtocol: URLProtocol {
 
     static var routes: [String: (Data, Int)] = [:]
+    static var hangingPaths: Set<String> = []
+    static var stoppedPaths: [String] = []
     static var lastRequest: URLRequest? = nil
     static var lastBody: Data? = nil
+    static var requestHandler: ((URLRequest) -> (Data, Int)?)? = nil
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -42,7 +45,12 @@ final class WizardStubURLProtocol: URLProtocol {
         }
 
         let path = request.url?.path ?? ""
-        let (data, status) = Self.routes[path] ?? (Data(), 404)
+        if Self.hangingPaths.contains(path) {
+            return
+        }
+        let (data, status) = Self.requestHandler?(request)
+            ?? Self.routes[path]
+            ?? (Data(), 404)
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: status,
@@ -54,7 +62,11 @@ final class WizardStubURLProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        if let path = request.url?.path {
+            Self.stoppedPaths.append(path)
+        }
+    }
 }
 
 // MARK: - Fixture helpers
@@ -81,7 +93,17 @@ private func makeStateJSON() -> Data {
     return json.data(using: .utf8)!
 }
 
-private func makeExposureJSON(ledR: Int = 180, ledG: Int = 160, ledB: Int = 230) -> Data {
+private func makeExposureJSON(
+    ledR: Int = 180,
+    ledG: Int = 160,
+    ledB: Int = 230,
+    shutterR: String? = nil,
+    shutterG: String? = nil,
+    shutterB: String? = nil
+) -> Data {
+    let rShutter = shutterR.map { "\"shutter_speed\": \"\($0)\"," } ?? ""
+    let gShutter = shutterG.map { "\"shutter_speed\": \"\($0)\"," } ?? ""
+    let bShutter = shutterB.map { "\"shutter_speed\": \"\($0)\"," } ?? ""
     let json = """
     {
         "r": {
@@ -90,6 +112,10 @@ private func makeExposureJSON(ledR: Int = 180, ledG: Int = 160, ledB: Int = 230)
             "black_level": 256.0,
             "gain": 1.234,
             "clip_fraction": 0.02,
+            "p99": 62200.0,
+            "target": 62258.0,
+            "exposure_status": "target",
+            \(rShutter)
             "schema_version": 1
         },
         "g": {
@@ -98,6 +124,10 @@ private func makeExposureJSON(ledR: Int = 180, ledG: Int = 160, ledB: Int = 230)
             "black_level": 260.0,
             "gain": 1.100,
             "clip_fraction": 0.01,
+            "p99": 62250.0,
+            "target": 62258.0,
+            "exposure_status": "target",
+            \(gShutter)
             "schema_version": 1
         },
         "b": {
@@ -106,6 +136,10 @@ private func makeExposureJSON(ledR: Int = 180, ledG: Int = 160, ledB: Int = 230)
             "black_level": 258.0,
             "gain": 1.500,
             "clip_fraction": 0.03,
+            "p99": 62300.0,
+            "target": 62258.0,
+            "exposure_status": "target",
+            \(bShutter)
             "schema_version": 1
         },
         "base_region": {
@@ -195,8 +229,11 @@ final class CalibrationWizardViewModelTests: XCTestCase {
     override func setUp() {
         super.setUp()
         WizardStubURLProtocol.routes = [:]
+        WizardStubURLProtocol.hangingPaths = []
+        WizardStubURLProtocol.stoppedPaths = []
         WizardStubURLProtocol.lastRequest = nil
         WizardStubURLProtocol.lastBody = nil
+        WizardStubURLProtocol.requestHandler = nil
     }
 
     // MARK: - SC-5 canonical test: all 4 steps, hardware-free
@@ -222,6 +259,7 @@ final class CalibrationWizardViewModelTests: XCTestCase {
         vm.currentStep = 2
 
         // Step 2 — exposure
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
         await vm.triggerExposure()
         XCTAssertNotNil(vm.exposureResult, "exposureResult should be set after Step 2")
         XCTAssertEqual(vm.exposureResult?.r.ledLevel, 180, "R LED level should decode")
@@ -263,7 +301,160 @@ final class CalibrationWizardViewModelTests: XCTestCase {
         XCTAssertEqual(result.g.ledLevel, 170)
         XCTAssertEqual(result.b.ledLevel, 240)
         XCTAssertEqual(result.r.channel, "R")
+        XCTAssertEqual(result.r.exposureStatus, "target")
+        XCTAssertEqual(result.r.target, 62258.0)
+        XCTAssertEqual(result.r.p99, 62200.0)
         XCTAssertGreaterThan(result.r.clipFraction, 0)
+    }
+
+    func testTriggerExposureConflictReattachesToExistingResult() async throws {
+        WizardStubURLProtocol.routes["/api/calibrate/exposure"] = (
+            #"{"error":"A scan is in progress — wait for it to finish.","call_id":"existing-run"}"#
+                .data(using: .utf8)!,
+            409
+        )
+        WizardStubURLProtocol.routes["/api/calibrate/progress"] = (
+            """
+            {
+                "event": "sony_capture_start",
+                "message": "Camera is capturing/downloading the dark frame at shutter 1/40.",
+                "recent_events": [
+                    {
+                        "event": "sony_capture_start",
+                        "message": "Camera is capturing/downloading the dark frame at shutter 1/40.",
+                        "label": "dark-frame",
+                        "shutter_speed": "1/40",
+                        "ts": "2026-05-23T06:05:04Z"
+                    }
+                ]
+            }
+            """.data(using: .utf8)!,
+            200
+        )
+        WizardStubURLProtocol.routes["/api/calibrate/exposure-result"] = (
+            makeExposureJSON(ledR: 201, ledG: 202, ledB: 203),
+            200
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+
+        await vm.triggerExposure()
+
+        XCTAssertNotNil(vm.exposureResult)
+        XCTAssertEqual(vm.exposureResult?.r.ledLevel, 201)
+        XCTAssertNil(vm.lastError[2])
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testTriggerExposureRetriesOnceWhenBusyConflictIsIdle() async throws {
+        var exposureRequests = 0
+        WizardStubURLProtocol.requestHandler = { request in
+            switch request.url?.path {
+            case "/api/calibrate/exposure":
+                exposureRequests += 1
+                if exposureRequests == 1 {
+                    return (#"{"error":"A capture is in progress — wait for it to finish."}"#
+                        .data(using: .utf8)!, 409)
+                }
+                return (makeExposureJSON(ledR: 211, ledG: 212, ledB: 213), 200)
+            case "/api/calibrate/progress":
+                return (
+                    """
+                    {
+                        "event": "idle",
+                        "message": "Waiting for calibration capture to start.",
+                        "recent_events": []
+                    }
+                    """.data(using: .utf8)!,
+                    200
+                )
+            default:
+                return nil
+            }
+        }
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+
+        await vm.triggerExposure()
+
+        XCTAssertEqual(exposureRequests, 2)
+        XCTAssertEqual(vm.exposureResult?.r.ledLevel, 211)
+        XCTAssertNil(vm.lastError[2])
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testTriggerExposureClearsPriorResultBeforeRerunFailure() async throws {
+        WizardStubURLProtocol.routes["/api/calibrate/exposure"] = (
+            #"{"error":"forced failure"}"#.data(using: .utf8)!,
+            500
+        )
+        WizardStubURLProtocol.routes["/api/calibrate/progress"] = (
+            """
+            {
+                "event": "idle",
+                "message": "Waiting for calibration capture to start.",
+                "recent_events": []
+            }
+            """.data(using: .utf8)!,
+            200
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        vm.exposureResult = try decoder.decode(
+            ExposureCalibrationResult.self,
+            from: makeExposureJSON(ledR: 201, ledG: 202, ledB: 203)
+        )
+
+        await vm.triggerExposure()
+
+        XCTAssertNil(vm.exposureResult, "A failed re-run must not leave stale exposure settings visible.")
+        XCTAssertNotNil(vm.lastError[2])
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testTriggerExposureReleasesUIWhenBackendNeverStartsCapture() async throws {
+        WizardStubURLProtocol.hangingPaths = ["/api/calibrate/exposure"]
+        WizardStubURLProtocol.routes["/api/calibrate/progress"] = (
+            """
+            {
+                "event": "idle",
+                "message": "Waiting for calibration capture to start.",
+                "recent_events": []
+            }
+            """.data(using: .utf8)!,
+            200
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        vm.exposureNoStartTimeoutSeconds = 0.05
+        vm.exposureProgressPollIntervalNanoseconds = 10_000_000
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+
+        await vm.triggerExposure()
+
+        XCTAssertNil(vm.exposureResult)
+        XCTAssertFalse(vm.isRunning)
+        XCTAssertEqual(
+            vm.lastError[2],
+            "Exposure calibration did not start. The backend stayed idle, so no camera capture is running. Try Run Exposure again; if it repeats, stop calibration and run the rig check again."
+        )
+        XCTAssertTrue(
+            WizardStubURLProtocol.stoppedPaths.contains("/api/calibrate/exposure"),
+            "The hung exposure request should be cancelled when the no-start watchdog fires."
+        )
     }
 
     // MARK: - FFC combined shape
@@ -308,6 +499,7 @@ final class CalibrationWizardViewModelTests: XCTestCase {
 
         await vm.triggerRigCheck()
         vm.currentStep = 2   // simulate "Next" (triggers no longer auto-advance — IN-03 fix)
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
         await vm.triggerExposure()
         vm.currentStep = 3
         await vm.triggerFFC()
@@ -332,10 +524,55 @@ final class CalibrationWizardViewModelTests: XCTestCase {
             "{\"error\": \"dark frame failed\"}".data(using: .utf8)!,
             500
         )
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
         await vm.triggerExposure()
         XCTAssertNotNil(vm.lastError[2], "lastError[2] set on 500 response")
         XCTAssertNil(vm.exposureResult, "exposureResult stays nil on error")
         XCTAssertFalse(vm.isRunning, "isRunning false after error")
+    }
+
+    func testExposureErrorMapsSonyCaptureExit127ToActionableCopy() async throws {
+        WizardStubURLProtocol.routes["/api/calibrate/exposure"] = (
+            "{\"error\":\"dark-frame capture failed: sony-capture failed for channel R (exit 127)\"}"
+                .data(using: .utf8)!,
+            500
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+        await vm.triggerExposure()
+
+        XCTAssertEqual(
+            vm.lastError[2],
+            "Sony SDK capture tool was not found. Build phase1/sony-capture, then use Set Up > Check Camera before running calibration."
+        )
+        XCTAssertNil(vm.exposureResult)
+        XCTAssertFalse(vm.isRunning)
+    }
+
+    func testExposureErrorMapsNonWritableShutterToManualModeCopy() async throws {
+        WizardStubURLProtocol.routes["/api/calibrate/exposure"] = (
+            "{\"error\":\"Camera shutter speed is not writable over the Sony SDK. Set the camera mode dial to M/manual exposure.\"}"
+                .data(using: .utf8)!,
+            500
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+        await vm.triggerExposure()
+
+        XCTAssertEqual(
+            vm.lastError[2],
+            "Camera shutter speed is not writable. Set the camera mode dial to M/manual exposure, keep f/8 fixed, and let the SDK set ISO 100 or ISO 125 before running exposure calibration again."
+        )
+        XCTAssertNil(vm.exposureResult)
+        XCTAssertFalse(vm.isRunning)
     }
 
     // MARK: - FIX-A: registration "not available" (empty deltas) excluded from roll verdict
@@ -354,6 +591,7 @@ final class CalibrationWizardViewModelTests: XCTestCase {
 
         await vm.triggerRigCheck()
         vm.currentStep = 2
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
         await vm.triggerExposure()
         vm.currentStep = 3
         await vm.triggerFFC()
@@ -389,6 +627,7 @@ final class CalibrationWizardViewModelTests: XCTestCase {
 
         await vm.triggerRigCheck()
         vm.currentStep = 2   // simulate "Next" (triggers no longer auto-advance — IN-03 fix)
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
         await vm.triggerExposure()
         vm.currentStep = 3   // simulate "Next"
 
@@ -405,11 +644,426 @@ final class CalibrationWizardViewModelTests: XCTestCase {
         XCTAssertNil(vm.checkResults, "reset() clears checkResults")
         XCTAssertEqual(vm.lastError, [:], "reset() clears lastError")
         XCTAssertNil(vm.rebateCoord, "reset() clears rebateCoord")
+        XCTAssertNil(vm.rigCheckProgressText, "reset() clears rigCheckProgressText")
     }
 
-    // MARK: - AX-ID count is exactly 44 (compile-time rename guard)
+    func testTriggerRigCheckReportsCompletionProgress() async throws {
+        WizardStubURLProtocol.routes["/api/state"] = (makeStateJSON(), 200)
 
-    func testAXIDWizardCountIsExactly44() {
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+
+        await vm.triggerRigCheck()
+
+        XCTAssertNotNil(vm.rigCheckResult)
+        XCTAssertFalse(vm.isRunning)
+        XCTAssertEqual(vm.rigCheckProgressText, "Rig check complete.")
+        XCTAssertNil(vm.lastError[1])
+    }
+
+    func testRebateRegionMapsNormalizedLiveViewPointToRawROI() {
+        let region = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+
+        XCTAssertEqual(region.w, 96)
+        XCTAssertEqual(region.h, 96)
+        XCTAssertEqual(region.x, 4736)
+        XCTAssertEqual(region.y, 3140)
+    }
+
+    func testTriggerExposureRequiresSelectedMeasurementRegion() async throws {
+        WizardStubURLProtocol.routes["/api/calibrate/exposure"] = (makeExposureJSON(), 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+
+        await vm.triggerExposure()
+
+        XCTAssertNil(vm.exposureResult)
+        XCTAssertFalse(vm.isRunning)
+        XCTAssertEqual(
+            vm.lastError[2],
+            "Select a film-base sample in the preview before running exposure. The app measures only the highlighted RAW crop."
+        )
+        XCTAssertNil(WizardStubURLProtocol.lastRequest)
+    }
+
+    // MARK: - Swift app unification hooks
+
+    func testApplyExposureWritesCalibratedLevelsToSettings() async throws {
+        WizardStubURLProtocol.routes["/api/calibrate/exposure"] = (
+            makeExposureJSON(
+                ledR: 181,
+                ledG: 162,
+                ledB: 231,
+                shutterR: "1/60",
+                shutterG: "1/30",
+                shutterB: "1/15"
+            ),
+            200
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.levelR = 10
+        store.settings.levelG = 20
+        store.settings.levelB = 30
+
+        await vm.triggerExposure()
+        vm.applyExposure(to: store)
+
+        XCTAssertEqual(store.settings.levelR, 181)
+        XCTAssertEqual(store.settings.levelG, 162)
+        XCTAssertEqual(store.settings.levelB, 231)
+        XCTAssertEqual(store.settings.shutterR, "1/60")
+        XCTAssertEqual(store.settings.shutterG, "1/30")
+        XCTAssertEqual(store.settings.shutterB, "1/15")
+    }
+
+    func testSkipFFCClearsStaleCorrectionAndAdvances() {
+        let client = OrchestratorClient(session: makeStubSession())
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.ffcCalibration = "/tmp/old-flat.npy"
+        vm.currentStep = 3
+        vm.lastError[3] = "old error"
+
+        vm.skipFFC(in: store)
+
+        XCTAssertTrue(vm.ffcSkipped)
+        XCTAssertNil(vm.ffcResult)
+        XCTAssertNil(store.settings.ffcCalibration)
+        XCTAssertNil(vm.lastError[3])
+        XCTAssertEqual(vm.currentStep, 4)
+    }
+
+    func testStockCalibrationProfilesPersistAndApplyExposureRecipe() async throws {
+        WizardStubURLProtocol.routes["/api/calibrate/exposure"] = (
+            makeExposureJSON(
+                ledR: 181,
+                ledG: 162,
+                ledB: 231,
+                shutterR: "1/60",
+                shutterG: "1/30",
+                shutterB: "1/15"
+            ),
+            200
+        )
+
+        let suiteName = "ScanlightApp.StockCalibrationProfiles.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated UserDefaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        vm.rebateRegion = RebateRegion.centeredAtNormalized(x: 0.5, y: 0.5)
+        let store = SettingsStore(userDefaults: defaults)
+        store.settings.triggerMode = "sdk"
+        store.settings.cameraModel = "Sony ILCE-7CR"
+
+        await vm.triggerExposure()
+        vm.calibrationStockName = "  Portra   400 "
+        vm.saveCurrentStockProfile(to: store)
+
+        XCTAssertEqual(store.stockCalibrationProfiles.count, 1)
+        XCTAssertEqual(store.stockCalibrationProfiles.first?.stockName, "Portra 400")
+        XCTAssertEqual(vm.selectedStockProfileID, store.stockCalibrationProfiles.first?.id)
+
+        let reloadedStore = SettingsStore(userDefaults: defaults)
+        let saved = try XCTUnwrap(reloadedStore.stockCalibrationProfiles.first)
+        XCTAssertEqual(saved.stockName, "Portra 400")
+        XCTAssertEqual(saved.exposureResult.r.ledLevel, 181)
+        XCTAssertEqual(saved.exposureResult.r.shutterSpeed, "1/60")
+
+        reloadedStore.settings.levelR = 1
+        reloadedStore.settings.levelG = 2
+        reloadedStore.settings.levelB = 3
+        reloadedStore.settings.shutterR = nil
+        reloadedStore.settings.shutterG = nil
+        reloadedStore.settings.shutterB = nil
+
+        let applyVM = CalibrationWizardViewModel(orchestratorClient: client)
+        applyVM.selectedStockProfileID = saved.id
+        applyVM.applySelectedStockProfile(from: reloadedStore)
+
+        XCTAssertEqual(reloadedStore.settings.levelR, 181)
+        XCTAssertEqual(reloadedStore.settings.levelG, 162)
+        XCTAssertEqual(reloadedStore.settings.levelB, 231)
+        XCTAssertEqual(reloadedStore.settings.shutterR, "1/60")
+        XCTAssertEqual(reloadedStore.settings.shutterG, "1/30")
+        XCTAssertEqual(reloadedStore.settings.shutterB, "1/15")
+        XCTAssertEqual(applyVM.exposureResult?.b.shutterSpeed, "1/15")
+        XCTAssertTrue(applyVM.stockProfileMessage?.contains("fresh flat field") ?? false)
+    }
+
+    func testStockCalibrationProfilesCanBeEditedRenamedAndDeleted() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let exposure = try decoder.decode(
+            ExposureCalibrationResult.self,
+            from: makeExposureJSON(
+                ledR: 181,
+                ledG: 162,
+                ledB: 231,
+                shutterR: "1/60",
+                shutterG: "1/30",
+                shutterB: "1/15"
+            )
+        )
+
+        let store = SettingsStore(persistenceEnabled: false)
+        let profile = try XCTUnwrap(store.saveStockCalibrationProfile(stockName: "Portra 400", exposureResult: exposure))
+        _ = store.saveStockCalibrationProfile(stockName: "Ektar 100", exposureResult: exposure)
+
+        let updated = try store.updateStockCalibrationProfile(
+            id: profile.id,
+            stockName: " Portra 400 warm ",
+            ledR: 300,
+            ledG: 150,
+            ledB: -4,
+            shutterR: " 1/40 ",
+            shutterG: "",
+            shutterB: "1/20"
+        )
+
+        XCTAssertEqual(updated.stockName, "Portra 400 warm")
+        XCTAssertEqual(updated.exposureResult.r.ledLevel, 255)
+        XCTAssertEqual(updated.exposureResult.g.ledLevel, 150)
+        XCTAssertEqual(updated.exposureResult.b.ledLevel, 0)
+        XCTAssertEqual(updated.exposureResult.r.shutterSpeed, "1/40")
+        XCTAssertNil(updated.exposureResult.g.shutterSpeed)
+        XCTAssertEqual(updated.exposureResult.b.shutterSpeed, "1/20")
+
+        XCTAssertThrowsError(
+            try store.updateStockCalibrationProfile(
+                id: updated.id,
+                stockName: "Ektar 100",
+                ledR: 1,
+                ledG: 2,
+                ledB: 3,
+                shutterR: nil,
+                shutterG: nil,
+                shutterB: nil
+            )
+        ) { error in
+            XCTAssertEqual(error as? StockProfileEditError, .duplicateName("Ektar 100"))
+        }
+
+        XCTAssertTrue(store.deleteStockCalibrationProfile(id: updated.id))
+        XCTAssertNil(store.stockCalibrationProfile(id: updated.id))
+    }
+
+    func testPrepareForCalibrationValidatesSettingsBeforeStartingServer() async throws {
+        let client = OrchestratorClient(session: makeStubSession())
+        let lightVM = ScanlightViewModel(transportFactory: FakeBridge.makeTransport)
+        let coordinator = ScanCoordinator(client: client, lightViewModel: lightVM)
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.outputFolder = ""
+        store.settings.iedInbox = nil
+
+        let cameraConnection = SonyCameraConnection()
+
+        let ok = await vm.prepareForCalibration(
+            store: store,
+            coordinator: coordinator,
+            cameraConnection: cameraConnection
+        )
+
+        XCTAssertFalse(ok)
+        XCTAssertEqual(coordinator.phase, .idle)
+        XCTAssertFalse(client.isRunning)
+        XCTAssertNotNil(vm.lastError[1])
+        XCTAssertFalse(vm.isRunning)
+        XCTAssertNil(vm.rigCheckProgressText)
+        XCTAssertTrue(store.validationErrors.keys.contains("outputFolder"))
+        XCTAssertTrue(store.validationErrors.keys.contains("iedInbox"))
+    }
+
+    func testPrepareForCalibrationRequestsPreviewRefreshAfterSuccessfulCheck() async throws {
+        WizardStubURLProtocol.routes["/api/state"] = (makeStateJSON(), 200)
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        let fakeBackend = FakeOrchestratorClient()
+        let fakeLight = FakeLightPanel()
+        fakeLight.scanlightPort = "/dev/cu.usbmodemTEST"
+        let coordinator = ScanCoordinator(clientProto: fakeBackend, lightPanelProto: fakeLight)
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.outputFolder = "/tmp"
+        store.settings.iedInbox = "/tmp/ied"
+
+        let cameraConnection = SonyCameraConnection()
+
+        let ok = await vm.prepareForCalibration(
+            store: store,
+            coordinator: coordinator,
+            cameraConnection: cameraConnection
+        )
+
+        XCTAssertTrue(ok)
+        XCTAssertEqual(coordinator.phase, .calibrating)
+        XCTAssertEqual(vm.previewRefreshGeneration, 1)
+        XCTAssertEqual(vm.rigCheckResult?.rollName, "Roll001")
+        XCTAssertEqual(vm.rigCheckProgressText, "Rig check complete. Refreshing live frame.")
+    }
+
+    func testPrepareForCalibrationPersistsResolvedSonyIPBeforeLaunch() async throws {
+        let oldProvider = OrchestratorClient.sonyARPTableProvider
+        OrchestratorClient.sonyARPTableProvider = {
+            "? (10.0.0.244) at 10:32:2c:26:1a:3f on en0 ifscope [ethernet]\n"
+        }
+        defer { OrchestratorClient.sonyARPTableProvider = oldProvider }
+
+        WizardStubURLProtocol.routes["/api/state"] = (makeStateJSON(), 200)
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        client.sonyConnectionProbeOverride = { settings in
+            XCTAssertEqual(settings.sonyIpAddress, "10.0.0.244")
+            return SonyConnectionProbeResult(success: true, message: "Connected to Sony camera.")
+        }
+        let coordinator = ScanCoordinator(
+            clientProto: FakeOrchestratorClient(),
+            lightPanelProto: FakeLightPanel()
+        )
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.outputFolder = "/tmp"
+        store.settings.triggerMode = "sdk"
+        store.settings.sonyIpAddress = "10.0.0.247"
+        store.settings.sonyMacAddress = "10:32:2C:26:1A:3F"
+        store.settings.sonyUser = "sdk-user"
+        store.settings.sonyPassword = "sdk-password"
+
+        let cameraConnection = SonyCameraConnection()
+
+        let ok = await vm.prepareForCalibration(
+            store: store,
+            coordinator: coordinator,
+            cameraConnection: cameraConnection
+        )
+
+        XCTAssertTrue(ok)
+        XCTAssertEqual(store.settings.sonyIpAddress, "10.0.0.244")
+        XCTAssertTrue(cameraConnection.isOnline)
+    }
+
+    func testPrepareForCalibrationStopsWhenSDKCameraProbeFails() async throws {
+        let client = OrchestratorClient(session: makeStubSession())
+        client.sonyConnectionProbeOverride = { _ in
+            SonyConnectionProbeResult(success: false, message: "Timed out connecting to the Sony camera.")
+        }
+        let fakeBackend = FakeOrchestratorClient()
+        let fakeLight = FakeLightPanel()
+        fakeLight.scanlightPort = "/dev/cu.usbmodemTEST"
+        let coordinator = ScanCoordinator(clientProto: fakeBackend, lightPanelProto: fakeLight)
+        let vm = CalibrationWizardViewModel(orchestratorClient: client)
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.outputFolder = "/tmp"
+        store.settings.triggerMode = "sdk"
+        store.settings.sonyIpAddress = "10.0.0.247"
+        store.settings.sonyUser = "sdk-user"
+        store.settings.sonyPassword = "sdk-password"
+
+        let cameraConnection = SonyCameraConnection()
+
+        let ok = await vm.prepareForCalibration(
+            store: store,
+            coordinator: coordinator,
+            cameraConnection: cameraConnection
+        )
+
+        XCTAssertFalse(ok)
+        XCTAssertEqual(coordinator.phase, .idle)
+        XCTAssertFalse(cameraConnection.isOnline)
+        XCTAssertEqual(cameraConnection.chipText, "OFFLINE")
+        XCTAssertTrue(vm.lastError[1]?.contains("not reachable") ?? false)
+    }
+
+    func testSonyCameraConnectionClearsCheckingWhenProbeHangs() async throws {
+        let client = OrchestratorClient(session: makeStubSession())
+        client.sonyConnectionProbeOverride = { _ in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            return SonyConnectionProbeResult(success: true, message: "Connected too late.")
+        }
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.triggerMode = "sdk"
+        store.settings.sonyIpAddress = "10.0.0.247"
+        store.settings.sonyUser = "sdk-user"
+        store.settings.sonyPassword = "sdk-password"
+
+        let cameraConnection = SonyCameraConnection(checkTimeout: 0.05)
+
+        let ok = await cameraConnection.check(store: store, orchestratorClient: client)
+
+        XCTAssertFalse(ok)
+        XCTAssertFalse(cameraConnection.isChecking)
+        XCTAssertFalse(cameraConnection.isOnline)
+        XCTAssertEqual(cameraConnection.chipText, "OFFLINE")
+        XCTAssertTrue(cameraConnection.detailText.contains("did not finish within 1 seconds"))
+    }
+
+    /// Regression for the "Checking..." UI sticking forever even when no
+    /// `sony-capture` process is left running. The original
+    /// `withTaskGroup`-based race waited for the loser task to finish before
+    /// resolving the parent — so a probe stuck on uncancellable synchronous
+    /// I/O (e.g. `Pipe.readDataToEndOfFile` waiting for an EOF that never
+    /// arrives) pinned the camera-check at `.checking` forever.
+    ///
+    /// A `withCheckedContinuation` that never resumes is the cleanest way to
+    /// simulate that pathological case: cancellation can't recover from it
+    /// (the suspended task never sees a cancellation point), and any
+    /// task-group await on it would block forever. The fix MUST resolve
+    /// against the outer timeout regardless.
+    func testSonyCameraConnectionRecoversWhenProbeNeverResolves() async throws {
+        let client = OrchestratorClient(session: makeStubSession())
+        client.sonyConnectionProbeOverride = { _ in
+            // Intentionally never resume — simulates an uncancellable hang
+            // in the underlying process/pipe layer (e.g. a synchronous
+            // Pipe.readDataToEndOfFile that never sees EOF). Using
+            // UnsafeContinuation because we deliberately leak it; the
+            // CheckedContinuation runtime warning would be noise here.
+            await withUnsafeContinuation { (_: UnsafeContinuation<SonyConnectionProbeResult, Never>) in
+            }
+        }
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.triggerMode = "sdk"
+        store.settings.sonyIpAddress = "10.0.0.247"
+        store.settings.sonyUser = "sdk-user"
+        store.settings.sonyPassword = "sdk-password"
+
+        let cameraConnection = SonyCameraConnection(checkTimeout: 0.2)
+
+        let start = Date()
+        let ok = await cameraConnection.check(store: store, orchestratorClient: client)
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertFalse(ok)
+        XCTAssertFalse(cameraConnection.isChecking, "phase must leave .checking even if probe never returns")
+        XCTAssertFalse(cameraConnection.isOnline)
+        XCTAssertEqual(cameraConnection.chipText, "OFFLINE")
+        XCTAssertTrue(
+            cameraConnection.detailText.contains("did not finish within"),
+            "expected timeout message, got: \(cameraConnection.detailText)"
+        )
+        // Bounded recovery: must return promptly after the deadline, not
+        // wait for the hung probe to finish (which it never will).
+        XCTAssertLessThan(elapsed, 2.0,
+            "check() should resolve shortly after the 0.2s timeout, took \(elapsed)s")
+    }
+
+    // MARK: - AX-ID count is exactly 48 (compile-time rename guard)
+
+    func testAXIDWizardCountIsExactly48() {
         let wizardIDs: [String] = [
             // Progress (4)
             AccessibilityID.wizardStep1Indicator,
@@ -438,6 +1092,10 @@ final class CalibrationWizardViewModelTests: XCTestCase {
             AccessibilityID.exposureOverall,
             AccessibilityID.rebatePicker,
             AccessibilityID.rebateClearBtn,
+            AccessibilityID.stockProfileNameField,
+            AccessibilityID.stockProfileSaveBtn,
+            AccessibilityID.stockProfilePicker,
+            AccessibilityID.stockProfileApplyBtn,
             // Flat Field (12)
             AccessibilityID.ffcFalloffR,
             AccessibilityID.ffcFalloffG,
@@ -463,7 +1121,7 @@ final class CalibrationWizardViewModelTests: XCTestCase {
             AccessibilityID.resultsRollVerdict,
         ]
 
-        XCTAssertEqual(wizardIDs.count, 44, "Expected exactly 44 wizard AX-IDs")
+        XCTAssertEqual(wizardIDs.count, 48, "Expected exactly 48 wizard AX-IDs")
 
         // Spot-check prefixes per naming convention
         let indicators = wizardIDs.filter { $0.hasPrefix("indicator-") }
@@ -476,6 +1134,6 @@ final class CalibrationWizardViewModelTests: XCTestCase {
         XCTAssertGreaterThan(lbls.count, 30, "Majority are lbl-* IDs")
 
         let pickers = wizardIDs.filter { $0.hasPrefix("picker-") }
-        XCTAssertEqual(pickers.count, 1, "1 picker-* ID")
+        XCTAssertEqual(pickers.count, 2, "2 picker-* IDs")
     }
 }

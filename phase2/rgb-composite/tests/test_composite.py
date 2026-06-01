@@ -150,6 +150,40 @@ def test_sidecar_written_by_default(demosaics_stub, tmp_path):
     assert "NOT INVERTED" in text
 
 
+def test_composite_writes_positive_sibling_when_profile_provided(demosaics_stub, tmp_path):
+    out = tmp_path / "frame.tif"
+    profile = {
+        "base_region": {
+            "x": 0,
+            "y": 0,
+            "w": W,
+            "h": 8,
+            "base_rgb": [50000.0, 48000.0, 42000.0],
+            "uniformity_cv": 1.0,
+            "source": "manual",
+            "schema_version": 1,
+        }
+    }
+
+    composite_triplet(
+        tmp_path / "r.ARW",
+        tmp_path / "g.ARW",
+        tmp_path / "b.ARW",
+        out,
+        positive_profile_json=profile,
+    )
+
+    positive = out.with_name("frame_positive.tif")
+    assert positive.exists()
+    rendered = tifffile.imread(positive)
+    assert rendered.shape == (H, W, 3)
+    assert rendered.dtype == np.uint16
+
+    sidecar = positive.with_suffix(positive.suffix + ".colorspace.txt")
+    assert sidecar.exists()
+    assert "AUTO POSITIVE" in sidecar.read_text()
+
+
 def test_sidecar_can_be_disabled(demosaics_stub, tmp_path):
     out = tmp_path / "frame.tif"
     composite_triplet(

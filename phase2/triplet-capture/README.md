@@ -2,18 +2,30 @@
 
 Per-frame R/G/B capture orchestrator. One button, three exposures, manual film advance between frames.
 
-Phase 2 / Deliverable 2A of the film scanner build — see `../../PROJECT.md`. **This UI is disposable** — Phase 3's native Swift app replaces it. Don't invest beyond what the operator needs to press a button per frame.
+Phase 2 / Deliverable 2A of the film scanner build — see `../../PROJECT.md`.
+The Flask UI is now a fallback/manual surface; the Swift app starts and
+drives this same Python orchestrator for the unified workflow.
 
 ## What it does, per frame
 
 ```
-Scanlight R only → sleep settle_ms → sony-capture --out {roll}_Frame{NNN}_R.ARW
-Scanlight G only → sleep settle_ms → sony-capture --out {roll}_Frame{NNN}_G.ARW
-Scanlight B only → sleep settle_ms → sony-capture --out {roll}_Frame{NNN}_B.ARW
+Scanlight R only → sleep settle_ms → capture/wait → {roll}_Frame{NNN}_R.ARW
+Scanlight G only → sleep settle_ms → capture/wait → {roll}_Frame{NNN}_G.ARW
+Scanlight B only → sleep settle_ms → capture/wait → {roll}_Frame{NNN}_B.ARW
 Scanlight off
 Verify all three files exist and are 40–120 MB
 Advance frame counter — ONLY on success
 ```
+
+Capture/wait is selected by `--trigger-mode`:
+
+| Mode | Behavior |
+|---|---|
+| `manual` | Current default. The app sets each Scanlight color and waits for the operator to manually trigger an Imaging Edge Desktop capture into `--ied-inbox`. No Sony SDK and no Scanlight shutter pulse. |
+| `hw` | The app sets each Scanlight color, pulses the Scanlight 3.5 mm shutter output, then waits for the resulting IED inbox file. |
+| `sdk` | Sony SDK path via `sony-capture`. The Swift app passes the Wi-Fi IP/MAC and Access Auth fields through to the verified host-PC auto-download path. |
+
+In SDK mode, exposure calibration assumes manual exposure, f/8, and manual focus are fixed. The Sony SDK cannot move the physical mode dial on the a7CR, so the body must already be in M. Each SDK capture asks for ISO 100, falling back to ISO 125 if 100 is not in the camera's candidate list; it does not use extended ISO 50. Calibration then chooses per-channel Sony shutter speed as the coarse exposure control and per-channel Scanlight LED level as the fine trim.
 
 ## Install
 
@@ -23,7 +35,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e "../../phase1/scanlightctl"   # the Scanlight class
 pip install -e .[dev]
-# sony-capture binary must be on $PATH (or pass --sony-capture /path/to/binary)
+# sony-capture is only needed for --trigger-mode sdk.
 ```
 
 ## Run
@@ -31,11 +43,31 @@ pip install -e .[dev]
 ```bash
 triplet-capture \
   --roll-name Roll001 \
-  --output-folder /Volumes/SSD/Scans
+  --output-folder /Volumes/SSD/Scans \
+  --trigger-mode manual \
+  --ied-inbox /Volumes/SSD/_ied_inbox
 # → web UI on http://127.0.0.1:8765
 ```
 
-Open the URL. One button: **Capture Triplet**. Frame counter advances automatically on success. **Retake** overwrites the current frame's files without advancing — use it when the result is bad.
+Open the URL. One button: **Capture Triplet**. In manual mode, fire one
+IED capture when the light is red, one when it is green, and one when it
+is blue. Frame counter advances automatically on success. **Retake**
+overwrites the current frame's files without advancing — use it when the
+result is bad.
+
+SDK mode example:
+
+```bash
+triplet-capture \
+  --roll-name Roll001 \
+  --output-folder /Volumes/SSD/Scans \
+  --trigger-mode sdk \
+  --sony-ip-address 10.0.0.247 \
+  --sony-mac-address 10:32:2C:26:1A:3F \
+  --sony-user USER \
+  --sony-password PASSWORD \
+  --shutter-r 1/4 --shutter-g 1/4 --shutter-b 1/2
+```
 
 ## Layout on disk
 
@@ -60,8 +92,10 @@ Bumping a level brightens that LED (and thus the corresponding camera channel). 
 
 | Failure | Behavior |
 |---|---|
-| `sony-capture` exits nonzero | Surface stderr in the log; frame counter does NOT advance; Scanlight is turned off |
-| `sony-capture` exits 0 but file missing | Same as above |
+| Manual/hardware IED timeout | Surface timeout in the log; frame counter does NOT advance; Scanlight is turned off |
+| Ambiguous IED inbox | Quarantine the inbox files, abort the frame, and do NOT advance |
+| `sony-capture` exits nonzero | SDK mode only. Surface stderr in the log; frame counter does NOT advance; Scanlight is turned off |
+| `sony-capture` exits 0 but file missing | SDK mode only. Same as above |
 | File exists but is <40 MB or >120 MB | Same as above; usually means a corrupt download or the camera changed file format |
 | Scanlight serial error | Propagates as a Python exception; web UI shows it |
 
@@ -90,4 +124,8 @@ with Scanlight() as light:
 pytest
 ```
 
-16 tests cover: settings validation, channel sequencing, frame-counter advance-on-success-only, retake overwrite without advance, implausible-size + missing-file aborts, log-line correctness, the four HTTP endpoints. The Scanlight and sony-capture subprocess are both stubbed; no hardware needed.
+Tests cover: settings validation, channel sequencing, manual IED pickup,
+hardware-pulse pickup, frame-counter advance-on-success-only, retake
+overwrite without advance, implausible-size + missing-file aborts,
+log-line correctness, and the HTTP endpoints. The Scanlight, IED inbox,
+and SDK subprocess are stubbed where needed; no hardware is required.

@@ -3,6 +3,7 @@
 // should call Scanlight, FakeTransport, or SerialPortTransport directly.
 
 import Combine
+import Darwin
 import Foundation
 import ScanlightSwift
 
@@ -44,6 +45,15 @@ final class ScanlightViewModel: ObservableObject {
     /// White channel slider level (0–255).
     @Published var whiteLevel: Double = 0
 
+    /// The four exclusive light channels (drives the switch-style Light tab).
+    enum LightChannel { case red, green, blue, white }
+
+    /// Which single channel is currently lit, or nil if all off. Lighting one
+    /// channel is exclusive — the firmware outputs one set of values and for
+    /// narrowband capture you expose one channel at a time. Drives the on/off
+    /// state of the per-channel toggles.
+    @Published var activeChannel: LightChannel?
+
     /// Pulse duration text field (milliseconds).
     @Published var pulseMs: String = "100"
 
@@ -52,6 +62,11 @@ final class ScanlightViewModel: ObservableObject {
 
     /// Log lines, newest first; capped at 200 entries.
     @Published var logLines: [String] = []
+
+    /// True when manual light controls can safely send serial commands.
+    var manualControlsEnabled: Bool {
+        isConnected && portOwner == .idle
+    }
 
     // MARK: - Port-ownership guard (Phase 07)
 
@@ -67,6 +82,10 @@ final class ScanlightViewModel: ObservableObject {
     /// reactively disable their port-grabbing controls while it is owned.
     @Published var portOwner: PortOwner = .idle
 
+    var scanlightPort: String {
+        port.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     // MARK: - Init
 
     init(transportFactory: @escaping () -> Result<ScanlightTransport, Error>) {
@@ -78,7 +97,14 @@ final class ScanlightViewModel: ObservableObject {
     func connect() {
         guard guardPortOwner("connect") else { return }
         log("connect: opening transport")
-        switch transportFactory() {
+        let transportResult: Result<ScanlightTransport, Error>
+        if !scanlightPort.isEmpty {
+            transportResult = Result { try SerialPortTransport(devicePath: scanlightPort) }
+        } else {
+            transportResult = transportFactory()
+        }
+
+        switch transportResult {
         case .success(let transport):
             let driver = Scanlight(transport: transport)
             self.scanlight = driver
@@ -117,50 +143,90 @@ final class ScanlightViewModel: ObservableObject {
         log("disconnect: closed")
     }
 
+    // Each turnOnX lights ONLY its channel (the others are zeroed, so the
+    // device + the sliders both reflect single-channel exclusivity) and records
+    // `activeChannel` on success. Driven by `toggle(_:)` from the Light tab.
     func turnOnRed() {
-        guard guardPortOwner("turnOnRed") else { return }
+        guard guardPortOwner("turnOnRed"), guardConnected("turnOnRed") else { return }
+        greenLevel = 0; blueLevel = 0; whiteLevel = 0
         attempt("turnOnRed") {
             try scanlight?.setColor(r: Int(redLevel))
+            activeChannel = .red
         }
     }
 
     func turnOnGreen() {
-        guard guardPortOwner("turnOnGreen") else { return }
+        guard guardPortOwner("turnOnGreen"), guardConnected("turnOnGreen") else { return }
+        redLevel = 0; blueLevel = 0; whiteLevel = 0
         attempt("turnOnGreen") {
             try scanlight?.setColor(g: Int(greenLevel))
+            activeChannel = .green
         }
     }
 
     func turnOnBlue() {
-        guard guardPortOwner("turnOnBlue") else { return }
+        guard guardPortOwner("turnOnBlue"), guardConnected("turnOnBlue") else { return }
+        redLevel = 0; greenLevel = 0; whiteLevel = 0
         attempt("turnOnBlue") {
             try scanlight?.setColor(b: Int(blueLevel))
+            activeChannel = .blue
         }
     }
 
     func turnOnWhite() {
-        guard guardPortOwner("turnOnWhite") else { return }
+        guard guardPortOwner("turnOnWhite"), guardConnected("turnOnWhite") else { return }
+        redLevel = 0; greenLevel = 0; blueLevel = 0
         attempt("turnOnWhite") {
             try scanlight?.setColor(w: Int(whiteLevel))
+            activeChannel = .white
         }
     }
 
     func allOff() {
-        guard guardPortOwner("allOff") else { return }
+        guard guardPortOwner("allOff"), guardConnected("allOff") else { return }
         attempt("allOff") {
             try scanlight?.off()
+            redLevel = 0; greenLevel = 0; blueLevel = 0; whiteLevel = 0
+            activeChannel = nil
         }
     }
 
-    func setAllRGB() {
-        guard guardPortOwner("setAllRGB") else { return }
-        attempt("setAllRGB") {
-            try scanlight?.setColor(r: Int(redLevel), g: Int(greenLevel), b: Int(blueLevel))
+    /// Switch-style tap from the Light tab: off → on at full brightness
+    /// (exclusive), on → all off. No need to set a slider level first — a fresh
+    /// tap defaults the channel to full unless you've already dialed in a level.
+    func toggle(_ channel: LightChannel) {
+        if activeChannel == channel {
+            allOff()
+            return
+        }
+        switch channel {
+        case .red:   if redLevel == 0 { redLevel = 255 }
+        case .green: if greenLevel == 0 { greenLevel = 255 }
+        case .blue:  if blueLevel == 0 { blueLevel = 255 }
+        case .white: if whiteLevel == 0 { whiteLevel = 255 }
+        }
+        apply(channel)
+    }
+
+    /// Live-dim: re-send the active channel at its current slider level. No-op
+    /// unless `channel` is the one currently lit (so dragging an off channel's
+    /// slider just stages a level for the next tap).
+    func setLevel(_ channel: LightChannel, to value: Double) {
+        guard activeChannel == channel else { return }
+        apply(channel)
+    }
+
+    private func apply(_ channel: LightChannel) {
+        switch channel {
+        case .red:   turnOnRed()
+        case .green: turnOnGreen()
+        case .blue:  turnOnBlue()
+        case .white: turnOnWhite()
         }
     }
 
     func firePulse() {
-        guard guardPortOwner("firePulse") else { return }
+        guard guardPortOwner("firePulse"), guardConnected("firePulse") else { return }
         guard let ms = Int(pulseMs),
               (10...2550).contains(ms),
               ms % 10 == 0 else {
@@ -195,6 +261,16 @@ final class ScanlightViewModel: ObservableObject {
         return true
     }
 
+    @discardableResult
+    internal func guardConnected(_ action: String) -> Bool {
+        guard isConnected, scanlight != nil else {
+            lastError = "\(action) rejected: Scanlight is not connected"
+            log("error \(action): rejected — not connected")
+            return false
+        }
+        return true
+    }
+
     private func refreshTelemetry() {
         ledTempString = scanlight?.lastTempC.map { String(format: "%.2f °C", $0) } ?? "—"
         vbusString = scanlight?.lastVBUSmv.map { "\($0) mV" } ?? "—"
@@ -207,9 +283,55 @@ final class ScanlightViewModel: ObservableObject {
             refreshTelemetry()
             log("\(name): ok")
         } catch {
-            lastError = "\(name): \(error)"
-            log("error \(name): \(error)")
+            if let message = serialDisconnectMessage(action: name, error: error) {
+                markDisconnectedAfterSerialFailure(message)
+            } else {
+                lastError = "\(name): \(error)"
+                log("error \(name): \(error)")
+            }
         }
+    }
+
+    private func markDisconnectedAfterSerialFailure(_ message: String) {
+        scanlight?.close()
+        scanlight = nil
+        isConnected = false
+        connectionStatusString = "disconnected"
+        firmwareString = "—"
+        hardwareString = "—"
+        ledTempString = "—"
+        vbusString = "—"
+        activeChannel = nil
+        lastError = message
+        log("error \(message)")
+    }
+
+    private func serialDisconnectMessage(action: String, error: Error) -> String? {
+        if let openError = error as? SerialPortTransport.OpenError {
+            switch openError {
+            case .writeFailed(let errno):
+                if Self.isDisconnectErrno(errno) {
+                    return "\(action): Scanlight disconnected while writing (errno \(errno)). Reconnect the light."
+                }
+            case .readFailed(let errno):
+                if Self.isDisconnectErrno(errno) {
+                    return "\(action): Scanlight disconnected while reading (errno \(errno)). Reconnect the light."
+                }
+            case .openFailed, .configureFailed, .noPortDiscovered:
+                break
+            }
+        }
+
+        if let scanlightError = error as? ScanlightError,
+           scanlightError == .transportClosed {
+            return "\(action): Scanlight connection closed. Reconnect the light."
+        }
+
+        return nil
+    }
+
+    private static func isDisconnectErrno(_ errno: Int32) -> Bool {
+        [ENXIO, EIO, EBADF, ENODEV, EPIPE].contains(errno)
     }
 
     private func log(_ message: String) {

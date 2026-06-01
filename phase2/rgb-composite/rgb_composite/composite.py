@@ -22,9 +22,10 @@ of a negative; FilmLab or NLP handles inversion downstream.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Mapping, Optional, Union
+from typing import Any, Mapping, Optional, Union
 
 import numpy as np
 import rawpy
@@ -59,6 +60,11 @@ DEMOSAIC_KWARGS: Mapping[str, object] = {
 
 # Allowed values for the `output_format` parameter.
 OUTPUT_FORMATS = ("tiff", "dng", "both")
+DEFAULT_POSITIVE_DMIN_PERCENTILE = 98.0
+DEFAULT_POSITIVE_BLACK_PERCENTILE = 0.1
+DEFAULT_POSITIVE_WHITE_PERCENTILE = 99.2
+DEFAULT_POSITIVE_TONE_GAMMA = 0.55
+DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION = 0.03
 
 
 class DimensionMismatchError(ValueError):
@@ -128,9 +134,41 @@ def _write_sidecar(
     return sidecar
 
 
+def _write_positive_sidecar(
+    out_path: Path,
+    source_path: Path,
+    description: str,
+    meta: Mapping[str, Any],
+) -> Path:
+    """Write a short audit sidecar for an auto-positive render."""
+    sidecar = out_path.with_suffix(out_path.suffix + ".colorspace.txt")
+    body = (
+        "colorspace: rendered positive RGB from linear ProPhoto-RGB composite\n"
+        "bit_depth: 16\n"
+        "inversion: AUTO POSITIVE\n"
+        "model: density (-log transmission/base)\n"
+        f"source_negative: {source_path.name}\n"
+        f"source: {description}\n"
+        f"frame_base_rgb: {meta.get('frame_base_rgb')}\n"
+        f"profile_base_rgb: {meta.get('profile_base_rgb')}\n"
+        f"dmin_percentile: {meta.get('dmin_percentile')}\n"
+        f"display_black_percentile: {meta.get('display_black_percentile')}\n"
+        f"display_white_percentile: {meta.get('display_white_percentile')}\n"
+        f"tone_gamma: {meta.get('tone_gamma')}\n"
+        f"input_clip_fraction: {meta.get('input_clip_fraction')}\n"
+    )
+    sidecar.write_text(body)
+    return sidecar
+
+
 def _derive_dng_path(tiff_path: Path) -> Path:
     """Return the DNG sibling path for a TIFF output path."""
     return tiff_path.with_suffix(".dng")
+
+
+def _derive_positive_path(primary_path: Path) -> Path:
+    """Return the positive TIFF sibling for a primary composite path."""
+    return primary_path.with_name(primary_path.stem + "_positive.tif")
 
 
 def _maybe_apply_ffc(
@@ -149,6 +187,193 @@ def _maybe_apply_ffc(
     )
 
 
+def _profile_json_to_descriptor(
+    profile_json: Union[str, Path, Mapping[str, Any], BaseRegionDescriptor],
+) -> BaseRegionDescriptor:
+    """Parse app/CLI positive-profile input into a BaseRegionDescriptor.
+
+    Accepted shapes:
+      - BaseRegionDescriptor instance
+      - JSON string containing either a base-region object or
+        {"base_region": {...}}
+      - path to a JSON file with either of the above
+      - mapping with snake_case or Swift camelCase keys
+    """
+    if isinstance(profile_json, BaseRegionDescriptor):
+        return profile_json
+
+    raw: Any = profile_json
+    if isinstance(profile_json, Path):
+        raw = profile_json.read_text()
+    elif isinstance(profile_json, str):
+        candidate = Path(profile_json).expanduser()
+        if candidate.exists():
+            raw = candidate.read_text()
+        else:
+            raw = profile_json
+
+    if isinstance(raw, str):
+        data = json.loads(raw)
+    elif isinstance(raw, Mapping):
+        data = dict(raw)
+    else:
+        raise TypeError(f"positive profile must be JSON, mapping, or BaseRegionDescriptor; got {type(raw).__name__}")
+
+    if "base_region" in data:
+        data = data["base_region"]
+    elif "baseRegion" in data:
+        data = data["baseRegion"]
+
+    base_rgb = data.get("base_rgb", data.get("baseRgb"))
+    uniformity_cv = data.get("uniformity_cv", data.get("uniformityCv", 0.0))
+    schema_version = data.get("schema_version", data.get("schemaVersion", 1))
+    source = data.get("source", "manual")
+
+    return BaseRegionDescriptor(
+        x=int(data["x"]),
+        y=int(data["y"]),
+        w=int(data["w"]),
+        h=int(data["h"]),
+        base_rgb=tuple(float(v) for v in base_rgb),
+        uniformity_cv=float(uniformity_cv),
+        source=str(source),
+        schema_version=int(schema_version),
+    )
+
+
+def _analysis_sample(
+    arr: np.ndarray,
+    crop_fraction: float = DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION,
+) -> np.ndarray:
+    """Central image sample used for automatic display levels.
+
+    Cropping keeps sprockets, edge borders, and the selected rebate patch from
+    dominating the display stretch. Very small arrays fall back to the whole
+    image so tests and thumbnails still work.
+    """
+    h, w = arr.shape[:2]
+    cf = max(0.0, min(float(crop_fraction), 0.45))
+    y0 = int(round(h * cf))
+    y1 = int(round(h * (1.0 - cf)))
+    x0 = int(round(w * cf))
+    x1 = int(round(w * (1.0 - cf)))
+    if y1 <= y0 or x1 <= x0:
+        return arr
+    return arr[y0:y1, x0:x1, :]
+
+
+def _frame_base_rgb(
+    triplet: np.ndarray,
+    descriptor: BaseRegionDescriptor,
+) -> tuple[float, float, float]:
+    """Measure d-min color from the selected box in this specific frame.
+
+    Calibration stores the location and an initial base measurement, but scan
+    composites can land at a different absolute brightness because shutter/LED
+    settings changed. Re-reading the same box from the current composite keeps
+    the inversion white point tied to the frame that is actually being flipped.
+    """
+    h, w = triplet.shape[:2]
+    x0 = max(0, min(int(descriptor.x), w))
+    y0 = max(0, min(int(descriptor.y), h))
+    x1 = max(x0, min(int(descriptor.x + descriptor.w), w))
+    y1 = max(y0, min(int(descriptor.y + descriptor.h), h))
+    if x1 <= x0 or y1 <= y0:
+        return tuple(float(v) for v in descriptor.base_rgb)
+
+    patch = triplet[y0:y1, x0:x1, :].reshape(-1, 3).astype(np.float32)
+    if patch.size == 0:
+        return tuple(float(v) for v in descriptor.base_rgb)
+
+    base = tuple(float(v) for v in np.percentile(patch, DEFAULT_POSITIVE_DMIN_PERCENTILE, axis=0))
+    if any(v < _MIN_BASE_CHANNEL for v in base):
+        return tuple(float(v) for v in descriptor.base_rgb)
+    return base
+
+
+def auto_positive_from_composite(
+    triplet: np.ndarray,
+    descriptor: BaseRegionDescriptor,
+    *,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
+    display_black_percentile: float = DEFAULT_POSITIVE_BLACK_PERCENTILE,
+    display_white_percentile: float = DEFAULT_POSITIVE_WHITE_PERCENTILE,
+    tone_gamma: float = DEFAULT_POSITIVE_TONE_GAMMA,
+    analysis_crop_fraction: float = DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Render a linear negative composite into a usable 16-bit positive.
+
+    This automates the operator workflow:
+      1. measure clear film/base from the saved region on this frame;
+      2. normalize each channel to that base and convert to optical density;
+      3. stretch black/white points from robust scene percentiles;
+      4. apply a mild display curve so the preview is an editable workprint.
+
+    The archival composite remains unchanged; this function produces a
+    separate rendered TIFF for inspection/editing.
+    """
+    if triplet.ndim != 3 or triplet.shape[2] != 3:
+        raise ValueError(f"triplet must be HxWx3, got shape {triplet.shape}")
+    if triplet.dtype != np.uint16:
+        raise ValueError(f"triplet dtype must be uint16, got {triplet.dtype}")
+    if any(b < _MIN_BASE_CHANNEL for b in descriptor.base_rgb):
+        raise ValueError(
+            f"base_rgb {descriptor.base_rgb} has a channel below {_MIN_BASE_CHANNEL}; "
+            "recapture or reselect the film-base calibration patch"
+        )
+    if tone_gamma <= 0:
+        raise ValueError(f"tone_gamma must be > 0, got {tone_gamma}")
+
+    profile_base_rgb = tuple(float(v) for v in descriptor.base_rgb)
+    frame_base_rgb = _frame_base_rgb(triplet, descriptor)
+
+    work = triplet.astype(np.float32)
+    base = np.maximum(np.asarray(frame_base_rgb, dtype=np.float32), _MIN_BASE_CHANNEL)
+
+    # Normalize to clear film/base, then convert transmittance to density:
+    # high negative density becomes high positive brightness. This is the
+    # physical model the linear subtract/invert path was missing.
+    transmission = work / base.reshape(1, 1, 3)
+    np.clip(transmission, 1e-5, 1.0, out=transmission)
+    density = -np.log(transmission, dtype=np.float32)
+
+    sample = _analysis_sample(density, analysis_crop_fraction)
+    positive = np.empty_like(density, dtype=np.float32)
+    display_levels: list[tuple[float, float]] = []
+
+    for ch in range(3):
+        values = sample[..., ch].reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            raise ValueError("positive render analysis sample contains no finite pixels")
+
+        lo = float(np.percentile(values, display_black_percentile))
+        hi = float(np.percentile(values, display_white_percentile))
+        if hi - lo <= 1e-6:
+            hi = lo + 1e-6
+        positive[..., ch] = (density[..., ch] - lo) / (hi - lo)
+        display_levels.append((lo, hi))
+
+    np.clip(positive, 0.0, 1.0, out=positive)
+    positive = np.power(positive, tone_gamma, dtype=np.float32)
+    np.clip(positive, 0.0, 1.0, out=positive)
+
+    meta: dict[str, Any] = {
+        "frame_base_rgb": tuple(float(v) for v in frame_base_rgb),
+        "profile_base_rgb": profile_base_rgb,
+        "dmin_percentile": dmin_percentile,
+        "display_levels": tuple(display_levels),
+        "display_black_percentile": display_black_percentile,
+        "display_white_percentile": display_white_percentile,
+        "tone_gamma": tone_gamma,
+        "analysis_crop_fraction": analysis_crop_fraction,
+        "input_clip_fraction": tuple(
+            float(np.mean(triplet[..., ch] >= 65535)) for ch in range(3)
+        ),
+    }
+    return np.rint(positive * 65535.0).astype(np.uint16), meta
+
+
 DEFAULT_DNG_CAMERA_MODEL = "Scanlight v4 Narrowband-RGB Composite"
 
 
@@ -162,6 +387,8 @@ def composite_triplet(
     ffc_calibration_dir: Optional[Union[str, Path]] = None,
     output_format: str = "tiff",
     dng_camera_model: Optional[str] = None,
+    positive_profile_json: Optional[Union[str, Path, Mapping[str, Any], BaseRegionDescriptor]] = None,
+    positive_tone_gamma: float = DEFAULT_POSITIVE_TONE_GAMMA,
 ) -> Path:
     """Read three RAWs, composite into one 16-bit linear output, return the path.
 
@@ -190,6 +417,13 @@ def composite_triplet(
             `"Sony ILCE-7CR"` to make Lightroom offer Sony camera
             profiles (Cobalt Spectre, Adobe Standard, etc.) in the
             Profile dropdown. Ignored for tiff-only output.
+        positive_profile_json: Optional base-region profile JSON from the
+            calibration wizard. When set, a sibling `<stem>_positive.tif` is
+            rendered automatically while the primary linear negative remains
+            unchanged.
+        positive_tone_gamma: Display curve exponent for the auto-positive
+            render. Lower values brighten midtones; ignored unless
+            `positive_profile_json` is set.
 
     Returns:
         Path to the primary output. For `output_format="both"`, that's the
@@ -298,6 +532,27 @@ def composite_triplet(
             description,
             ffc_source=ffc_maps.source if ffc_maps else None,
         )
+
+    if positive_profile_json is not None:
+        descriptor = _profile_json_to_descriptor(positive_profile_json)
+        positive, positive_meta = auto_positive_from_composite(
+            composite,
+            descriptor,
+            tone_gamma=positive_tone_gamma,
+        )
+        positive_path = _derive_positive_path(primary)
+        positive_description = (
+            f"auto-positive render from {primary.name}; d-min balanced from "
+            f"base region x={descriptor.x} y={descriptor.y} w={descriptor.w} h={descriptor.h}"
+        )
+        _write_tiff(positive_path, positive, positive_description)
+        if write_sidecar:
+            _write_positive_sidecar(
+                positive_path,
+                primary,
+                positive_description,
+                positive_meta,
+            )
 
     return primary
 
@@ -522,6 +777,24 @@ def main(argv=None) -> int:
             "Spectre, Adobe Standard, etc.) in the Profile dropdown."
         ),
     )
+    p.add_argument(
+        "--positive-profile-json",
+        default=None,
+        help=(
+            "Base-region JSON from exposure calibration. When provided, "
+            "rgb-composite also writes a sibling *_positive.tif rendered with "
+            "d-min balance, inversion, automatic levels, and a display curve."
+        ),
+    )
+    p.add_argument(
+        "--positive-tone-gamma",
+        type=float,
+        default=DEFAULT_POSITIVE_TONE_GAMMA,
+        help=(
+            "Tone curve exponent for --positive-profile-json output "
+            f"(default {DEFAULT_POSITIVE_TONE_GAMMA})."
+        ),
+    )
     args = p.parse_args(argv)
 
     try:
@@ -534,6 +807,8 @@ def main(argv=None) -> int:
             ffc_calibration_dir=args.ffc_calibration,
             output_format=args.format,
             dng_camera_model=args.camera_model,
+            positive_profile_json=args.positive_profile_json,
+            positive_tone_gamma=args.positive_tone_gamma,
         )
     except DimensionMismatchError as e:
         print(f"rgb-composite: {e}", file=sys.stderr)

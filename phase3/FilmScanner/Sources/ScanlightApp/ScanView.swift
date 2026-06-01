@@ -18,6 +18,13 @@ import SwiftUI
 struct ScanView: View {
     @ObservedObject var coordinator: ScanCoordinator
     @ObservedObject var store: SettingsStore
+    @ObservedObject var orchestratorClient: OrchestratorClient
+    @ObservedObject var lightViewModel: ScanlightViewModel
+
+    @State private var selectedStockProfileID: UUID? = nil
+    @State private var appliedStockProfileID: UUID? = nil
+    @State private var stockProfileMessage: String? = nil
+    @State private var scanLiveViewActive = false
 
     var body: some View {
         ScrollView {
@@ -36,9 +43,11 @@ struct ScanView: View {
                             Spacer(minLength: 0)
                         }
 
+                        stockProfileSection
+
                         HStack(spacing: Theme.Space.md) {
-                            Button("Start Scan") {
-                                Task { await coordinator.startScan(settings: store.settings) }
+                            Button(scanStartLabel) {
+                                Task { await startScan() }
                             }
                             .accessibilityIdentifier(AccessibilityID.scanStartBtn)
                             .buttonStyle(.borderedProminent)
@@ -58,9 +67,49 @@ struct ScanView: View {
                         }
 
                         if coordinator.phase == .idle && !coordinator.reconnectNeeded {
-                            Text("Start a scan to hand the serial port to the orchestrator. The Light panel locks while scanning.")
+                            Text("Start a scan when the roll is positioned. The app owns the light while scanning.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                        } else if coordinator.phase == .calibrating {
+                            Text("Switching to Scan reuses the running backend; no reconnect is needed.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if !store.validationErrors.isEmpty {
+                            Banner(kind: .danger, text: "Choose the required folders before scanning.")
+                        }
+                    }
+                }
+
+                // MARK: 2. SDK Live View
+
+                if store.settings.triggerMode == "sdk" {
+                    GroupBox(label: Text("Camera Live View")) {
+                        VStack(alignment: .leading, spacing: Theme.Space.md) {
+                            SonyLiveViewPanel(
+                                settings: store.settings,
+                                orchestratorClient: orchestratorClient,
+                                lightViewModel: lightViewModel,
+                                isLiveViewActive: $scanLiveViewActive,
+                                allowsWhileBackendRunning: true,
+                                isTemporarilyUnavailable: coordinator.captureInFlight || coordinator.transitionInFlight,
+                                unavailableReason: "Live view pauses while the camera is capturing or the backend is changing state.",
+                                startButtonID: AccessibilityID.scanSonyLiveViewStartButton,
+                                stopButtonID: AccessibilityID.scanSonyLiveViewStopButton,
+                                statusLabelID: AccessibilityID.scanSonyLiveViewStatusLabel,
+                                imageID: AccessibilityID.scanSonyLiveViewImage,
+                                invertToggleID: AccessibilityID.scanSonyLiveViewInvertToggle,
+                                mirrorToggleID: AccessibilityID.scanSonyLiveViewMirrorToggle,
+                                flipToggleID: AccessibilityID.scanSonyLiveViewFlipToggle,
+                                rotatePickerID: AccessibilityID.scanSonyLiveViewRotatePicker,
+                                zoomSliderID: AccessibilityID.scanSonyLiveViewZoomSlider,
+                                whiteLightToggleID: AccessibilityID.scanSonyLiveViewWhiteLightToggle
+                            )
+
+                            if scanLiveViewActive {
+                                Banner(kind: .warning, text: "Close live view before Capture Frame. The camera can only service one Sony SDK capture session reliably.")
+                            }
                         }
                     }
                 }
@@ -71,14 +120,17 @@ struct ScanView: View {
                     GroupBox(label: Text("Capture")) {
                         VStack(alignment: .leading, spacing: Theme.Space.md) {
                             HStack(spacing: Theme.Space.md) {
-                                Text("Frames")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                                Text("\(coordinator.frameStatuses.count)")
-                                    .accessibilityIdentifier(AccessibilityID.scanFrameCounterLabel)
-                                    .accessibilityValue("\(coordinator.frameStatuses.count)")
-                                    .font(.title3.weight(.semibold))
-                                    .monospacedDigit()
+                                scanMetric(
+                                    label: "Captured",
+                                    value: "\(coordinator.frameStatuses.count)",
+                                    accessibilityID: AccessibilityID.scanFrameCounterLabel
+                                )
+
+                                scanMetric(
+                                    label: "Next shot",
+                                    value: "\(coordinator.nextFrameNumber)",
+                                    accessibilityID: AccessibilityID.scanNextFrameLabel
+                                )
 
                                 Spacer()
 
@@ -104,7 +156,7 @@ struct ScanView: View {
                                 }
                                 .accessibilityIdentifier(AccessibilityID.scanCaptureFrameBtn)
                                 .buttonStyle(.borderedProminent)
-                                .disabled(coordinator.captureInFlight || coordinator.transitionInFlight)
+                                .disabled(captureControlsDisabled)
 
                                 Button("Retake") {
                                     Task { await coordinator.captureFrame(retake: true) }
@@ -113,11 +165,18 @@ struct ScanView: View {
                                 .buttonStyle(.bordered)
                                 .disabled(coordinator.captureInFlight
                                          || coordinator.transitionInFlight
+                                         || scanLiveViewActive
                                          || coordinator.frameStatuses.isEmpty)
 
                                 if coordinator.captureInFlight {
                                     ProgressView().controlSize(.small)
                                 }
+                            }
+
+                            if scanLiveViewActive {
+                                Text("Close live view to shoot; the live stream is for framing, then capture takes the RAW triplet.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -143,7 +202,9 @@ struct ScanView: View {
                         Image(systemName: "lock.fill")
                             .foregroundStyle(Theme.State.warning)
                             .accessibilityHidden(true)
-                        Text("Light panel is controlled by the active scan")
+                        Text(coordinator.phase == .calibrating
+                             ? "Light is controlled by calibration"
+                             : "Light is controlled by the active scan")
                             .accessibilityIdentifier(AccessibilityID.scanLightLockedLabel)
                             .font(.callout)
                             .foregroundStyle(Theme.State.warning)
@@ -184,16 +245,151 @@ struct ScanView: View {
             .padding(Theme.Space.xl)
         }
         .groupBoxStyle(PanelGroupBoxStyle())
+        .onAppear {
+            ensureSelectedStockProfile()
+        }
+        .onChange(of: store.stockCalibrationProfiles.map(\.id)) { _ in
+            ensureSelectedStockProfile()
+        }
     }
 
     // MARK: - Helpers
 
+    @MainActor
+    private func startScan() async {
+        let errors = store.validate()
+        guard errors.isEmpty else { return }
+        applySelectedStockProfileForScan()
+        await coordinator.startScan(settings: store.settings)
+    }
+
     private var canStartScan: Bool {
-        coordinator.phase == .idle && !coordinator.transitionInFlight
+        (coordinator.phase == .idle || coordinator.phase == .calibrating)
+            && !coordinator.transitionInFlight
+    }
+
+    private var scanStartLabel: String {
+        coordinator.phase == .calibrating ? "Switch to Scan" : "Start Scan"
     }
 
     private var canStopScan: Bool {
         coordinator.phase == .scanning && !coordinator.transitionInFlight
+    }
+
+    private var captureControlsDisabled: Bool {
+        coordinator.captureInFlight || coordinator.transitionInFlight || scanLiveViewActive
+    }
+
+    private var stockProfileStatusText: String {
+        if store.stockCalibrationProfiles.isEmpty {
+            return "No saved film stock profiles yet. Use Calibrate > Exposure, then Save Profile."
+        }
+        if let profile = store.stockCalibrationProfile(id: appliedStockProfileID) {
+            return "Using \(profile.displayName). Capture or intentionally skip a fresh flat field for this roll."
+        }
+        if coordinator.phase == .scanning {
+            return "Scanning with the current RGB/shutter settings. Stop scan to change film stock profile."
+        }
+        if selectedStockProfileID != nil {
+            return "Start Scan applies this stock profile before the roll begins."
+        }
+        return "Choose the film stock you calibrated against before starting this roll."
+    }
+
+    private var stockProfileSelectionDisabled: Bool {
+        coordinator.phase == .scanning || coordinator.transitionInFlight
+    }
+
+    @ViewBuilder
+    private var stockProfileSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Divider()
+                .padding(.vertical, Theme.Space.xs)
+
+            Text("Film Stock")
+                .font(.subheadline.weight(.semibold))
+
+            HStack(spacing: Theme.Space.md) {
+                Picker("Film stock", selection: $selectedStockProfileID) {
+                    Text("Current settings").tag(Optional<UUID>.none)
+                    ForEach(store.stockCalibrationProfiles) { profile in
+                        Text(profile.displayName).tag(Optional(profile.id))
+                    }
+                }
+                .accessibilityIdentifier(AccessibilityID.scanStockProfilePicker)
+                .pickerStyle(.menu)
+                .disabled(stockProfileSelectionDisabled || store.stockCalibrationProfiles.isEmpty)
+
+                Button("Apply Profile") {
+                    applySelectedStockProfile()
+                }
+                .accessibilityIdentifier(AccessibilityID.scanStockProfileApplyBtn)
+                .buttonStyle(.bordered)
+                .disabled(stockProfileSelectionDisabled || selectedStockProfileID == nil)
+            }
+
+            Text(stockProfileMessage ?? stockProfileStatusText)
+                .accessibilityIdentifier(AccessibilityID.scanStockProfileStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private func scanMetric(label: String, value: String, accessibilityID: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .accessibilityIdentifier(accessibilityID)
+                .accessibilityValue(value)
+                .font(.title3.weight(.semibold))
+                .monospacedDigit()
+        }
+        .frame(minWidth: 96, alignment: .leading)
+    }
+
+    private func ensureSelectedStockProfile() {
+        if let selectedStockProfileID,
+           store.stockCalibrationProfile(id: selectedStockProfileID) != nil {
+            return
+        }
+        selectedStockProfileID = store.stockCalibrationProfiles.first?.id
+        if let appliedStockProfileID,
+           store.stockCalibrationProfile(id: appliedStockProfileID) == nil {
+            self.appliedStockProfileID = nil
+            stockProfileMessage = nil
+        }
+    }
+
+    private func applySelectedStockProfile() {
+        guard let profile = store.stockCalibrationProfile(id: selectedStockProfileID) else {
+            appliedStockProfileID = nil
+            store.settings.positiveProfileJSON = nil
+            stockProfileMessage = "No stock profile selected."
+            return
+        }
+        store.applyStockCalibrationProfile(profile)
+        store.settings.positiveProfileJSON = profile.positiveProfileJSON
+        appliedStockProfileID = profile.id
+        stockProfileMessage = "Applied \(profile.displayName). Scans will also write auto-positive TIFFs from this film-base profile."
+    }
+
+    private func applySelectedStockProfileForScan() {
+        guard coordinator.phase == .idle || coordinator.phase == .calibrating else {
+            return
+        }
+        guard let profile = store.stockCalibrationProfile(id: selectedStockProfileID) else {
+            store.settings.positiveProfileJSON = nil
+            appliedStockProfileID = nil
+            return
+        }
+        store.applyStockCalibrationProfile(profile)
+        store.settings.positiveProfileJSON = profile.positiveProfileJSON
+        appliedStockProfileID = profile.id
+        stockProfileMessage = "Using \(profile.displayName) for this scan. Auto-positive TIFFs will be written next to the linear composites."
     }
 
     @ViewBuilder

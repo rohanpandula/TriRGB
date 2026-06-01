@@ -24,7 +24,7 @@ final class AccessibilityIDCoverageTests: XCTestCase {
         continueAfterFailure = false
     }
 
-    // All 23 AccessibilityID string values — the contract between this test
+    // All 22 AccessibilityID string values — the contract between this test
     // file and the SwiftUI app. If a new case is added to AccessibilityID,
     // add it here in lockstep.
     private let allAccessibilityIDs: [String] = [
@@ -45,7 +45,6 @@ final class AccessibilityIDCoverageTests: XCTestCase {
         AccessibilityID.blueOnButton,
         AccessibilityID.whiteOnButton,
         AccessibilityID.allChannelsOffButton,
-        AccessibilityID.setAllRGBButton,
         AccessibilityID.pulseMsTextField,
         AccessibilityID.firePulseButton,
         AccessibilityID.lastErrorLabel,
@@ -80,7 +79,7 @@ final class AccessibilityIDCoverageTests: XCTestCase {
     /// This test does NOT use XCUIApplication and always runs.
     func testSchemaVersionMatches() {
         XCTAssertEqual(
-            AccessibilityID.schemaVersion, "2",
+            AccessibilityID.schemaVersion, "4",
             "AccessibilityID.schemaVersion bumped without updating ScanlightAppUITests"
         )
     }

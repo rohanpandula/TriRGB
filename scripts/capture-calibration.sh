@@ -8,7 +8,12 @@
 # fix is per-channel FFC, but FFC needs a "blank light" reference: three
 # captures of the scanlight at scanning brightness, *no film in the holder*.
 #
-# This script automates that. The output is a directory of three ARWs:
+# This script uses sony-capture. The SDK host-PC Wi-Fi path is verified on
+# the a7CR, but the preferred calibration surface is the Swift app's
+# Calibrate tab.
+#
+# This script automates the legacy SDK path. The output is a directory of
+# three ARWs:
 #
 #     ~/.scanlight/calibration/<YYYY-MM-DD>/
 #         R.ARW

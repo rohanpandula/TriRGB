@@ -1,0 +1,1058 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scanlight Film Scanner - Interactive User Guide</title>
+  <meta name="description" content="Interactive operator guide for the Scanlight Sony film scanner app." />
+
+  <!-- External libraries requested for the guide UI. The page still reads as plain HTML if they do not load. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    window.guideApp = function guideApp() {
+      const savedChecks = (() => {
+        try { return JSON.parse(localStorage.getItem("scanlight-guide-checks") || "{}"); }
+        catch (_) { return {}; }
+      })();
+      return {
+        tab: "start",
+        mode: "sdk",
+        calStep: "rig",
+        diag: "sdk-no-live",
+        copied: "",
+        checks: savedChecks,
+        sections: [
+          { id: "start", label: "Start" },
+          { id: "workflow", label: "Workflow" },
+          { id: "modes", label: "Capture modes" },
+          { id: "calibration", label: "Calibration" },
+          { id: "sony", label: "Sony SDK" },
+          { id: "limits", label: "Missing" }
+        ],
+        modeInfo: {
+          sdk: {
+            label: "SDK over Wi-Fi",
+            status: "Best integrated path when the camera is on and paired.",
+            appDoes: [
+              "Sets Scanlight R, G, and B for each frame.",
+              "Fires the Sony body over Wi-Fi PC Remote.",
+              "Downloads each ARW directly to the roll folder through host-PC transfer.",
+              "Can open a live-view preview without taking a photo."
+            ],
+            youDo: [
+              "Turn on Wi-Fi PC Remote on the camera.",
+              "Keep ISO 100, f/8, manual focus, and RAW capture set on the body.",
+              "Advance the Valoi holder manually after each successful triplet."
+            ],
+            missing: "The app does not move film, focus the lens, or use SDK USB capture for this rig."
+          },
+          manual: {
+            label: "Manual / IED",
+            status: "Safest fallback when SDK or hardware pulse is not available.",
+            appDoes: [
+              "Sets each Scanlight channel.",
+              "Waits for a new RAW to appear in the Imaging Edge Desktop inbox.",
+              "Moves on only after it sees the expected file."
+            ],
+            youDo: [
+              "Keep Imaging Edge Desktop connected and saving RAWs to the watched inbox.",
+              "Fire one camera capture for R, one for G, and one for B.",
+              "Advance film manually after the triplet is complete."
+            ],
+            missing: "The app cannot change shutter speed in this mode, so set shutter on the camera yourself."
+          },
+          pulse: {
+            label: "Hardware pulse",
+            status: "Useful only if the Scanlight shutter cable path is proven reliable.",
+            appDoes: [
+              "Sets R, G, and B on the Scanlight.",
+              "Pulses the Scanlight shutter output for each channel.",
+              "Waits for IED to drop a new RAW in the inbox."
+            ],
+            youDo: [
+              "Keep Imaging Edge Desktop connected and saving to the watched inbox.",
+              "Verify the 3.5 mm shutter pulse fires the camera before scanning a roll.",
+              "Advance film manually after every good frame."
+            ],
+            missing: "There is no motorized advance and no guarantee the cable path works on every rig."
+          }
+        },
+        calSteps: {
+          rig: {
+            title: "1. Rig",
+            goal: "Confirm the Scanlight, Sony settings, output folder, and trigger mode before the app takes control.",
+            detail: "Use SDK mode for automatic shutter plus ARW download. Use Manual / IED if SDK is down or the camera is unavailable."
+          },
+          exposure: {
+            title: "2. Exposure",
+            goal: "Select film base or rebate, then let the app solve per-channel brightness.",
+            detail: "In SDK mode the solver changes shutter speed as the coarse control and Scanlight LED level as the fine trim. ISO stays 100 and the lens stays at f/8."
+          },
+          flat: {
+            title: "3. Flat Field",
+            goal: "Remove film and capture no-film flat frames using the solved channel settings.",
+            detail: "Flat-field correction fixes channel-specific unevenness and vignetting before the RGB composite is written."
+          },
+          results: {
+            title: "4. Results",
+            goal: "Review the solved shutter speeds, LED levels, black levels, gains, and clipping warnings.",
+            detail: "Save these per stock/session. Re-run calibration when the holder, lens distance, film stock, or exposure results change."
+          }
+        },
+        diagnostics: {
+          "sdk-no-live": {
+            title: "SDK selected but live view or connection test is missing",
+            fix: "You are probably running an older repo copy or old build. Launch from the Downloads repo path and rebuild the Swift package.",
+            command: "cd /Users/rohan/Downloads/sony-automated-scanlight-filmscanner\nswift run --package-path phase3/FilmScanner scanlight-app"
+          },
+          "sdk-auth": {
+            title: "Sony auth fails",
+            fix: "Confirm the camera is in Wi-Fi PC Remote, IP address is current, Access Auth user/password match the camera screen, and the camera is awake.",
+            command: "phase1/sony-capture/build/sony-capture --connect-only --ip-address 10.0.0.247 --username USER --password PASSWORD"
+          },
+          "capture-500": {
+            title: "Server returned 500 during calibration or capture",
+            fix: "Read the message as a real capture failure, not a UI failure. The usual causes are camera off, SDK auth stale, IED inbox not receiving files, or the Scanlight port being held by another process.",
+            command: "python3 scripts/diagnose.py --skip-camera"
+          },
+          "folder-warning": {
+            title: "Folder warning stays visible after choosing folders",
+            fix: "Settings persist in the app state/UserDefaults. If the warning returns after reload, check that you are launching the same repo copy and the same built app.",
+            command: "rg -n \"Check Connection|Open Live View|sonyIpAddress\" phase3/FilmScanner/Sources/ScanlightApp"
+          }
+        },
+        toggleCheck(id) {
+          this.checks[id] = !this.checks[id];
+          localStorage.setItem("scanlight-guide-checks", JSON.stringify(this.checks));
+        },
+        resetChecks() {
+          this.checks = {};
+          localStorage.removeItem("scanlight-guide-checks");
+        },
+        copy(text) {
+          if (!navigator.clipboard) return;
+          navigator.clipboard.writeText(text).then(() => {
+            this.copied = text;
+            setTimeout(() => { this.copied = ""; }, 1300);
+          });
+        },
+        checkedCount(ids) {
+          return ids.filter((id) => this.checks[id]).length;
+        }
+      };
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
+
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #171514;
+      --bg-soft: #211f1d;
+      --panel: #292623;
+      --panel-strong: #332f2b;
+      --line: #4b4540;
+      --line-strong: #756a60;
+      --text: #f1ece5;
+      --muted: #b5aaa0;
+      --dim: #827870;
+      --cyan: #63d4c7;
+      --cyan-soft: rgba(99, 212, 199, 0.16);
+      --amber: #f0b65f;
+      --amber-soft: rgba(240, 182, 95, 0.18);
+      --red: #f45f5f;
+      --green: #67c87a;
+      --blue: #6aa3ff;
+      --shadow: rgba(0, 0, 0, 0.36);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    [x-cloak] { display: none !important; }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0) 260px),
+        repeating-linear-gradient(90deg, rgba(255,255,255,0.018) 0, rgba(255,255,255,0.018) 1px, transparent 1px, transparent 120px),
+        var(--bg);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    button, input, select { font: inherit; }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      border-right: 1px solid var(--line);
+      background: rgba(23, 21, 20, 0.92);
+      backdrop-filter: blur(18px);
+      padding: 28px 22px;
+      overflow: auto;
+    }
+
+    .brand {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 22px;
+      margin-bottom: 18px;
+    }
+
+    .eyebrow {
+      color: var(--amber);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      line-height: 1.3;
+      margin: 0 0 10px;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+
+    h1 {
+      font-size: clamp(31px, 5vw, 58px);
+      line-height: 0.96;
+      letter-spacing: 0;
+      margin-bottom: 18px;
+      max-width: 880px;
+    }
+
+    h2 {
+      font-size: clamp(24px, 3vw, 36px);
+      line-height: 1.06;
+      letter-spacing: 0;
+      margin-bottom: 14px;
+    }
+
+    h3 {
+      font-size: 18px;
+      line-height: 1.2;
+      letter-spacing: 0;
+      margin-bottom: 10px;
+    }
+
+    p, li {
+      color: var(--muted);
+      line-height: 1.62;
+      font-size: 16px;
+    }
+
+    .lead {
+      font-size: 19px;
+      line-height: 1.58;
+      color: #ded7cf;
+      max-width: 880px;
+    }
+
+    .nav-button {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 11px 12px;
+      margin: 3px 0;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .nav-button:hover {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+    }
+
+    .nav-button.active {
+      background: var(--cyan-soft);
+      border-color: rgba(99, 212, 199, 0.36);
+      color: var(--text);
+    }
+
+    .main {
+      min-width: 0;
+      padding: 34px min(5vw, 64px) 72px;
+    }
+
+    .section {
+      border-top: 1px solid var(--line);
+      padding-top: 36px;
+      margin-top: 38px;
+    }
+
+    .section:first-child {
+      border-top: 0;
+      margin-top: 0;
+      padding-top: 0;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 18px 0 0;
+    }
+
+    .pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.035);
+      font-size: 14px;
+    }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      margin: 28px 0;
+      box-shadow: 0 20px 60px -42px var(--shadow);
+    }
+
+    .status-item {
+      padding: 18px;
+      min-height: 128px;
+      background: rgba(255, 255, 255, 0.025);
+      border-right: 1px solid var(--line);
+    }
+
+    .status-item:last-child { border-right: 0; }
+
+    .status-item strong {
+      display: block;
+      color: var(--text);
+      margin-bottom: 8px;
+      font-size: 15px;
+    }
+
+    .status-item span {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .mode-switch,
+    .step-switch,
+    .diag-switch {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 18px 0;
+    }
+
+    .choice {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 13px;
+      min-height: 42px;
+      color: var(--muted);
+      background: var(--panel);
+      cursor: pointer;
+    }
+
+    .choice:hover { border-color: var(--line-strong); color: var(--text); }
+
+    .choice.active {
+      color: #101615;
+      background: var(--cyan);
+      border-color: var(--cyan);
+    }
+
+    .callout {
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--cyan);
+      border-radius: 8px;
+      padding: 18px 20px;
+      background: rgba(255, 255, 255, 0.03);
+      margin: 18px 0;
+    }
+
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.bad { border-left-color: var(--red); background: rgba(244, 95, 95, 0.12); }
+    .callout.good { border-left-color: var(--green); background: rgba(103, 200, 122, 0.12); }
+
+    .callout p:last-child { margin-bottom: 0; }
+
+    .split {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .tile {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      background: rgba(255, 255, 255, 0.028);
+      min-height: 100%;
+    }
+
+    .tile h3 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+      flex: 0 0 auto;
+      background: var(--cyan);
+    }
+
+    .dot.red { background: #f05252; }
+    .dot.green { background: #55be67; }
+    .dot.blue { background: #5f93f0; }
+    .dot.amber { background: var(--amber); }
+
+    .check-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .check {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 74px;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .box {
+      width: 20px;
+      height: 20px;
+      flex: 0 0 20px;
+      border-radius: 5px;
+      border: 1px solid var(--line-strong);
+      display: grid;
+      place-items: center;
+      color: #0f1817;
+      margin-top: 2px;
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .check.done .box {
+      background: var(--cyan);
+      border-color: var(--cyan);
+    }
+
+    .check span {
+      color: var(--muted);
+      line-height: 1.35;
+      font-size: 14px;
+    }
+
+    .progress {
+      height: 9px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+      overflow: hidden;
+      margin: 15px 0;
+    }
+
+    .progress > div {
+      height: 100%;
+      background: linear-gradient(90deg, var(--cyan), var(--amber));
+      transition: width 0.2s ease;
+    }
+
+    .rgb-line {
+      display: grid;
+      grid-template-columns: 70px 1fr 1fr 1fr 96px;
+      gap: 10px;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      padding: 12px 0;
+    }
+
+    .rgb-line:last-child { border-bottom: 0; }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      color: #e7dfd7;
+    }
+
+    pre {
+      position: relative;
+      margin: 16px 0 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #11100f;
+      color: #efe8df;
+      padding: 17px;
+      overflow: auto;
+      font-size: 13px;
+      line-height: 1.52;
+    }
+
+    .copy {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 10px;
+      color: var(--cyan);
+      background: rgba(99, 212, 199, 0.09);
+      cursor: pointer;
+      font-size: 13px;
+    }
+
+    .copy:hover { border-color: var(--cyan); }
+
+    .topline {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 8px;
+    }
+
+    .small {
+      font-size: 13px;
+      color: var(--dim);
+      line-height: 1.5;
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 18px 0 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      display: table;
+    }
+
+    .table th,
+    .table td {
+      border-bottom: 1px solid var(--line);
+      padding: 13px 14px;
+      text-align: left;
+      vertical-align: top;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 14px;
+    }
+
+    .table tr:last-child td { border-bottom: 0; }
+    .table th { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+
+    .kbd {
+      border: 1px solid var(--line-strong);
+      border-bottom-color: #2a2724;
+      background: #24211f;
+      border-radius: 6px;
+      padding: 2px 6px;
+      color: var(--text);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .footer {
+      border-top: 1px solid var(--line);
+      margin-top: 48px;
+      padding-top: 20px;
+      color: var(--dim);
+      font-size: 13px;
+    }
+
+    @media (max-width: 980px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar {
+        position: relative;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .status-strip,
+      .split,
+      .check-grid { grid-template-columns: 1fr; }
+      .status-item { border-right: 0; border-bottom: 1px solid var(--line); }
+      .status-item:last-child { border-bottom: 0; }
+      .rgb-line { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+
+<body x-data="guideApp()" x-cloak>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <p class="eyebrow">SCANLIGHT OPERATOR GUIDE</p>
+        <h2 style="font-size: 27px; margin-bottom: 10px;">Film Scanner</h2>
+        <p class="small">Interactive guide for the Swift app, Sony Wi-Fi SDK path, manual IED fallback, calibration, and current limitations.</p>
+      </div>
+
+      <nav aria-label="Guide sections">
+        <template x-for="section in sections" :key="section.id">
+          <button class="nav-button" :class="{ active: tab === section.id }" @click="tab = section.id; window.scrollTo({ top: 0, behavior: 'smooth' })">
+            <span x-text="section.label"></span>
+            <span aria-hidden="true">+</span>
+          </button>
+        </template>
+      </nav>
+
+      <div class="callout warn" style="margin-top: 24px;">
+        <p class="small"><strong style="color: var(--text);">Current rig assumption:</strong> Sony a7CR over Wi-Fi PC Remote, Scanlight over USB serial, Valoi film advance by hand.</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section class="section" x-show="tab === 'start'">
+        <p class="eyebrow">WHAT THIS APP IS FOR</p>
+        <h1>Make a camera scanning rig behave like a repeatable RGB film scanner.</h1>
+        <p class="lead">
+          The app coordinates the Scanlight, Sony camera, capture folders, calibration, and compositing pipeline. For each film frame it creates three RAW captures under narrowband red, green, and blue light, then composites those captures into a linear DNG and/or TIFF for inversion in Negative Lab Pro, FilmLab, or Lightroom workflows.
+        </p>
+
+        <div class="status-strip" aria-label="Current feature map">
+          <div class="status-item">
+            <strong>Scanlight control</strong>
+            <span>Set white, red, green, blue, levels, settle timing, and all-off from the Swift app.</span>
+          </div>
+          <div class="status-item">
+            <strong>Sony Wi-Fi SDK</strong>
+            <span>Connection test, Access Auth fields, still capture, host-PC ARW download, shutter speed control, and live view preview.</span>
+          </div>
+          <div class="status-item">
+            <strong>Calibration</strong>
+            <span>Solves per-channel shutter and LED levels against selected film base, then captures flat-field frames.</span>
+          </div>
+          <div class="status-item">
+            <strong>Not automatic</strong>
+            <span>No motorized film advance, no lens focus/aperture control, and no finished positive conversion inside the app.</span>
+          </div>
+        </div>
+
+        <div class="split">
+          <div class="tile">
+            <h3><span class="dot"></span>Fast launch</h3>
+            <p>Run this from the Downloads repo copy if that is the copy you are editing and testing.</p>
+            <div class="topline">
+              <span class="small">Swift app</span>
+              <button class="copy" @click="copy('cd /Users/rohan/Downloads/sony-automated-scanlight-filmscanner\nswift run --package-path phase3/FilmScanner scanlight-app')" x-text="copied.startsWith('cd /Users') ? 'Copied' : 'Copy'"></button>
+            </div>
+            <pre><code>cd /Users/rohan/Downloads/sony-automated-scanlight-filmscanner
+swift run --package-path phase3/FilmScanner scanlight-app</code></pre>
+          </div>
+
+          <div class="tile">
+            <h3><span class="dot amber"></span>Use the same repo copy</h3>
+            <p>If the Sony SDK controls disappear, you are almost certainly launching an older copy or older build. This project has existed in both Downloads and Projects, so the path matters.</p>
+            <p class="small">Expected SDK UI in Settings: Sony IP, Access Auth user/password, Check Connection, and Live View controls.</p>
+          </div>
+        </div>
+
+        <div class="section">
+          <h2>Session readiness checklist</h2>
+          <p>Use this before a real roll. The checklist is stored in your browser local storage for this guide only.</p>
+          <div class="progress" aria-label="Checklist progress">
+            <div :style="{ width: (checkedCount(['scanlight','camera','folders','auth','mode','calibration']) / 6 * 100) + '%' }"></div>
+          </div>
+          <p class="small" x-text="checkedCount(['scanlight','camera','folders','auth','mode','calibration']) + ' of 6 ready'"></p>
+          <div class="check-grid">
+            <div class="check" :class="{ done: checks.scanlight }" @click="toggleCheck('scanlight')">
+              <span class="box" x-text="checks.scanlight ? 'OK' : ''"></span>
+              <span>Scanlight is plugged into Mac on data port and wall power on power port.</span>
+            </div>
+            <div class="check" :class="{ done: checks.camera }" @click="toggleCheck('camera')">
+              <span class="box" x-text="checks.camera ? 'OK' : ''"></span>
+              <span>Camera is awake, in manual exposure, ISO 100, f/8, manual focus, RAW.</span>
+            </div>
+            <div class="check" :class="{ done: checks.folders }" @click="toggleCheck('folders')">
+              <span class="box" x-text="checks.folders ? 'OK' : ''"></span>
+              <span>Output folder is chosen. IED inbox is chosen if using Manual or Pulse mode.</span>
+            </div>
+            <div class="check" :class="{ done: checks.auth }" @click="toggleCheck('auth')">
+              <span class="box" x-text="checks.auth ? 'OK' : ''"></span>
+              <span>Sony SDK auth is filled in and Check Connection passes if using SDK mode.</span>
+            </div>
+            <div class="check" :class="{ done: checks.mode }" @click="toggleCheck('mode')">
+              <span class="box" x-text="checks.mode ? 'OK' : ''"></span>
+              <span>Trigger mode matches the real rig: SDK, Manual / IED, or hardware Pulse.</span>
+            </div>
+            <div class="check" :class="{ done: checks.calibration }" @click="toggleCheck('calibration')">
+              <span class="box" x-text="checks.calibration ? 'OK' : ''"></span>
+              <span>Exposure calibration and flat field are current for this stock and holder setup.</span>
+            </div>
+          </div>
+          <button class="copy" style="margin-top: 14px;" @click="resetChecks()">Reset checklist</button>
+        </div>
+      </section>
+
+      <section class="section" x-show="tab === 'workflow'">
+        <p class="eyebrow">NORMAL OPERATOR FLOW</p>
+        <h1>From cold start to scanned frame.</h1>
+        <p class="lead">The app is a control hub. It does not replace the physical holder, camera setup, or negative conversion tool. It makes the capture and calibration steps repeatable.</p>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>What you do</th>
+              <th>What the app does</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono">1. Configure</td>
+              <td>Choose output folder, trigger mode, Sony auth if SDK mode, and composite format.</td>
+              <td>Persists settings locally and validates required fields for the selected mode.</td>
+            </tr>
+            <tr>
+              <td class="mono">2. Connect</td>
+              <td>Connect Scanlight. In SDK mode, run Check Connection and open Live View if needed.</td>
+              <td>Claims the Scanlight serial port and probes the Sony camera without firing the shutter.</td>
+            </tr>
+            <tr>
+              <td class="mono">3. Calibrate</td>
+              <td>Select film base/rebate region, keep the lens fixed, remove film for flat field when asked.</td>
+              <td>Captures calibration frames and solves R/G/B exposure settings from real ARWs.</td>
+            </tr>
+            <tr>
+              <td class="mono">4. Scan</td>
+              <td>Click capture for each film frame, then manually advance the film holder after success.</td>
+              <td>Cycles R/G/B, triggers or waits for captures, names RAWs, and optionally streams composites.</td>
+            </tr>
+            <tr>
+              <td class="mono">5. Invert</td>
+              <td>Import the linear DNG/TIFF composites into Lightroom, NLP, or FilmLab.</td>
+              <td>Does not perform final negative inversion yet. The output is made for external inversion tools.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="section">
+          <h2>What happens during one SDK frame</h2>
+          <div class="rgb-line">
+            <strong><span class="dot red"></span> Red</strong>
+            <span>Set red LED level</span>
+            <span>Set solved shutter</span>
+            <span>Trigger Sony capture</span>
+            <span class="mono">*_R.ARW</span>
+          </div>
+          <div class="rgb-line">
+            <strong><span class="dot green"></span> Green</strong>
+            <span>Set green LED level</span>
+            <span>Set solved shutter</span>
+            <span>Trigger Sony capture</span>
+            <span class="mono">*_G.ARW</span>
+          </div>
+          <div class="rgb-line">
+            <strong><span class="dot blue"></span> Blue</strong>
+            <span>Set blue LED level</span>
+            <span>Set solved shutter</span>
+            <span>Trigger Sony capture</span>
+            <span class="mono">*_B.ARW</span>
+          </div>
+          <div class="callout good">
+            <p><strong style="color: var(--text);">The important invariant:</strong> all three captures must be the same film frame. The app only advances its frame counter after the full triplet succeeds; you advance the film manually after that.</p>
+          </div>
+        </div>
+
+        <div class="section">
+          <h2>Composite output</h2>
+          <p>Streaming composite means the app starts building the linear RGB file in the background after each successful R/G/B triplet. The main useful formats are:</p>
+          <div class="split">
+            <div class="tile">
+              <h3>Linear DNG</h3>
+              <p>Best Lightroom-style workflow because it behaves more like a RAW file in the Develop module. Use this for the normal NLP path.</p>
+            </div>
+            <div class="tile">
+              <h3>16-bit TIFF</h3>
+              <p>Useful as a stable interchange format and for tools that prefer TIFF. It is already demosaiced and composited.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" x-show="tab === 'modes'">
+        <p class="eyebrow">CAPTURE MODES</p>
+        <h1>Pick the mode that matches the hardware that is actually working.</h1>
+        <p class="lead">The modes are interchangeable from the app, but they do not all control the same parts of the rig. SDK is most integrated. Manual / IED is the fallback. Pulse is only for a proven shutter cable.</p>
+
+        <div class="mode-switch" role="tablist" aria-label="Capture mode selector">
+          <button class="choice" :class="{ active: mode === 'sdk' }" @click="mode = 'sdk'">SDK over Wi-Fi</button>
+          <button class="choice" :class="{ active: mode === 'manual' }" @click="mode = 'manual'">Manual / IED</button>
+          <button class="choice" :class="{ active: mode === 'pulse' }" @click="mode = 'pulse'">Hardware pulse</button>
+        </div>
+
+        <div class="callout">
+          <h3 x-text="modeInfo[mode].label"></h3>
+          <p x-text="modeInfo[mode].status"></p>
+        </div>
+
+        <div class="split">
+          <div class="tile">
+            <h3>App does</h3>
+            <ul>
+              <template x-for="item in modeInfo[mode].appDoes" :key="item">
+                <li x-text="item"></li>
+              </template>
+            </ul>
+          </div>
+          <div class="tile">
+            <h3>You do</h3>
+            <ul>
+              <template x-for="item in modeInfo[mode].youDo" :key="item">
+                <li x-text="item"></li>
+              </template>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <p><strong style="color: var(--text);">Mode-specific limitation:</strong> <span x-text="modeInfo[mode].missing"></span></p>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Mode</th>
+              <th>Camera trigger</th>
+              <th>RAW arrival</th>
+              <th>Shutter speed control</th>
+              <th>Use when</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>SDK</td>
+              <td>Sony Wi-Fi SDK</td>
+              <td>Host-PC SDK download to roll folder</td>
+              <td>Automatic per channel</td>
+              <td>Camera is on Wi-Fi PC Remote and auth passes.</td>
+            </tr>
+            <tr>
+              <td>Manual / IED</td>
+              <td>You fire Imaging Edge Desktop</td>
+              <td>IED watched inbox</td>
+              <td>Manual on camera</td>
+              <td>SDK is unavailable or you want the safest fallback.</td>
+            </tr>
+            <tr>
+              <td>Pulse</td>
+              <td>Scanlight shutter output</td>
+              <td>IED watched inbox</td>
+              <td>Manual on camera</td>
+              <td>3.5 mm shutter pulse has been bench-tested.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section" x-show="tab === 'calibration'">
+        <p class="eyebrow">CALIBRATION AND FFC</p>
+        <h1>Calibration should measure real ARWs, not the preview image.</h1>
+        <p class="lead">Live view is for aiming and selecting the film base/rebate region. The color and exposure solve should come from the captured ARW triplet because that is the data used by the final scan.</p>
+
+        <div class="step-switch" aria-label="Calibration step selector">
+          <template x-for="entry in Object.entries(calSteps)" :key="entry[0]">
+            <button class="choice" :class="{ active: calStep === entry[0] }" @click="calStep = entry[0]" x-text="entry[1].title"></button>
+          </template>
+        </div>
+
+        <div class="callout">
+          <h3 x-text="calSteps[calStep].goal"></h3>
+          <p x-text="calSteps[calStep].detail"></p>
+        </div>
+
+        <div class="section">
+          <h2>Recommended calibration behavior</h2>
+          <ol>
+            <li>Turn the Scanlight to white for the preview picker so the film edge/rebate is easy to see.</li>
+            <li>Select the film base or rebate region in live view.</li>
+            <li>Capture a real dark frame plus R/G/B ARW triplet for that selected region.</li>
+            <li>Measure the same mapped region in the ARWs and solve per-channel shutter plus LED brightness.</li>
+            <li>Turn the light off when the sequence ends or fails.</li>
+            <li>Remove film, then capture flat-field frames with the solved settings.</li>
+          </ol>
+        </div>
+
+        <div class="split">
+          <div class="tile">
+            <h3><span class="dot amber"></span>Exposure solve</h3>
+            <p>The intended target is a high but unclipped film-base signal. In SDK mode the solver uses shutter speed as the coarse control and LED level as the fine trim.</p>
+            <p class="small">Assumptions: ISO 100, f/8, manual focus lens, fixed camera position, fixed holder position.</p>
+          </div>
+          <div class="tile">
+            <h3><span class="dot"></span>Flat field correction</h3>
+            <p>FFC is a no-film capture that records illumination unevenness for each channel. It corrects vignetting and color falloff before the final composite is written.</p>
+            <p class="small">Re-run it when lens, distance, holder, light position, or film stock setup changes.</p>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <p><strong style="color: var(--text);">Current rough edge:</strong> the live-view ROI to ARW crop mapping still needs real-world validation. If the selected strip looks wrong in results, use auto-detect or reselect a clearer rebate area before trusting the calibration.</p>
+        </div>
+      </section>
+
+      <section class="section" x-show="tab === 'sony'">
+        <p class="eyebrow">SONY SDK DETAILS</p>
+        <h1>The SDK path is Wi-Fi PC Remote, not USB.</h1>
+        <p class="lead">The current Sony integration uses the Camera Remote SDK over the camera network connection. Access Authentication is required on newer Sony bodies, and the camera can provide both still capture and a live-view JPEG stream.</p>
+
+        <div class="split">
+          <div class="tile">
+            <h3>Connection test</h3>
+            <p>Use Settings -> SDK -> Check Connection before calibration or scanning. It connects, completes auth, then disconnects without firing the shutter.</p>
+            <pre><code>phase1/sony-capture/build/sony-capture \
+  --connect-only \
+  --ip-address 10.0.0.247 \
+  --username USER \
+  --password PASSWORD</code></pre>
+          </div>
+          <div class="tile">
+            <h3>Live view</h3>
+            <p>Live view is a sequence of JPEG frames from the camera through the SDK. It is not RAW and it is not the final color measurement path.</p>
+            <pre><code>phase1/sony-capture/build/sony-capture \
+  --live-view-stream-out /tmp/sony-live-view.jpg \
+  --ip-address 10.0.0.247 \
+  --username USER \
+  --password PASSWORD</code></pre>
+          </div>
+        </div>
+
+        <div class="section">
+          <h2>What live view is and is not</h2>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Question</th>
+                <th>Answer</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Is it video?</td>
+                <td>Operationally yes, but technically the app displays refreshed SDK live-view JPEG frames.</td>
+              </tr>
+              <tr>
+                <td>Is it decoded on the camera?</td>
+                <td>The camera/SDK provides compressed live-view image data. The Mac decodes each JPEG for display.</td>
+              </tr>
+              <tr>
+                <td>Is it used for final color?</td>
+                <td>No. Use it for framing and ROI selection. Calibration and scanning should measure captured ARWs.</td>
+              </tr>
+              <tr>
+                <td>Does opening live view take a photo?</td>
+                <td>No. It keeps one SDK session open and refreshes a preview frame until you close it.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout bad">
+          <p><strong style="color: var(--text);">Auth storage note:</strong> the app may store Sony auth locally for convenience. That belongs in local macOS settings or ignored cache files only. Do not commit camera usernames, passwords, or fingerprint blobs to GitHub.</p>
+        </div>
+      </section>
+
+      <section class="section" x-show="tab === 'limits'">
+        <p class="eyebrow">WHAT IS MISSING OR STILL ROUGH</p>
+        <h1>Known gaps are part of the operating procedure.</h1>
+        <p class="lead">The rig is useful, but it is not a fully automatic lab scanner. These are the current boundaries to keep in mind while testing.</p>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Area</th>
+              <th>Current state</th>
+              <th>Operator impact</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Film advance</td>
+              <td>No motorized advance.</td>
+              <td>You advance the holder by hand after each successful triplet.</td>
+            </tr>
+            <tr>
+              <td>Sony USB SDK</td>
+              <td>Deferred for this rig.</td>
+              <td>Use Wi-Fi PC Remote for SDK capture, or Manual / IED as fallback.</td>
+            </tr>
+            <tr>
+              <td>RemoteTransfer pull mode</td>
+              <td>Not the main path.</td>
+              <td>Use host-PC SDK download. FTP/NAS can still be useful as a separate backup path.</td>
+            </tr>
+            <tr>
+              <td>Live-view to ARW ROI mapping</td>
+              <td>Implemented conceptually, needs real-world validation.</td>
+              <td>Trust calibration results only after checking that the selected rebate maps correctly.</td>
+            </tr>
+            <tr>
+              <td>Lens control</td>
+              <td>No autofocus or aperture control.</td>
+              <td>Set focus manually and keep the lens at f/8 before calibration and scanning.</td>
+            </tr>
+            <tr>
+              <td>Final inversion</td>
+              <td>Not built into the app.</td>
+              <td>Use Lightroom, Negative Lab Pro, FilmLab, or another inversion workflow on the composites.</td>
+            </tr>
+            <tr>
+              <td>Error messages</td>
+              <td>Improving, but some backend errors still surface raw details.</td>
+              <td>Use the failure assistant below to translate common cases.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="section">
+          <h2>Failure assistant</h2>
+          <p>Pick the symptom that matches what you see.</p>
+          <div class="diag-switch">
+            <button class="choice" :class="{ active: diag === 'sdk-no-live' }" @click="diag = 'sdk-no-live'">SDK UI missing</button>
+            <button class="choice" :class="{ active: diag === 'sdk-auth' }" @click="diag = 'sdk-auth'">Auth fails</button>
+            <button class="choice" :class="{ active: diag === 'capture-500' }" @click="diag = 'capture-500'">Capture 500</button>
+            <button class="choice" :class="{ active: diag === 'folder-warning' }" @click="diag = 'folder-warning'">Folder warning</button>
+          </div>
+          <div class="callout">
+            <h3 x-text="diagnostics[diag].title"></h3>
+            <p x-text="diagnostics[diag].fix"></p>
+            <div class="topline">
+              <span class="small">Useful command</span>
+              <button class="copy" @click="copy(diagnostics[diag].command)" x-text="copied === diagnostics[diag].command ? 'Copied' : 'Copy'"></button>
+            </div>
+            <pre><code x-text="diagnostics[diag].command"></code></pre>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <p>This guide is a local operator document for the current Scanlight/Sony app state. It loads Tailwind CSS and Alpine.js externally; the content remains visible without them, but the tabs and checklist need JavaScript.</p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

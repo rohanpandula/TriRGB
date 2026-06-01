@@ -1,8 +1,8 @@
 // SettingsCalibrationUITests — Phase 06 acceptance test suite.
 //
 // Covers:
-//   R-20: Settings form validates input; Save Settings pushes applyRuntimeSettings
-//         when the orchestrator is running (testSaveSettingsPushesRuntimeSettings).
+//   R-20: Settings form validates input; runtime-safe changes push
+//         applyRuntimeSettings when the orchestrator is running.
 //   NFR-09: Every new Phase 06 AX-ID has >= 1 rendered element (testNewAccessibilityIDsRendered).
 //
 // Note: R-21 (CalibrationViewModel stub-runner test) was removed in Phase 14 when
@@ -14,7 +14,7 @@
 // (testNewAccessibilityIDsRendered) covers the Settings AX-ID coverage gate; it
 // skips gracefully in headless CI.
 //
-// URLProtocol injection for testSaveSettingsPushesRuntimeSettings mirrors the exact
+// URLProtocol injection for runtime-push tests mirrors the exact
 // pattern from OrchestratorClientTests (StubURLProtocol + makeStubSession).
 
 import XCTest
@@ -34,32 +34,27 @@ final class SettingsCalibrationUITests: XCTestCase {
         StubURLProtocol.lastBody = nil
     }
 
-    // MARK: - AX-ID array (16 Settings-view cases)
+    // MARK: - AX-ID array (12 Settings-view cases)
 
-    /// The 16 Settings-view AccessibilityID string values introduced in Phase 06.
+    /// The 12 Settings-view AccessibilityID string values currently rendered.
     /// Using the type constants (not string literals) so a rename fails at compile time.
     ///
     /// Note: the 6 old Calibration-view IDs (calCaptureBtn, calVerdictR/G/B,
     /// calOverallLabel, calUseBtn) were removed in Phase 14 along with
     /// CalibrationView.swift/CalibrationViewModel.swift.
     private let newAccessibilityIDs: [String] = [
-        // Settings view (16)
         AccessibilityID.settingsRollNameField,
         AccessibilityID.settingsPickOutputBtn,
         AccessibilityID.settingsOutputPathLabel,
         AccessibilityID.settingsTriggerModePicker,
         AccessibilityID.settingsPickInboxBtn,
         AccessibilityID.settingsInboxPathLabel,
-        AccessibilityID.settingsLevelRSlider,
-        AccessibilityID.settingsLevelGSlider,
-        AccessibilityID.settingsLevelBSlider,
         AccessibilityID.settingsSettleStepper,
         AccessibilityID.settingsPickFfcBtn,
         AccessibilityID.settingsFfcPathLabel,
         AccessibilityID.settingsCameraModelPicker,
         AccessibilityID.settingsStreamToggle,
         AccessibilityID.settingsCompositeFormat,
-        AccessibilityID.settingsSaveBtn,
     ]
 
     // MARK: - Test 1: AX-ID coverage gate (requires window server)
@@ -67,7 +62,7 @@ final class SettingsCalibrationUITests: XCTestCase {
     /// Verify that every Phase 06 Settings AX-ID has at least one rendered SwiftUI element.
     ///
     /// Requires accessibility permissions and a window server. Skips gracefully
-    /// when neither is available (headless CI, SSH). Navigates to the Settings tab
+    /// when neither is available (headless CI, SSH). Navigates to the Set Up tab
     /// to cover the 16 Settings IDs.
     ///
     /// Note: the 6 old Calibration-view IDs were removed in Phase 14.
@@ -81,8 +76,8 @@ final class SettingsCalibrationUITests: XCTestCase {
             throw XCTSkip("App window did not appear — Accessibility permission may not be granted, or running headless.")
         }
 
-        // Navigate to the Settings tab and check the 16 Settings AX-IDs.
-        let settingsTab = app.tabs["Settings"]
+        // Navigate to Set Up > Roll Setup and check the Settings AX-IDs.
+        let settingsTab = app.tabs["Set Up"]
         if settingsTab.exists { settingsTab.click() }
 
         for id in newAccessibilityIDs {
@@ -98,7 +93,7 @@ final class SettingsCalibrationUITests: XCTestCase {
 
     /// Unit test — no app launch.
     func testRollNameValidationRejectsSpaces() {
-        let store = SettingsStore()
+        let store = SettingsStore(persistenceEnabled: false)
         store.settings.rollName = "Roll With Spaces"
         let errors = store.validate()
         XCTAssertNotNil(errors["rollName"],
@@ -111,7 +106,7 @@ final class SettingsCalibrationUITests: XCTestCase {
 
     /// Unit test — no app launch.
     func testRollNameValidationRejectsEmpty() {
-        let store = SettingsStore()
+        let store = SettingsStore(persistenceEnabled: false)
         store.settings.rollName = ""
         let errors = store.validate()
         XCTAssertNotNil(errors["rollName"],
@@ -120,46 +115,128 @@ final class SettingsCalibrationUITests: XCTestCase {
                       "Error should mention 'required', got: \(errors["rollName"] ?? "nil")")
     }
 
-    // MARK: - Test 4: HW trigger requires IED inbox
+    // MARK: - Test 4: IED-backed trigger modes require IED inbox
 
     /// Unit test — no app launch.
-    func testHWTriggerRequiresIedInbox() {
-        let store = SettingsStore()
-        store.settings.triggerMode = "hw"
-        store.settings.iedInbox = nil
-        let errors = store.validate()
-        XCTAssertNotNil(errors["iedInbox"],
-                        "Expected iedInbox error when triggerMode == hw and iedInbox is nil")
+    func testIedBackedTriggersRequireIedInbox() {
+        let store = SettingsStore(persistenceEnabled: false)
+        for mode in ["manual", "hw"] {
+            store.settings.triggerMode = mode
+            store.settings.iedInbox = nil
+            let errors = store.validate()
+            XCTAssertNotNil(errors["iedInbox"],
+                            "Expected iedInbox error when triggerMode == \(mode) and iedInbox is nil")
+        }
     }
 
     // MARK: - Test 5: SDK trigger does not require IED inbox
 
     /// Unit test — no app launch.
     func testSDKTriggerDoesNotRequireIedInbox() {
-        let store = SettingsStore()
+        let store = SettingsStore(persistenceEnabled: false)
         store.settings.triggerMode = "sdk"
         store.settings.iedInbox = nil
         store.settings.rollName = "Roll001"
         store.settings.outputFolder = "/tmp/out"
+        store.settings.sonyIpAddress = "10.0.0.247"
+        store.settings.sonyUser = "user"
+        store.settings.sonyPassword = "password"
         let errors = store.validate()
         XCTAssertNil(errors["iedInbox"],
                      "SDK trigger should not require iedInbox, got: \(errors["iedInbox"] ?? "nil")")
     }
 
-    // MARK: - Test 6: Save Settings pushes applyRuntimeSettings when orchestrator is running
+    // MARK: - Test 5a: SDK trigger requires Sony network auth fields
+
+    /// Unit test — no app launch.
+    func testSDKTriggerRequiresSonyNetworkAuth() {
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.triggerMode = "sdk"
+        store.settings.rollName = "Roll001"
+        store.settings.outputFolder = "/tmp/out"
+        store.settings.sonyIpAddress = nil
+        store.settings.sonyUser = nil
+        store.settings.sonyPassword = nil
+
+        let errors = store.validate()
+
+        XCTAssertNotNil(errors["sonyIpAddress"])
+        XCTAssertNotNil(errors["sonyUser"])
+        XCTAssertNotNil(errors["sonyPassword"])
+    }
+
+    // MARK: - Test 5b: picking folders clears stale validation errors
+
+    /// Unit test — no app launch.
+    func testFolderSelectionRefreshesVisibleValidationErrors() {
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.outputFolder = ""
+        store.settings.triggerMode = "manual"
+        store.settings.iedInbox = nil
+
+        _ = store.validate()
+        XCTAssertNotNil(store.validationErrors["outputFolder"])
+        XCTAssertNotNil(store.validationErrors["iedInbox"])
+
+        let view = ScanSettingsView(
+            store: store,
+            orchestratorClient: OrchestratorClient(),
+            lightViewModel: ScanlightViewModel(transportFactory: FakeBridge.makeTransport),
+            cameraConnection: SonyCameraConnection()
+        )
+        store.settings.outputFolder = "/tmp/out"
+        store.settings.iedInbox = "/tmp/ied"
+        view.refreshValidationIfNeeded()
+
+        XCTAssertNil(store.validationErrors["outputFolder"])
+        XCTAssertNil(store.validationErrors["iedInbox"])
+    }
+
+    // MARK: - Test 5c: folder paths persist across store reloads
+
+    /// Unit test — no app launch.
+    func testFolderLocationsPersistAcrossStoreInstances() {
+        let suiteName = "ScanlightApp.SettingsCalibrationUITests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated UserDefaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let firstStore = SettingsStore(userDefaults: defaults)
+        firstStore.settings.outputFolder = "/tmp/scans"
+        firstStore.settings.iedInbox = "/tmp/ied"
+        firstStore.settings.ffcCalibration = "/tmp/ffc"
+        firstStore.settings.sonyIpAddress = "10.0.0.247"
+        firstStore.settings.sonyMacAddress = "10:32:2C:26:1A:3F"
+        firstStore.settings.sonyUser = "user"
+        firstStore.settings.sonyPassword = "persist-for-local-use"
+        firstStore.lastCalibrationDir = "/tmp/calibration-last"
+
+        let reloadedStore = SettingsStore(userDefaults: defaults)
+        XCTAssertEqual(reloadedStore.settings.outputFolder, "/tmp/scans")
+        XCTAssertEqual(reloadedStore.settings.iedInbox, "/tmp/ied")
+        XCTAssertEqual(reloadedStore.settings.ffcCalibration, "/tmp/ffc")
+        XCTAssertEqual(reloadedStore.settings.sonyIpAddress, "10.0.0.247")
+        XCTAssertEqual(reloadedStore.settings.sonyMacAddress, "10:32:2C:26:1A:3F")
+        XCTAssertEqual(reloadedStore.settings.sonyUser, "user")
+        XCTAssertEqual(reloadedStore.settings.sonyPassword, "persist-for-local-use")
+        XCTAssertEqual(reloadedStore.lastCalibrationDir, "/tmp/calibration-last")
+    }
+
+    // MARK: - Test 6: Runtime settings push when orchestrator is running
 
     /// Unit test — no app launch.
     ///
-    /// R-20: Save Settings calls applyRuntimeSettings when orchestrator is running
-    /// → POST /api/settings with levelR/G/B. When not running → no POST.
+    /// R-20: runtime-safe settings call applyRuntimeSettings when orchestrator
+    /// is running → POST /api/settings with levelR/G/B + settle. When not
+    /// running → no POST.
     ///
-    /// Exercises the ACTUAL wiring: creates a ScanSettingsView with the
-    /// orchestratorClient injected and calls saveSettings() — the same method
-    /// that the Save button action now invokes — to verify the wiring is correct,
-    /// not just the capability of applyRuntimeSettings in isolation.
+    /// Exercises the actual Settings view wiring without a Save button.
     ///
     /// Uses the StubURLProtocol injection pattern from OrchestratorClientTests.
-    func testSaveSettingsPushesRuntimeSettings() async throws {
+    func testRuntimeSettingsPushesWhenRunning() async throws {
         // Pre-program StubURLProtocol to return HTTP 200 for POST /api/settings
         let stateResponseData = """
         {
@@ -184,21 +261,28 @@ final class SettingsCalibrationUITests: XCTestCase {
         // Build SettingsStore with known level values.
         // Use triggerMode "sdk" so iedInbox is not required — the test focuses on
         // the applyRuntimeSettings POST path, not trigger-mode validation.
-        let store = SettingsStore()
+        let store = SettingsStore(persistenceEnabled: false)
         store.settings.levelR = 210
         store.settings.levelG = 195
         store.settings.levelB = 220
         store.settings.rollName = "TestRoll"
         store.settings.outputFolder = "/tmp/out"
         store.settings.triggerMode = "sdk"
+        store.settings.sonyIpAddress = "10.0.0.247"
+        store.settings.sonyUser = "user"
+        store.settings.sonyPassword = "password"
 
         // Create ScanSettingsView with the orchestratorClient injected — this verifies
-        // the wiring (not just calling applyRuntimeSettings directly). Call saveSettings()
-        // which is the exact method the Save button action delegates to.
-        let view = ScanSettingsView(store: store, orchestratorClient: orchestratorClient)
-        await view.saveSettings()
+        // the wiring (not just calling applyRuntimeSettings directly).
+        let view = ScanSettingsView(
+            store: store,
+            orchestratorClient: orchestratorClient,
+            lightViewModel: ScanlightViewModel(transportFactory: FakeBridge.makeTransport),
+            cameraConnection: SonyCameraConnection()
+        )
+        await view.applyRuntimeSettingsIfRunning()
 
-        // Assert: validation passed (no errors after saveSettings())
+        // Assert: validation passed.
         XCTAssertTrue(store.validationErrors.isEmpty,
                       "Validation should pass for valid settings, errors: \(store.validationErrors)")
 
@@ -206,7 +290,7 @@ final class SettingsCalibrationUITests: XCTestCase {
         XCTAssertNotNil(StubURLProtocol.lastRequest,
                         "StubURLProtocol should have intercepted a request")
         XCTAssertEqual(StubURLProtocol.lastRequest?.httpMethod, "POST",
-                       "Save Settings must POST to /api/settings")
+                       "Runtime settings must POST to /api/settings")
         XCTAssertEqual(StubURLProtocol.lastRequest?.url?.path, "/api/settings",
                        "Request path must be /api/settings")
 
@@ -241,10 +325,10 @@ final class SettingsCalibrationUITests: XCTestCase {
         StubURLProtocol.lastBody = nil
 
         orchestratorClient.isRunning = false
-        await view.saveSettings()
+        await view.applyRuntimeSettingsIfRunning()
 
         XCTAssertNil(StubURLProtocol.lastRequest,
-                     "When orchestrator is not running, Save Settings must not POST to /api/settings")
+                     "When orchestrator is not running, settings changes must not POST to /api/settings")
     }
 
     // MARK: - Private helpers

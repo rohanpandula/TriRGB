@@ -15,7 +15,17 @@ DerivedData/
 
 # Local
 .env
+.env.*
+*.secret
+*.secrets
+.sony-capture-fingerprint.bin
+*.fingerprint.bin
+*.local
 *.log
+.external/
 
 # Agent harness — vendored/installed skills (re-installable from skills-lock.json)
 .agents/
+
+# Agent harness — local Claude Code state (settings.local.json, locks, worktrees)
+.claude/

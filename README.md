@@ -1,313 +1,206 @@
-# Film Scanner
+# TriRGB
 
-A Mac-driven workflow for scanning film negatives as three sequential
-narrowband-RGB exposures, composited into a 16-bit linear ProPhoto-RGB
-TIFF (or Linear DNG) for inversion in **Negative Lab Pro** or FilmLab.
+**Scan, combine, and invert RGB negatives.**
 
-**Canonical brief:** [`PROJECT.md`](PROJECT.md) — read first.
-**Resume from HW arrival:** [`HANDOFF.md`](HANDOFF.md).
-**Optical pre-flight:** [`docs/optical_dry_run.md`](docs/optical_dry_run.md).
-**Automation reference:** [`docs/automation.md`](docs/automation.md) — for AI agents and CI runners.
+TriRGB is a Mac-driven workflow for **trichromatic narrowband-RGB film scanning**:
+it photographs a color negative as three sequential exposures — one each under
+narrowband **red (665 nm)**, **green (525 nm)**, and **blue (455 nm)** light —
+then composites the matching channel from each into a single 16-bit linear
+ProPhoto-RGB TIFF (or Linear DNG) that inverts cleanly in
+[Negative Lab Pro](https://www.negativelabpro.com/) or
+[FilmLab](https://www.filmlabapp.com/).
+
+This is the same principle used by dedicated film scanners (Fuji Frontier,
+Nikon Coolscan): treat the camera sensor as a **densitometer** and measure the
+film one narrow band at a time, instead of fighting the orange mask under white
+light.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Platform: macOS](https://img.shields.io/badge/platform-macOS%2013%2B-blue)
+![Swift 5.9](https://img.shields.io/badge/Swift-5.9-orange)
+![Python 3.12](https://img.shields.io/badge/Python-3.12%2B-blue)
+
+> **Status:** active development, built around specific hardware (see below).
+> The capture/compositing/calibration logic and the operator GUI are
+> implemented and tested hardware-free; full end-to-end validation on the
+> physical rig is ongoing. Treat it as a reference implementation and a
+> starting point, not a turnkey product.
 
 ---
 
-## Automating this project
+## How it works
 
-For AI agents (Claude, Codex) and CI runners that need to drive the
-system without human intervention, the written contract lives at
-[`docs/automation.md`](docs/automation.md). It enumerates every
-automatable surface (every CLI, the SwiftUI app's AX-ID schema, the
-Python harness pattern), documents the JSON contract / exit codes /
-failure modes for each, and ships a GUI ↔ CLI mapping table covering
-every case in `AccessibilityIDs.swift`. The flat AX-ID list is at
-[`docs/ax-id-reference.md`](docs/ax-id-reference.md); a consistency
-check keeps it in sync with the Swift source.
+1. **Light one band at a time.** A narrowband RGB backlight illuminates the
+   negative with pure red, then green, then blue. You advance the film by hand;
+   one button captures the **triplet** (three RAW frames).
+2. **Extract the matching channel.** From the red-lit frame we keep only the
+   sensor's red channel, green from the green-lit frame, blue from the blue-lit
+   frame. This sidesteps the Bayer-sensor crosstalk that limits single-shot RGB
+   capture.
+3. **Composite.** The three channels are merged into one 16-bit **linear**
+   RGB image. Because each channel is exposed to place the **film base** just
+   below clipping, the orange mask is neutralized in the exposure (physical)
+   domain — the film rebate comes out near-neutral grey.
+4. **Invert.** With a neutral base and linear data, inversion is close to a
+   straight linear flip — far less per-channel wrangling than white-light
+   scans, and the red channel no longer clips first and bottlenecks dynamic
+   range.
 
-The rest of this file is the operator how-to. AI agents should start
-at `docs/automation.md`; humans scanning film should keep reading.
+### Why bother (vs. white-light camera scanning)
+
+- **More latitude:** every channel is exposed to the right independently, so
+  you keep highlight and shadow headroom in all three.
+- **Cleaner separation:** narrowband light + per-channel extraction mimics how
+  pro RGB scanners work.
+- **Simpler inversion:** a neutralized base means minimal, predictable color
+  correction downstream.
 
 ---
 
 ## Hardware
 
-| | |
+TriRGB is built and verified against this rig (other Sony bodies / RGB lights
+should adapt with modest changes):
+
+| Component | Used here |
 |---|---|
-| Camera | Sony a7CR with NP-FZ100 dummy battery |
-| Lens | Sony FE 90mm Macro (primary), Pentax 120mm (fallback) |
-| Light | Scanlight v4 (jackw01) — narrowband 665/525/455 nm + 5000K white |
-| Film holder | Valoi 360 Advancer, manual |
-| Host | Apple Silicon Mac |
+| Camera | **Sony a7CR** (61 MP), via Sony Camera Remote SDK (Wi-Fi PC Remote) |
+| Lens | Sony FE 90mm Macro (Pentax 120mm as fallback) |
+| Light | **[Scanlight v4 by jackw01](https://github.com/jackw01/scanlight)** — narrowband 665/525/455 nm RGB + 5000K 95-CRI white, USB-CDC serial control |
+| Film transport | Valoi 360 Advancer (manual, one frame at a time) |
+| Host | Mac (Apple Silicon), macOS 13+ |
 
-See PROJECT.md §"Hardware architecture" for cabling. **Important:**
-Scanlight LEFT port is data (Mac), RIGHT port is wall PSU — never
-powered from Mac USB.
-
----
-
-## Structure
-
-```
-.
-├── PROJECT.md                  ← spec / brief (read first)
-├── HANDOFF.md                  ← state of every deliverable + plug-in-day playbook
-├── README.md                   ← this file
-├── docs/
-│   ├── optical_dry_run.md      ← pre-software optical checklist
-│   └── calibration_notes.md    ← per-stock R/G/B level table (fill in)
-├── scripts/
-│   ├── diagnose.py             ← first-thing-on-plug-in HW check
-│   ├── smoketest.sh            ← Phase 1 exit-criteria, one command
-│   └── capture-calibration.sh  ← capture FFC blank-light triplet
-├── phase1/
-│   ├── scanlightctl/           ← Python CLI + driver for Scanlight v4 (USB-CDC)
-│   └── sony-capture/           ← C++ CLI for single-shot tether capture (Sony SDK)
-├── phase2/
-│   ├── triplet-capture/        ← Per-frame R/G/B orchestrator (Flask UI, disposable)
-│   ├── rgb-composite/          ← 3 ARWs → 16-bit linear ProPhoto-RGB TIFF or Linear DNG, with optional per-channel FFC
-│   └── batch-composite/        ← Walk a roll dir, composite every frame
-└── phase3/
-    └── FilmScanner/            ← Swift package — Scanlight protocol port (scaffold)
-```
+Power and tether wiring matter (ground-loop avoidance, light power isolation) —
+see the [project brief](PROJECT.md) and [operator guide](docs/OPERATING.md).
 
 ---
 
-## End-to-end how-to
+## Repository structure
 
-The complete flow from cold start to final positive JPEG. Run each step
-once per scanning session unless noted.
-
-### 1. Plug in the hardware
+The system is three cooperating layers:
 
 ```
-Mac ──USB-A→ Scanlight LEFT port  (data / control)
-Wall PSU ──USB-C→ Scanlight RIGHT port  (power)
-Mac ──USB-C→ Sony a7CR  (PC Remote tether)
+phase1/   Hardware control (plug-in-day primitives)
+  sony-capture/     C++ CLI over the Sony Camera Remote SDK (capture + live view)
+  scanlightctl/     Python serial control for the Scanlight LEDs
+
+phase2/   Imaging pipeline (Python, hardware-free + testable)
+  c41-core/         Versioned data contracts shared across the pipeline
+  rgb-composite/    Channel extraction, flat-field correction, rebate detection,
+                    linear inversion, and numeric QA checks
+  triplet-capture/  Capture orchestrator + Flask backend; per-roll exposure &
+                    flat-field calibration
+  batch-composite/  Batch compositing of a whole roll
+
+phase3/   Operator GUI
+  FilmScanner/      SwiftUI macOS app — drives the Python backend, hosts the
+                    guided calibration wizard and the scan/review workflow
+
+docs/     PROJECT brief, operator guide, automation contract, AX-ID reference
+scripts/  Calibration capture/inspection and diagnostics helpers
 ```
 
-The dummy battery into the a7CR's battery slot keeps it from sleeping
-during long sessions.
-
-### 2. Verify the rig (~30 seconds)
-
-```bash
-python3 scripts/diagnose.py
-```
-
-Checks serial enumeration, scanlight handshake, VBUS voltage, and that
-the Sony SDK sees the camera. **Do not proceed until everything is
-green.** If something fails, the error tells you which assumption broke.
-
-### 3. Optical dry run (paper, one-time per setup)
-
-```bash
-open docs/optical_dry_run.md
-```
-
-Confirm focus, framing, level, and working distance. If you swap the
-lens or holder later, redo this — it's a thirty-second check that saves
-hours.
-
-### 4. Capture FFC calibration (once per session)
-
-**Why:** Under narrowband-RGB illumination, each color channel has its
-own vignette profile — red, green, and blue fall off differently at the
-corners. Without correction this shows up as red flaring in the NLP
-conversion (see [NLP forum thread on Big Scanlight workflow][nlpforum]).
-
-[nlpforum]: https://forums.negativelabpro.com/t/nlp-workflow-using-combined-rgb-light-source/
-
-**Run:** Remove film from the holder, then:
-
-```bash
-scripts/capture-calibration.sh
-# → ~/.scanlight/calibration/<YYYY-MM-DD>/{R,G,B}.ARW
-```
-
-Re-run whenever you change holder, working distance, lens, or move the
-scanlight. **Use the same lens/focus/distance as the actual scan.**
-
-### 5. Phase 1 smoke test (one frame, ~30 seconds)
-
-```bash
-scripts/smoketest.sh /Volumes/SSD/smoke
-```
-
-Cycles R/G/B with the shutter, verifies three RAWs landed in the
-expected size band. Pure sanity check — if this fails, don't waste time
-scanning film.
-
-### 6. Scan a roll
-
-Load film into the Valoi 360. Launch the orchestrator with whichever
-trigger mode matches your physical setup (see PROJECT.md §Hardware
-architecture for the two configurations).
-
-**Configuration B — tether app + Scanlight 3.5mm trigger (recommended default):**
-
-The tether app (Imaging Edge Desktop for Sony, or Lightroom Classic tether
-for Fuji) holds the camera connection and auto-saves each RAW to a watched
-folder. The Scanlight's 3.5mm jack fires the shutter. This works for **both
-the Sony a7CR and the Fuji GFX 100 II** — the orchestrator and inbox watcher
-are camera-agnostic; only the cable adapter differs (Sony Multi vs Fuji
-RR-100 2.5mm, each → 3.5mm TRS).
-
-```bash
-# Start the tether app first; point its save folder at --ied-inbox below.
-# (Sony: Imaging Edge Desktop. Fuji: Lightroom Classic → File → Tether Capture.)
-triplet-capture \
-    --roll-name Roll001 \
-    --output-folder /Volumes/SSD/Scans \
-    --trigger-mode hw \
-    --ied-inbox /Volumes/SSD/_ied_inbox \
-    --shutter-pulse-ms 100 \
-    --capture-timeout-s 30 \
-    --stream-composite \
-    --ffc-calibration ~/.scanlight/calibration/$(date +%Y-%m-%d) \
-    --camera-model "Sony ILCE-7CR"   # or "FUJIFILM GFX100 II"
-```
-
-**Configuration A — USB tether, Sony SDK trigger (deprecated):**
-
-```bash
-triplet-capture --roll-name Roll001 --output-folder /Volumes/SSD/Scans
-```
-
-> ⚠ The Sony Camera Remote SDK shutter path (`sony-capture`, the default
-> `--trigger-mode sdk`) does NOT reliably produce stills on a7CR firmware
-> ≥ 1.10 with Access Authentication enabled — `CrCommandId_Release` routes
-> to movie capture and writes XAVC instead of ARW. The SDK *connection*
-> (Wi-Fi + Access Auth + RemoteTransfer file pull) works; the still-shutter
-> command does not. Use Configuration B. The SDK path is kept for reference
-> and may be revisited if Sony fixes the firmware behavior.
-
-Either way, opens a web UI. Per frame:
-1. Click "Capture frame NNN" — the scanlight cycles R, G, B; the camera
-   fires three times; three RAWs (ARW or RAF) land in
-   `/Volumes/SSD/Scans/Roll001/`.
-2. Manually advance the Valoi to the next frame.
-3. Repeat.
-
-File naming follows `{roll_name}_Frame{NNN}_{R|G|B}.{ARW,RAF}`.
-
-### 7. Composite the roll
-
-**If you passed `--stream-composite` in step 6, the roll is already composited** —
-each triplet was composited in the background as you shot it, so by the time
-you finished the last frame the `composites/` directory was full. Skip to
-step 8. (Background composites run up to 4 at a time; a failed frame is
-logged but never aborts capture, and you can always re-run `batch-composite`
-to fill gaps.)
-
-**Otherwise, composite the whole roll in one batch pass:**
-
-```bash
-batch-composite /Volumes/SSD/Scans/Roll001 \
-    --ffc-calibration ~/.scanlight/calibration/$(date +%Y-%m-%d) \
-    --format both
-```
-
-Walks the roll directory, finds every (R, G, B) triplet, and writes a
-composite per frame to `Roll001/composites/`.
-
-Key flags (shared by `batch-composite` and the `--stream-composite` path):
-- `--ffc-calibration <dir>` — apply per-channel Flat Field Correction
-  using the calibration triplet from step 4. Strongly recommended.
-- `--format <tiff|dng|both>` (batch) / `--composite-format` (streaming) —
-  16-bit linear ProPhoto-RGB as TIFF (legacy), Linear DNG (Lightroom/Capture
-  One treat it as RAW — parametric Develop module works), or both.
-- `--camera-model "<model>"` — sets the DNG `UniqueCameraModel` tag so LR
-  offers the matching camera profile. `"Sony ILCE-7CR"` or
-  `"FUJIFILM GFX100 II"`.
-- `--workers N` (batch) / `--composite-workers N` (streaming) — parallel
-  decode. Default 4 to keep peak memory bounded; raise on a 32 GB+ Mac.
-
-### 8. Import to Lightroom
-
-Drag the `composites/` directory into LR. Use **Linear DNG** if you
-generated it — you get the full Develop module before NLP runs.
-
-**Hands-off option:** point Lightroom Classic's Auto Import (File → Auto
-Import → Auto Import Settings) at the `composites/` directory. Combined
-with `--stream-composite` in step 6, composites appear in your LR catalog
-within seconds of each frame being captured — by the time the roll is shot,
-every frame is already imported and waiting for NLP. Zero manual import.
-
-Per the NLP forum, before running the convert:
-- **Camera Profile** → "Linear" or "Adobe Standard" (not Camera-anything).
-- **White Balance** → leave alone. Don't try to neutralize the orange
-  mask manually; NLP needs to see it to invert correctly.
-- **Tone Curve** → linear.
-
-### 9. Convert with Negative Lab Pro
-
-Select the imported frames → File → Plug-in Extras → Negative Lab Pro →
-Convert Negatives. Per-stock settings (Portra 400 vs Ektar 100 vs CineStill,
-etc.) belong in `docs/calibration_notes.md` as you tune them.
-
-### 10. Export deliverables
-
-Export sRGB JPEGs for sharing. Keep the DNG (or TIFF) + LR develop edits
-as the archival master.
+The Swift app talks to the Python orchestrator over HTTP; the orchestrator
+shells out to the C++ `sony-capture` tool and the Scanlight serial driver.
 
 ---
 
-## Gotchas from the field
+## Requirements
 
-- **Holder-to-light distance matters.** Imacon-style holders that sit
-  right against the scanlight produce visible WB shift in the center
-  (yellow-cast snow in winslow's Jan 2026 forum post). Tone Carrier with
-  a small air gap produces clean scans. The Valoi 360 lands somewhere
-  between — **test on plug-in day** with `capture-calibration.sh` and
-  inspect the cal frames before scanning real film. If a single channel
-  is patchy or shows a tinted gradient that FFC can't flatten, you need
-  more air between the holder and the diffuser.
-- **Re-running calibration is cheap; re-scanning a roll is not.** When
-  in doubt, re-shoot calibration.
-- **Don't enable camera WB.** The pipeline locks `user_wb=(1,1,1,1)` for
-  good reason — auto WB on a negative scan biases NLP's conversion. The
-  test `test_demosaic_kwargs_match_project_md` prevents an accidental
-  flip back.
-- **FFC in LR is a fallback only.** If you do FFC in Lightroom instead
-  of in `rgb-composite`, set the cal frame's color profile to
-  **Monochrome** before generating the correction — otherwise LR's FFC
-  applies color correction on top of light correction and overshoots.
-  Doing FFC in `rgb-composite` skips this trap.
+- **macOS 13+** on Apple Silicon
+- **Swift 5.9+** (Xcode toolchain) for the app
+- **Python 3.12+** for the imaging pipeline
+- **Sony Camera Remote SDK** (v1.10+) to build `phase1/sony-capture` — obtain it
+  from Sony; it is not redistributed here
+- A C++ toolchain + CMake for `phase1/sony-capture`
+- Python imaging deps: `numpy`, `rawpy`, `opencv-python` (per-package
+  `pyproject.toml`)
 
 ---
 
-## Status
-
-All software shipped and tested without hardware. FFC + Linear DNG
-support added 2026-05-18 in anticipation of plug-in day. Plug-in
-verification, live-preview app (Phase 3), and per-stock calibration are
-HW-gated — see HANDOFF.md.
-
----
-
-## Tests
+## Build & test
 
 ```bash
-# Python
-(cd phase1/scanlightctl    && pytest)
-(cd phase2/rgb-composite   && PYTHONPATH=. pytest)
-(cd phase2/batch-composite && PYTHONPATH=. pytest)
-(cd phase2/triplet-capture && PYTHONPATH=.:../../phase1/scanlightctl pytest)
+# --- Imaging pipeline (Python) ---
+python -m venv .venv && source .venv/bin/activate
+pip install -e phase2/c41-core -e phase2/rgb-composite \
+            -e phase2/triplet-capture -e phase2/batch-composite
+pytest                       # full suite (hardware-free)
 
-# Swift
-(cd phase3/FilmScanner && swift test)
+# --- Operator app (Swift) ---
+cd phase3/FilmScanner
+swift build
+swift test                   # unit + UI-surface tests, no hardware needed
+swift run scanlight-app      # launch the macOS app
 
-# sony-capture C++ — builds clean, error-path runs
-(cd phase1/sony-capture && cmake --build build && build/sony-capture --out /tmp/x.ARW --timeout 2 || true)
+# --- Sony capture CLI (C++, requires the Sony SDK) ---
+cd phase1/sony-capture
+cmake -B build && cmake --build build
 ```
 
-`rgb-composite` ships unit tests for:
-- channel-from-correct-input selection
-- FFC math (compute_ffc_map, apply_ffc_to_channel) — uniform input,
-  vignette correction, error cases
-- Linear DNG roundtrip (DNGVersion tag, LinearRaw photometric,
-  ColorMatrix1 precision, AsShotNeutral)
-- end-to-end `composite_triplet` with FFC and `--format` flags
+The Python and Swift suites are designed to run **without any hardware**
+attached (capture and demosaic seams are injectable), so you can develop and
+validate the full pipeline on any Mac.
 
-A real-ARW integration test runs against a Sony ARW fixture
-(env var `RGB_COMPOSITE_TEST_ARW`) and skips cleanly when no fixture is
-available.
+---
+
+## Usage
+
+The short version of a session:
+
+1. **Verify the rig** — app checks the camera connection and Scanlight serial
+   link.
+2. **Calibrate once per roll** — the guided wizard solves a per-channel LED
+   level + shutter so each channel's film base lands near 85% of range without
+   clipping (this is what neutralizes the orange mask), then captures a
+   flat-field reference.
+3. **Scan** — advance the film by hand; one button captures each R/G/B triplet.
+   RAWs auto-download and are named by roll/frame.
+4. **Composite** — the backend merges each triplet into a 16-bit linear
+   TIFF/DNG.
+5. **Invert** — import to Negative Lab Pro / FilmLab and apply a linear
+   inversion.
+
+The complete, field-tested operator how-to (hardware setup, exact commands,
+gotchas) lives in **[docs/OPERATING.md](docs/OPERATING.md)**. AI agents and CI
+runners should start at **[docs/automation.md](docs/automation.md)**, which
+documents every automatable CLI, the app's accessibility-ID schema, and the
+JSON/exit-code contracts.
+
+---
+
+## Calibration, in brief
+
+Per-roll RGB calibration is the heart of quality here, and it mirrors how
+practitioners do it by hand: expose each channel so the **film base reads equal
+across R/G/B** (neutral grey), just short of clipping. TriRGB automates that —
+it drives each channel's rebate toward a common target, prefers LED PWM as the
+fine trim with shutter as the coarse step, and guards against both demosaiced
+and source-Bayer clipping. See
+[docs/calibration_notes.md](docs/calibration_notes.md).
+
+---
+
+## Credits & prior art
+
+TriRGB stands on a lot of community work:
+
+- **[jackw01](https://github.com/jackw01/scanlight)** — the Scanlight hardware
+  and the original narrowband-RGB scanning write-up that inspired this project.
+- **seklerek** and the **[r/AnalogCommunity](https://www.reddit.com/r/AnalogCommunity/)**
+  trichromatic-scanning discussions — the manual per-roll process this
+  automates (the toneLight / toneCarrier work).
+- **Barbara Flückiger et al., ETH Zürich (2018)** — research on film-material /
+  scanner interaction.
+- **[Negative Lab Pro](https://www.negativelabpro.com/)** and
+  **[FilmLab](https://www.filmlabapp.com/)** — the inversion tools this pipeline
+  feeds.
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 Rohan Pandula
+
+The Sony Camera Remote SDK is proprietary to Sony and is **not** included in or
+covered by this license; obtain it directly from Sony.

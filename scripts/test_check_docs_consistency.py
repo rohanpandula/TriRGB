@@ -1,9 +1,9 @@
 """Tests for scripts/check_docs_consistency.py.
 
 Covers:
-  - parse_swift_enum: extracts 45 IDs from the real swift file
+  - parse_swift_enum: extracts the expected AX-ID count from the real swift file
   - parse_swift_enum: excludes schemaVersion symbol and its value "1"
-  - parse_md_reference: extracts 45 IDs from the real markdown file
+  - parse_md_reference: extracts the expected AX-ID count from the real markdown file
   - Real sources are consistent (live end-to-end check)
   - compare detects IDs present in swift but missing from md
   - compare detects IDs present in md but missing from swift
@@ -33,18 +33,23 @@ _REPO_ROOT = _SCRIPTS_DIR.parent
 _SWIFT_FILE = _REPO_ROOT / "phase3" / "FilmScanner" / "Sources" / "ScanlightApp" / "AccessibilityIDs.swift"
 _MD_FILE = _REPO_ROOT / "docs" / "ax-id-reference.md"
 
+# Current number of AX-IDs in AccessibilityIDs.swift (excluding schemaVersion).
+# Bump this when AX-IDs are added/removed. The real drift gate is
+# test_real_sources_are_consistent (set equality between the two sources); this
+# constant is a parser sanity-check shared by the two count tests below.
+_EXPECTED_AX_ID_COUNT = 133
+
 
 # --------------------------------------------------------------------------
 # parse_swift_enum
 # --------------------------------------------------------------------------
 
-def test_parse_swift_enum_extracts_all_54_ids():
-    """The real AccessibilityIDs.swift should yield exactly 54 AX-ID strings
-    (23 Phase 01 + 22 Phase 06 settings/calibration + 9 Phase 07 scan view)."""
+def test_parse_swift_enum_extracts_expected_count():
+    """The real AccessibilityIDs.swift should yield _EXPECTED_AX_ID_COUNT strings."""
     swift_text = _SWIFT_FILE.read_text()
     result = cdc.parse_swift_enum(swift_text)
-    assert len(result) == 54, (
-        f"expected 54 AX-IDs from swift enum, got {len(result)}: {sorted(result)}"
+    assert len(result) == _EXPECTED_AX_ID_COUNT, (
+        f"expected {_EXPECTED_AX_ID_COUNT} AX-IDs from swift enum, got {len(result)}: {sorted(result)}"
     )
 
 
@@ -65,13 +70,12 @@ def test_parse_swift_enum_excludes_schemaVersion():
 # parse_md_reference
 # --------------------------------------------------------------------------
 
-def test_parse_md_reference_extracts_all_54_ids():
-    """The real docs/ax-id-reference.md should yield exactly 54 AX-ID strings
-    (23 Phase 01 + 22 Phase 06 settings/calibration + 9 Phase 07 scan view)."""
+def test_parse_md_reference_extracts_expected_count():
+    """The real docs/ax-id-reference.md should yield _EXPECTED_AX_ID_COUNT strings."""
     md_text = _MD_FILE.read_text()
     result = cdc.parse_md_reference(md_text)
-    assert len(result) == 54, (
-        f"expected 54 AX-IDs from markdown table, got {len(result)}: {sorted(result)}"
+    assert len(result) == _EXPECTED_AX_ID_COUNT, (
+        f"expected {_EXPECTED_AX_ID_COUNT} AX-IDs from markdown table, got {len(result)}: {sorted(result)}"
     )
 
 

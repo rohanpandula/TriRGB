@@ -22,7 +22,7 @@ import Foundation
 
 // MARK: - Errors
 
-enum OrchestratorError: Error {
+enum OrchestratorError: LocalizedError, CustomStringConvertible {
     /// Process started but stayed alive without ever responding to /api/state
     /// within the timeout (hung server).
     case startupTimeout(stderr: String)
@@ -36,6 +36,82 @@ enum OrchestratorError: Error {
     case httpError(statusCode: Int, body: String)
     /// The Python tool was not found on PATH.
     case toolNotFound(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .startupTimeout(let stderr):
+            return Self.withDiagnostic(
+                "Python server did not become ready before the startup timeout.",
+                stderr: stderr,
+                fallback: "No stderr was captured."
+            )
+        case .startupFailed(let exitCode, let stderr):
+            return Self.withDiagnostic(
+                "Python server exited before it became ready (exit \(exitCode)).",
+                stderr: stderr,
+                fallback: "No stderr was captured."
+            )
+        case .invalidResponse(let statusCode):
+            return "Unexpected Python server response (HTTP \(statusCode))."
+        case .httpError(let statusCode, let body):
+            return Self.withDiagnostic(
+                "Python server returned HTTP \(statusCode).",
+                stderr: body,
+                fallback: "No response body was returned."
+            )
+        case .toolNotFound(let message):
+            return "Required tool was not found: \(message)"
+        }
+    }
+
+    var description: String {
+        errorDescription ?? String(describing: self)
+    }
+
+    private static func withDiagnostic(
+        _ prefix: String,
+        stderr: String,
+        fallback: String
+    ) -> String {
+        let diagnostic = diagnosticSnippet(from: stderr)
+        guard !diagnostic.isEmpty else {
+            return "\(prefix) \(fallback)"
+        }
+        return "\(prefix) Details: \(diagnostic)"
+    }
+
+    private static func diagnosticSnippet(from rawText: String) -> String {
+        let redacted = redactedDiagnostics(rawText)
+        let lines = redacted
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let tail = lines.suffix(8).joined(separator: " | ")
+        guard tail.count > 1200 else { return tail }
+        return String(tail.suffix(1200))
+    }
+
+    private static func redactedDiagnostics(_ text: String) -> String {
+        var output = text
+        let patterns = [
+            #"(?i)(--sony-password\s+)\S+"#,
+            #"(?i)(--password\s+)\S+"#,
+            #"(?i)(--sony-user\s+)\S+"#,
+            #"(?i)(--user\s+)\S+"#,
+            #"(?i)(sony_password[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+"#,
+            #"(?i)(sony_user[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+"#,
+            #"(?i)(password[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+"#,
+            #"(?i)(user[\"']?\s*[:=]\s*[\"']?)[^\"'\s,}]+"#,
+        ]
+        for pattern in patterns {
+            output = output.replacingOccurrences(
+                of: pattern,
+                with: "$1<redacted>",
+                options: .regularExpression
+            )
+        }
+        return output
+    }
 }
 
 // MARK: - Codable Shapes
@@ -49,6 +125,9 @@ struct OrchestratorState: Codable {
     var levelG: Int
     var levelB: Int
     var settleMs: Int
+    var shutterR: String? = nil
+    var shutterG: String? = nil
+    var shutterB: String? = nil
 }
 
 /// Sent to start() for CLI args and to updateSettings() as POST /api/settings body.
@@ -56,16 +135,40 @@ struct OrchestratorState: Codable {
 struct ScanSettings: Codable {
     var rollName: String
     var outputFolder: String      // BASE folder for CLI spawn; full path for POST
-    var triggerMode: String       // "sdk" | "hw"
+    var scanlightPort: String? = nil
+    var triggerMode: String       // "manual" | "hw" | "sdk"
     var iedInbox: String?
+    var sonyIpAddress: String? = nil
+    var sonyMacAddress: String? = nil
+    var sonyUser: String? = nil
+    var sonyPassword: String? = nil
+    var sonyCapturePath: String? = nil
     var streamComposite: Bool
     var ffcCalibration: String?
     var cameraModel: String?
     var compositeFormat: String   // "tiff" | "dng" | "both"
+    var positiveProfileJSON: String? = nil
+    var calibrationTargetFraction: Double? = nil
     var levelR: Int
     var levelG: Int
     var levelB: Int
     var settleMs: Int
+    var shutterR: String? = nil
+    var shutterG: String? = nil
+    var shutterB: String? = nil
+}
+
+/// Result from a non-shooting Sony SDK connection probe.
+struct SonyConnectionProbeResult: Equatable {
+    var success: Bool
+    var message: String
+}
+
+/// Result from a non-shooting Sony SDK live-view frame pull.
+struct SonyLiveViewFrameResult: Equatable {
+    var success: Bool
+    var message: String
+    var imageURL: URL?
 }
 
 /// Response body from POST /api/capture (200 success, 500 failure).
@@ -93,10 +196,110 @@ struct CompositeStatus: Codable {
     var results: [CompositeEntry]?
 }
 
+/// Latest calibration progress event from GET /api/calibrate/progress.
+struct CalibrationProgress: Codable, Equatable {
+    var event: String
+    var message: String
+    var callId: String?
+    var ts: String?
+    var channel: String?
+    var level: Int?
+    var shutterSpeed: String?
+    var label: String?
+    var error: String?
+    var recentEvents: [CalibrationProgressLogEntry]?
+}
+
+/// Compact timestamped event shown in the calibration log viewer.
+struct CalibrationProgressLogEntry: Codable, Equatable, Identifiable {
+    var ts: String?
+    var event: String
+    var message: String
+    var callId: String?
+    var channel: String?
+    var level: Int?
+    var shutterSpeed: String?
+    var label: String?
+    var p99: Double?
+    var p999: Double?
+    var target: Double?
+    var clipFraction: Double?
+    var sensorClipFraction: Double?
+    var outputClipFraction: Double?
+    var nextLevel: Int?
+    var exposureStatus: String?
+    var converged: Bool?
+    var error: String?
+
+    var id: String {
+        [
+            ts ?? "",
+            event,
+            callId ?? "",
+            channel ?? "",
+            level.map(String.init) ?? "",
+            shutterSpeed ?? "",
+            p99.map { String(format: "%.2f", $0) } ?? "",
+            nextLevel.map(String.init) ?? "",
+            error ?? "",
+        ].joined(separator: "|")
+    }
+}
+
+/// A running Python orchestrator process discovered from `ps`.
+internal struct RunningTripletProcess: Equatable {
+    var pid: Int32
+    var parentPID: Int32
+    var command: String
+}
+
 /// Minimal decode of GET /api/state used only by waitForReady to confirm the
 /// responding server is the child we spawned (it echoes our --ready-nonce).
 private struct ReadyProbe: Codable {
     var readyNonce: String?
+}
+
+/// Thread-safe incremental accumulator for a pipe's stdout/stderr.
+///
+/// `drain(handle:)` blocks on `availableData` in a loop until the writer
+/// closes the pipe (`availableData.isEmpty` signals EOF). The caller polls
+/// `isFinished` and only ever reads `collectedString` after deciding to stop
+/// — never blocks on the drain itself. Used by `runSonyProbeProcess` to
+/// avoid the synchronous-`readDataToEndOfFile` hang that froze the UI when
+/// the Sony SDK left a pipe writer dangling.
+final class PipeDrainer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private var finished = false
+
+    func drain(handle: FileHandle) {
+        while true {
+            let chunk = handle.availableData
+            if chunk.isEmpty { break }
+            lock.lock()
+            data.append(chunk)
+            // Cap to avoid unbounded growth on a chatty probe. Keep the tail
+            // because that's where the operative error/status line lives.
+            let cap = 64 * 1024
+            if data.count > cap {
+                data.removeFirst(data.count - cap)
+            }
+            lock.unlock()
+        }
+        lock.lock()
+        finished = true
+        lock.unlock()
+    }
+
+    var isFinished: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return finished
+    }
+
+    var collectedString: String {
+        lock.lock(); defer { lock.unlock() }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
 }
 
 // MARK: - OrchestratorClient
@@ -124,6 +327,24 @@ final class OrchestratorClient: ObservableObject {
 
     private var process: Process?
     private let session: URLSession
+    private static let calibrationRequestTimeout: TimeInterval = 30 * 60
+    internal var sonyConnectionProbeOverride: ((ScanSettings) async -> SonyConnectionProbeResult)?
+    internal static var sonyARPTableProvider: () -> String = {
+        let proc = Process()
+        let pipe = Pipe()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
+        proc.arguments = ["-an"]
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return String(data: data, encoding: .utf8) ?? ""
+        } catch {
+            return ""
+        }
+    }
     /// Accumulated stderr output from the child process.
     private var stderrData: Data = Data()
     /// Non-nil once the child process has exited (set by the termination handler).
@@ -148,7 +369,174 @@ final class OrchestratorClient: ObservableObject {
         self.session = session
     }
 
+    private static func url(
+        path: String,
+        webPort: Int,
+        queryItems: [URLQueryItem] = []
+    ) -> URL {
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = "127.0.0.1"
+        components.port = webPort
+        components.path = path
+        components.queryItems = queryItems.isEmpty ? nil : queryItems
+        return components.url!
+    }
+
+    deinit {
+        if let process, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    /// Best-effort synchronous teardown for app termination.
+    ///
+    /// `stop()` is the normal async path while the UI is alive. During
+    /// `applicationWillTerminate`, there may be no time left for an async task to
+    /// run, so terminate the child immediately and clear local state. This keeps a
+    /// crashed or closed UI from leaving a Python backend holding the camera/light
+    /// workflow and causing the next launch to report a stale "already running".
+    func terminateChildForAppShutdown() {
+        stopping = true
+        defer {
+            isRunning = false
+            process = nil
+            stopping = false
+        }
+
+        guard let proc = process, proc.isRunning else { return }
+        proc.interrupt()
+        usleep(300_000)
+        if proc.isRunning {
+            kill(proc.processIdentifier, SIGKILL)
+        }
+    }
+
     // MARK: - Public API
+
+    /// Probe the Sony SDK camera path without firing the shutter.
+    ///
+    /// `sony-capture --connect-only` connects, completes Access Auth/fingerprint
+    /// caching, then disconnects. The scan loop still opens a fresh SDK session
+    /// for each R/G/B capture, so this is a readiness check rather than a held
+    /// connection.
+    func checkSonyConnection(settings: ScanSettings) async -> SonyConnectionProbeResult {
+        if let sonyConnectionProbeOverride {
+            return await sonyConnectionProbeOverride(settingsWithResolvedSonyIP(settings))
+        }
+
+        do {
+            let command = try buildSonyConnectionProbeCommand(
+                settings: settingsWithResolvedSonyIP(settings),
+                timeoutSeconds: 10
+            )
+            let result = try await Self.runSonyProbeProcess(
+                executableURL: command.executableURL,
+                arguments: command.arguments,
+                timeout: 15
+            )
+
+            if result.timedOut {
+                return SonyConnectionProbeResult(
+                    success: false,
+                    message: "Timed out connecting to the Sony camera."
+                )
+            }
+
+            let output = Self.conciseProcessOutput(stdout: result.stdout, stderr: result.stderr)
+            if result.exitCode == 0 {
+                let message = output.lowercased() == "connected"
+                    ? "Connected to Sony camera."
+                    : output
+                return SonyConnectionProbeResult(
+                    success: true,
+                    message: message.isEmpty ? "Connected to Sony camera." : message
+                )
+            }
+
+            return SonyConnectionProbeResult(
+                success: false,
+                message: output.isEmpty
+                    ? "Sony connection failed (exit \(result.exitCode))."
+                    : "Sony connection failed (exit \(result.exitCode)): \(output)"
+            )
+        } catch PythonToolLocatorError.toolNotFound(let message) {
+            return SonyConnectionProbeResult(success: false, message: message)
+        } catch {
+            return SonyConnectionProbeResult(
+                success: false,
+                message: "Could not run sony-capture: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// Pull one Sony SDK live-view JPEG frame without firing the shutter.
+    ///
+    /// This is intentionally process-scoped just like the SDK connection probe:
+    /// `sony-capture --live-view-out` opens a short SDK session, writes one JPEG
+    /// frame atomically, then disconnects. The scan loop remains responsible for
+    /// actual RAW captures.
+    func captureSonyLiveViewFrame(
+        settings: ScanSettings,
+        outputURL: URL
+    ) async -> SonyLiveViewFrameResult {
+        do {
+            let sdkTimeoutSeconds = 20
+            let processTimeoutSeconds: TimeInterval = 30
+            let command = try buildSonyLiveViewFrameCommand(
+                settings: settingsWithResolvedSonyIP(settings),
+                outputURL: outputURL,
+                timeoutSeconds: sdkTimeoutSeconds
+            )
+            let result = try await Self.runSonyProbeProcess(
+                executableURL: command.executableURL,
+                arguments: command.arguments,
+                timeout: processTimeoutSeconds
+            )
+
+            let output = Self.conciseProcessOutput(stdout: result.stdout, stderr: result.stderr)
+
+            if result.timedOut {
+                let detail = output.isEmpty ? "" : " Details: \(output)"
+                return SonyLiveViewFrameResult(
+                    success: false,
+                    message: "Timed out after \(Int(processTimeoutSeconds))s waiting for a Sony live-view frame.\(detail)",
+                    imageURL: nil
+                )
+            }
+
+            if result.exitCode == 0 {
+                guard FileManager.default.fileExists(atPath: outputURL.path) else {
+                    return SonyLiveViewFrameResult(
+                        success: false,
+                        message: "Sony live view finished but did not write a JPEG.",
+                        imageURL: nil
+                    )
+                }
+                return SonyLiveViewFrameResult(
+                    success: true,
+                    message: output.isEmpty ? "Live view updated." : output,
+                    imageURL: outputURL
+                )
+            }
+
+            return SonyLiveViewFrameResult(
+                success: false,
+                message: output.isEmpty
+                    ? "Sony live view failed (exit \(result.exitCode))."
+                    : "Sony live view failed (exit \(result.exitCode)): \(output)",
+                imageURL: nil
+            )
+        } catch PythonToolLocatorError.toolNotFound(let message) {
+            return SonyLiveViewFrameResult(success: false, message: message, imageURL: nil)
+        } catch {
+            return SonyLiveViewFrameResult(
+                success: false,
+                message: "Could not run sony-capture: \(error.localizedDescription)",
+                imageURL: nil
+            )
+        }
+    }
 
     /// Spawn `triplet-capture` with the given settings and wait for it to be ready.
     ///
@@ -189,6 +577,12 @@ final class OrchestratorClient: ObservableObject {
             throw OrchestratorError.toolNotFound(msg)
         }
 
+        // A killed app can leave its Python child reparented to launchd while
+        // still holding the Scanlight serial port. Remove same-checkout orphans
+        // before starting another backend.
+        let launchSettings = settingsWithResolvedSonyIP(settings)
+        cleanupStaleTripletCaptureOrphans(settings: launchSettings)
+
         // 2. Readiness nonce + a unique port-file path.
         // The nonce lets waitForReady reject a foreign server (the child we spawned
         // echoes it on /api/state). The port-file is where the child writes the
@@ -202,7 +596,7 @@ final class OrchestratorClient: ObservableObject {
         // 3. Build process
         let proc = Process()
         proc.executableURL = toolURL
-        proc.arguments = buildArgs(settings: settings, portFile: portFileURL.path, readyNonce: readyNonce)
+        proc.arguments = buildArgs(settings: launchSettings, portFile: portFileURL.path, readyNonce: readyNonce)
         proc.environment = ProcessInfo.processInfo.environment
 
         let stderrPipe = Pipe()
@@ -399,12 +793,21 @@ final class OrchestratorClient: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Int] = [
+        var body: [String: Any] = [
             "level_r": settings.levelR,
             "level_g": settings.levelG,
             "level_b": settings.levelB,
             "settle_ms": settings.settleMs,
         ]
+        if let shutterR = settings.shutterR, !shutterR.isEmpty {
+            body["shutter_r"] = shutterR
+        }
+        if let shutterG = settings.shutterG, !shutterG.isEmpty {
+            body["shutter_g"] = shutterG
+        }
+        if let shutterB = settings.shutterB, !shutterB.isEmpty {
+            body["shutter_b"] = shutterB
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -451,25 +854,51 @@ final class OrchestratorClient: ObservableObject {
     /// - Parameters:
     ///   - rebateCol: Optional column index of the rebate region (auto-detect when nil).
     ///   - rebateRow: Optional row index of the rebate region (auto-detect when nil).
-    ///   - rebateW: Rebate region width in pixels (default 100).
-    ///   - rebateH: Rebate region height in pixels (default 20).
+    ///   - rebateW: Rebate region width in RAW pixels.
+    ///   - rebateH: Rebate region height in RAW pixels.
     /// - Returns: `ExposureCalibrationResult` decoded from the snake_case JSON.
     /// - Throws: `OrchestratorError.httpError` for non-200 responses (includes 409 conflict).
     func calibrateExposure(
         rebateCol: Int? = nil,
         rebateRow: Int? = nil,
-        rebateW: Int = 100,
-        rebateH: Int = 20
+        rebateW: Int = RebateRegion.defaultWidth,
+        rebateH: Int = RebateRegion.defaultHeight,
+        seed: ExposureCalibrationResult? = nil,
+        callID: String? = nil,
+        targetFraction: Double? = nil
     ) async throws -> ExposureCalibrationResult {
         let url = URL(string: "http://127.0.0.1:\(webPort)/api/calibrate/exposure")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = Self.calibrationRequestTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         var body: [String: Any] = ["rebate_w": rebateW, "rebate_h": rebateH]
         if let col = rebateCol, let row = rebateRow {
             body["rebate_col"] = col
             body["rebate_row"] = row
+        }
+        if let callID, !callID.isEmpty {
+            body["call_id"] = callID
+        }
+        if let targetFraction {
+            body["target_fraction"] = targetFraction
+        }
+        if let seed {
+            body["seed"] = [
+                "R": [
+                    "led_level": seed.r.ledLevel,
+                    "shutter_speed": seed.r.shutterSpeed ?? "",
+                ],
+                "G": [
+                    "led_level": seed.g.ledLevel,
+                    "shutter_speed": seed.g.shutterSpeed ?? "",
+                ],
+                "B": [
+                    "led_level": seed.b.ledLevel,
+                    "shutter_speed": seed.b.shutterSpeed ?? "",
+                ],
+            ]
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -486,6 +915,70 @@ final class OrchestratorClient: ObservableObject {
         return try decoder.decode(ExposureCalibrationResult.self, from: data)
     }
 
+    /// Fetch the latest backend calibration progress event.
+    func calibrationProgress(callID: String? = nil) async throws -> CalibrationProgress {
+        let url = Self.url(
+            path: "/api/calibrate/progress",
+            webPort: webPort,
+            queryItems: callID.map { [URLQueryItem(name: "call_id", value: $0)] } ?? []
+        )
+        let (data, response) = try await session.data(from: url)
+        guard let http = response as? HTTPURLResponse else {
+            throw OrchestratorError.invalidResponse(statusCode: 0)
+        }
+        guard http.statusCode == 200 else {
+            throw OrchestratorError.invalidResponse(statusCode: http.statusCode)
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(CalibrationProgress.self, from: data)
+    }
+
+    /// Fetch the last completed exposure calibration result, if the backend has one.
+    func lastExposureResult(callID: String? = nil) async throws -> ExposureCalibrationResult? {
+        let url = Self.url(
+            path: "/api/calibrate/exposure-result",
+            webPort: webPort,
+            queryItems: callID.map { [URLQueryItem(name: "call_id", value: $0)] } ?? []
+        )
+        let (data, response) = try await session.data(from: url)
+        guard let http = response as? HTTPURLResponse else {
+            throw OrchestratorError.invalidResponse(statusCode: 0)
+        }
+        if http.statusCode == 404 {
+            return nil
+        }
+        guard http.statusCode == 200 else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(ExposureCalibrationResult.self, from: data)
+    }
+
+    /// Turn the backend-owned Scanlight preview white light on/off for live-view framing.
+    func setCalibrationPreviewLight(enabled: Bool, level: Int = 200) async throws {
+        let url = URL(string: "http://127.0.0.1:\(webPort)/api/calibrate/preview-light")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 5
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "enabled": enabled,
+            "level": level,
+        ])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw OrchestratorError.invalidResponse(statusCode: 0)
+        }
+        guard http.statusCode == 200 else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw OrchestratorError.httpError(statusCode: http.statusCode, body: body)
+        }
+    }
+
     /// Capture flat frames via POST /api/calibrate/ffc.
     ///
     /// - Parameter exposureResult: The result of the prior exposure calibration,
@@ -496,9 +989,10 @@ final class OrchestratorClient: ObservableObject {
         let url = URL(string: "http://127.0.0.1:\(webPort)/api/calibrate/ffc")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = Self.calibrationRequestTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "led_level_r":   exposureResult.r.ledLevel,
             "led_level_g":   exposureResult.g.ledLevel,
             "led_level_b":   exposureResult.b.ledLevel,
@@ -506,6 +1000,15 @@ final class OrchestratorClient: ObservableObject {
             "black_level_g": exposureResult.g.blackLevel,
             "black_level_b": exposureResult.b.blackLevel,
         ]
+        if let shutter = exposureResult.r.shutterSpeed, !shutter.isEmpty {
+            body["shutter_r"] = shutter
+        }
+        if let shutter = exposureResult.g.shutterSpeed, !shutter.isEmpty {
+            body["shutter_g"] = shutter
+        }
+        if let shutter = exposureResult.b.shutterSpeed, !shutter.isEmpty {
+            body["shutter_b"] = shutter
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)
@@ -674,7 +1177,142 @@ final class OrchestratorClient: ObservableObject {
         if launchGeneration == generation { process = nil }
     }
 
+    private func cleanupStaleTripletCaptureOrphans(settings: ScanSettings) {
+        let psOutput = Self.processOutput(
+            executable: "/bin/ps",
+            arguments: ["-axo", "pid=,ppid=,command="]
+        )
+        let cwd = FileManager.default.currentDirectoryPath
+        let repoHints = [
+            cwd,
+            settings.sonyCapturePath ?? "",
+        ].filter { !$0.isEmpty }
+
+        for candidate in Self.parseTripletProcesses(from: psOutput) {
+            guard Self.shouldCleanupStaleTripletProcess(
+                candidate,
+                repoHints: repoHints,
+                currentWorkingDirectory: cwd,
+                cwdLookup: { Self.cwdForProcess(pid: $0) }
+            ) else { continue }
+
+            kill(candidate.pid, SIGTERM)
+            usleep(400_000)
+            if kill(candidate.pid, 0) == 0 {
+                kill(candidate.pid, SIGKILL)
+            }
+        }
+    }
+
+    internal static func parseTripletProcesses(from psOutput: String) -> [RunningTripletProcess] {
+        psOutput
+            .split(separator: "\n")
+            .compactMap { rawLine -> RunningTripletProcess? in
+                let fields = rawLine
+                    .split(maxSplits: 2, omittingEmptySubsequences: true) { $0.isWhitespace }
+                guard fields.count == 3,
+                      let pid = Int32(fields[0]),
+                      let parentPID = Int32(fields[1]) else {
+                    return nil
+                }
+                let command = String(fields[2])
+                guard command.contains("-m triplet_capture.app") else { return nil }
+                return RunningTripletProcess(pid: pid, parentPID: parentPID, command: command)
+            }
+    }
+
+    internal static func shouldCleanupStaleTripletProcess(
+        _ process: RunningTripletProcess,
+        repoHints: [String],
+        currentWorkingDirectory: String,
+        cwdLookup: (Int32) -> String?
+    ) -> Bool {
+        guard process.parentPID == 1,
+              process.pid != Int32(ProcessInfo.processInfo.processIdentifier),
+              process.command.contains("-m triplet_capture.app") else {
+            return false
+        }
+
+        if repoHints.contains(where: { !$0.isEmpty && process.command.contains($0) }) {
+            return true
+        }
+
+        guard let processCwd = cwdLookup(process.pid) else { return false }
+        let current = URL(fileURLWithPath: currentWorkingDirectory).standardizedFileURL.path
+        let discovered = URL(fileURLWithPath: processCwd).standardizedFileURL.path
+        return discovered == current
+    }
+
+    private static func cwdForProcess(pid: Int32) -> String? {
+        let output = processOutput(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"]
+        )
+        return output
+            .split(separator: "\n")
+            .first { $0.hasPrefix("n") }
+            .map { String($0.dropFirst()) }
+    }
+
+    internal static func processOutput(executable: String, arguments: [String]) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = arguments
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            return String(data: data, encoding: .utf8) ?? ""
+        } catch {
+            return ""
+        }
+    }
+
     // MARK: - Private helpers
+
+    internal func settingsWithResolvedSonyIP(_ settings: ScanSettings) -> ScanSettings {
+        guard let mac = settings.sonyMacAddress?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !mac.isEmpty,
+              let resolvedIP = Self.resolveSonyIPFromARP(macAddress: mac),
+              !resolvedIP.isEmpty else {
+            return settings
+        }
+
+        var copy = settings
+        copy.sonyIpAddress = resolvedIP
+        return copy
+    }
+
+    internal static func resolveSonyIPFromARP(macAddress: String) -> String? {
+        let normalizedMAC = normalizeMAC(macAddress)
+        guard !normalizedMAC.isEmpty else { return nil }
+
+        let table = sonyARPTableProvider()
+        for rawLine in table.split(whereSeparator: \.isNewline) {
+            let line = String(rawLine)
+            guard normalizeMAC(line).contains(normalizedMAC),
+                  let open = line.firstIndex(of: "("),
+                  let close = line[open...].firstIndex(of: ")") else {
+                continue
+            }
+            let start = line.index(after: open)
+            let ip = String(line[start..<close]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ip.isEmpty {
+                return ip
+            }
+        }
+        return nil
+    }
+
+    private static func normalizeMAC(_ text: String) -> String {
+        text
+            .lowercased()
+            .replacingOccurrences(of: "-", with: ":")
+            .filter { $0.isHexDigit || $0 == ":" }
+    }
 
     /// Build the argument array for the child process.
     ///
@@ -684,7 +1322,7 @@ final class OrchestratorClient: ObservableObject {
     /// `--web-port 0` tells the child to bind an ephemeral OS-assigned port.
     /// `--port-file <path>` tells the child where to write the actual bound port
     /// once listening. Swift reads that file via `waitForPort(file:timeout:)`.
-    private func buildArgs(settings: ScanSettings, portFile: String, readyNonce: String) -> [String] {
+    internal func buildArgs(settings: ScanSettings, portFile: String, readyNonce: String) -> [String] {
         var args: [String] = [
             "--roll-name",      settings.rollName,
             "--output-folder",  settings.outputFolder,  // BASE folder; Python appends /rollName
@@ -694,8 +1332,41 @@ final class OrchestratorClient: ObservableObject {
             "--ready-nonce",    readyNonce,
             "--no-browser",
         ]
+        if let scanlightPort = settings.scanlightPort, !scanlightPort.isEmpty {
+            args += ["--port", scanlightPort]
+        }
         if let inbox = settings.iedInbox {
             args += ["--ied-inbox", inbox]
+        }
+        if settings.triggerMode == "sdk" {
+            args += ["--capture-timeout-s", "60"]
+            if let sonyCapture = settings.sonyCapturePath, !sonyCapture.isEmpty {
+                args += ["--sony-capture", sonyCapture]
+            } else if let resolved = try? PythonToolLocator.resolve("sony-capture") {
+                args += ["--sony-capture", resolved.path]
+            }
+            if let ip = settings.sonyIpAddress, !ip.isEmpty {
+                args += ["--sony-ip-address", ip]
+            }
+            if let mac = settings.sonyMacAddress, !mac.isEmpty {
+                args += ["--sony-mac-address", mac]
+            }
+            if let user = settings.sonyUser, !user.isEmpty {
+                args += ["--sony-user", user]
+            }
+            if let password = settings.sonyPassword, !password.isEmpty {
+                args += ["--sony-password", password]
+            }
+            args += ["--sony-iso", "100or125"]
+            if let shutterR = settings.shutterR, !shutterR.isEmpty {
+                args += ["--shutter-r", shutterR]
+            }
+            if let shutterG = settings.shutterG, !shutterG.isEmpty {
+                args += ["--shutter-g", shutterG]
+            }
+            if let shutterB = settings.shutterB, !shutterB.isEmpty {
+                args += ["--shutter-b", shutterB]
+            }
         }
         if settings.streamComposite {
             args.append("--stream-composite")
@@ -706,8 +1377,260 @@ final class OrchestratorClient: ObservableObject {
         if let model = settings.cameraModel {
             args += ["--camera-model", model]
         }
+        if let positiveProfileJSON = settings.positiveProfileJSON,
+           !positiveProfileJSON.isEmpty {
+            args += ["--positive-profile-json", positiveProfileJSON]
+        }
         args += ["--composite-format", settings.compositeFormat]
         return args
+    }
+
+    internal func buildSonyConnectionProbeCommand(
+        settings: ScanSettings,
+        timeoutSeconds: Int
+    ) throws -> (executableURL: URL, arguments: [String]) {
+        let executableURL: URL
+        if let sonyCapturePath = settings.sonyCapturePath, !sonyCapturePath.isEmpty {
+            executableURL = URL(fileURLWithPath: sonyCapturePath)
+        } else {
+            executableURL = try PythonToolLocator.resolve("sony-capture")
+        }
+
+        var args = [
+            "--connect-only",
+            "--timeout", "\(timeoutSeconds)",
+        ]
+        if let ip = settings.sonyIpAddress, !ip.isEmpty {
+            args += ["--ip-address", ip]
+        }
+        if let mac = settings.sonyMacAddress, !mac.isEmpty {
+            args += ["--mac-address", mac]
+        }
+        if let user = settings.sonyUser, !user.isEmpty {
+            args += ["--user", user]
+        }
+        if let password = settings.sonyPassword, !password.isEmpty {
+            args += ["--password", password]
+        }
+        return (executableURL, args)
+    }
+
+    internal func buildSonyLiveViewFrameCommand(
+        settings: ScanSettings,
+        outputURL: URL,
+        timeoutSeconds: Int
+    ) throws -> (executableURL: URL, arguments: [String]) {
+        let executableURL: URL
+        if let sonyCapturePath = settings.sonyCapturePath, !sonyCapturePath.isEmpty {
+            executableURL = URL(fileURLWithPath: sonyCapturePath)
+        } else {
+            executableURL = try PythonToolLocator.resolve("sony-capture")
+        }
+
+        var args = [
+            "--live-view-out", outputURL.path,
+            "--timeout", "\(timeoutSeconds)",
+        ]
+        if let ip = settings.sonyIpAddress, !ip.isEmpty {
+            args += ["--ip-address", ip]
+        }
+        if let mac = settings.sonyMacAddress, !mac.isEmpty {
+            args += ["--mac-address", mac]
+        }
+        if let user = settings.sonyUser, !user.isEmpty {
+            args += ["--user", user]
+        }
+        if let password = settings.sonyPassword, !password.isEmpty {
+            args += ["--password", password]
+        }
+        return (executableURL, args)
+    }
+
+    internal func buildSonyLiveViewStreamCommand(
+        settings: ScanSettings,
+        outputURL: URL,
+        intervalMs: Int,
+        timeoutSeconds: Int
+    ) throws -> (executableURL: URL, arguments: [String]) {
+        let executableURL: URL
+        if let sonyCapturePath = settings.sonyCapturePath, !sonyCapturePath.isEmpty {
+            executableURL = URL(fileURLWithPath: sonyCapturePath)
+        } else {
+            executableURL = try PythonToolLocator.resolve("sony-capture")
+        }
+
+        var args = [
+            "--live-view-stream-out", outputURL.path,
+            "--live-view-interval-ms", "\(intervalMs)",
+            "--timeout", "\(timeoutSeconds)",
+        ]
+        if let ip = settings.sonyIpAddress, !ip.isEmpty {
+            args += ["--ip-address", ip]
+        }
+        if let mac = settings.sonyMacAddress, !mac.isEmpty {
+            args += ["--mac-address", mac]
+        }
+        if let user = settings.sonyUser, !user.isEmpty {
+            args += ["--user", user]
+        }
+        if let password = settings.sonyPassword, !password.isEmpty {
+            args += ["--password", password]
+        }
+        return (executableURL, args)
+    }
+
+    internal struct SonyProbeProcessResult {
+        var exitCode: Int32
+        var stdout: String
+        var stderr: String
+        var timedOut: Bool
+    }
+
+    private enum SonyProbeWaitResult {
+        case exited(Int32)
+        case timedOut
+        case cancelled
+    }
+
+    /// Spawn `sony-capture` and capture its stdout/stderr without blocking
+    /// MainActor or the calling task.
+    ///
+    /// `nonisolated` so the synchronous `Process` and `Pipe` machinery runs on
+    /// the cooperative pool, not on MainActor — a blocking pipe read here used
+    /// to freeze the UI ("Checking…" stuck forever).
+    ///
+    /// Pipes are drained INCREMENTALLY via `availableData` polling on detached
+    /// tasks. We never call `readDataToEndOfFile()`: on Darwin the parent's
+    /// write end of a `Pipe` may stay open after the child exits (or a Sony
+    /// SDK background thread may keep it alive), which makes that call block
+    /// forever even though `ps` shows no child process. Closing
+    /// `fileHandleForWriting` after spawn is a belt-and-braces step.
+    internal nonisolated static func runSonyProbeProcess(
+        executableURL: URL,
+        arguments: [String],
+        timeout: TimeInterval
+    ) async throws -> SonyProbeProcessResult {
+        let proc = Process()
+        proc.executableURL = executableURL
+        proc.arguments = arguments
+        proc.environment = ProcessInfo.processInfo.environment
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        proc.standardOutput = stdoutPipe
+        proc.standardError = stderrPipe
+
+        try proc.run()
+
+        // After fork+exec the child has its own dup'd write FDs. Close our
+        // parent-side copies so the readers can see EOF as soon as the child
+        // (and only the child) closes its end.
+        try? stdoutPipe.fileHandleForWriting.close()
+        try? stderrPipe.fileHandleForWriting.close()
+
+        let stdoutCollector = PipeDrainer()
+        let stderrCollector = PipeDrainer()
+        let stdoutTask = Task.detached(priority: .userInitiated) {
+            stdoutCollector.drain(handle: stdoutPipe.fileHandleForReading)
+        }
+        let stderrTask = Task.detached(priority: .userInitiated) {
+            stderrCollector.drain(handle: stderrPipe.fileHandleForReading)
+        }
+
+        let waitResult = await withTaskGroup(of: SonyProbeWaitResult.self) { group in
+            group.addTask {
+                while proc.isRunning {
+                    if Task.isCancelled {
+                        return .cancelled
+                    }
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                return .exited(proc.terminationStatus)
+            }
+            group.addTask {
+                let ns = UInt64(max(timeout, 0.1) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: ns)
+                if Task.isCancelled {
+                    return .cancelled
+                }
+                if proc.isRunning {
+                    proc.terminate()
+                    return .timedOut
+                }
+                return .exited(proc.terminationStatus)
+            }
+
+            let first = await group.next() ?? .timedOut
+            group.cancelAll()
+            return first
+        }
+
+        if case .timedOut = waitResult, proc.isRunning {
+            await terminateSonyProbeProcess(proc)
+        } else if case .cancelled = waitResult, proc.isRunning {
+            await terminateSonyProbeProcess(proc)
+        }
+
+        // Give the drainers a short grace window after the child exits to
+        // collect anything still in flight, then stop them. We never await
+        // them unbounded: a stuck pipe (e.g. a Sony SDK background thread
+        // that inherited the FD) must not pin this task.
+        let collectionDeadline = Date(timeIntervalSinceNow: 1.0)
+        while !(stdoutCollector.isFinished && stderrCollector.isFinished),
+              Date() < collectionDeadline,
+              !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        stdoutTask.cancel()
+        stderrTask.cancel()
+        // Closing the read end interrupts any pending availableData read in
+        // the drainer tasks (they exit their while-loop on the next iter).
+        try? stdoutPipe.fileHandleForReading.close()
+        try? stderrPipe.fileHandleForReading.close()
+
+        let stdout = stdoutCollector.collectedString
+        let stderr = stderrCollector.collectedString
+
+        switch waitResult {
+        case .exited(let code):
+            return SonyProbeProcessResult(exitCode: code, stdout: stdout, stderr: stderr, timedOut: false)
+        case .timedOut:
+            let code: Int32 = proc.isRunning ? -1 : proc.terminationStatus
+            return SonyProbeProcessResult(exitCode: code, stdout: stdout, stderr: stderr, timedOut: true)
+        case .cancelled:
+            let code: Int32 = proc.isRunning ? -1 : proc.terminationStatus
+            return SonyProbeProcessResult(exitCode: code, stdout: stdout, stderr: stderr, timedOut: false)
+        }
+    }
+
+    private nonisolated static func terminateSonyProbeProcess(_ proc: Process) async {
+        if proc.isRunning {
+            proc.terminate()
+        }
+
+        let terminateDeadline = Date(timeIntervalSinceNow: 1.0)
+        while proc.isRunning && Date() < terminateDeadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        if proc.isRunning {
+            kill(proc.processIdentifier, SIGKILL)
+        }
+
+        let killDeadline = Date(timeIntervalSinceNow: 1.0)
+        while proc.isRunning && Date() < killDeadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private static func conciseProcessOutput(stdout: String, stderr: String) -> String {
+        let combined = [stdout, stderr]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard combined.count > 240 else { return combined }
+        let suffix = combined.suffix(240)
+        return "...\(suffix)"
     }
 
     /// Poll for the port-file written by the child once it is bound and listening.

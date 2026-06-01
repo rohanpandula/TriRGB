@@ -4,13 +4,13 @@ Single-shot tether capture for the Sony a7CR (and any body supported by Sony Cam
 
 ## What it does
 
-Drives one capture-and-download cycle against the connected camera over USB. The Phase 2 orchestrator shells out to this binary three times per frame (R, G, B), once the Scanlight is set to the matching channel.
+Drives one capture-and-download cycle against the connected camera over USB or Wi-Fi. The Phase 2 orchestrator shells out to this binary three times per frame (R, G, B), once the Scanlight is set to the matching channel.
 
 ## Camera-side setup (do this on the body first)
 
 - **PC Remote** mode enabled
 - File format: **RAW (lossless compressed)**
-- Save destination: **PC** (Host)
+- Save destination: **PC** (Host) or **PC + memory card**
 - Manual exposure, ISO 100, fixed WB, manual focus, IBIS off, EFCS or electronic shutter
 - All in-camera corrections disabled
 
@@ -47,16 +47,45 @@ cmake --build build
 
 Result: `build/sony-capture`.
 
+If CMake is not installed, this target can also be rebuilt directly because it
+is a single translation unit:
+
+```bash
+xcrun clang++ -std=c++17 -stdlib=libc++ \
+  -I third_party/sony_sdk/app \
+  src/main.cpp third_party/sony_sdk/external/crsdk/libCr_Core.dylib \
+  -o build/sony-capture \
+  -Wl,-rpath,@executable_path \
+  -Wl,-rpath,@executable_path/../third_party/sony_sdk/external/crsdk \
+  -Wl,-rpath,@executable_path/../third_party/sony_sdk/external/crsdk/CrAdapter
+```
+
 ## Usage
 
 ```
-sony-capture --out PATH [--timeout SECONDS]
+sony-capture --list
+sony-capture --connect-only [--ip-address IP [--mac-address MAC]]
+sony-capture --out PATH [--timeout SECONDS] [--ip-address IP [--mac-address MAC]]
+sony-capture --remote-transfer --out PATH [--ip-address IP [--mac-address MAC]]
+sony-capture --live-view-out PATH [--ip-address IP [--mac-address MAC]]
+sony-capture --live-view-stream-out PATH [--ip-address IP [--mac-address MAC]]
 ```
 
 | Flag | Meaning |
 |---|---|
 | `--out PATH` | Where to write the downloaded RAW. Parent directories are created if missing. If the file exists it is overwritten (intentional — supports retakes). |
+| `--live-view-out PATH`, `--live-view PATH` | Connect, pull one SDK live-view JPEG frame, write it atomically to PATH, then disconnect. This does not fire the shutter or download a RAW. |
+| `--live-view-stream-out PATH`, `--live-view-stream PATH` | Connect once, keep the SDK session open, and refresh PATH with live-view JPEG frames until SIGTERM/SIGINT. |
+| `--live-view-interval-ms MS` | Delay between live-view stream frame polls. Default 250 ms. |
 | `--timeout SECONDS` | Per-stage (connect, download) timeout. Default 30. |
+| `--list` | Enumerate SDK-visible cameras and exit without connecting or firing the shutter. Safe first smoke test. |
+| `--connect-only`, `--probe` | Connect/authenticate/cache fingerprint, then disconnect without firing the shutter. Use this before the first capture attempt. |
+| `--ip-address IP` | Direct network PC Remote connection, matching SonShell's direct-IP path. Falls back to `SONY_IP`. |
+| `--mac-address MAC` | Optional camera MAC for direct IP. Falls back to `SONY_MAC`. |
+| `--transfer-mode host-pc\|remote-transfer` | Select download strategy. `host-pc` is the default and uses `CrSdkControlMode_Remote` plus `SetSaveInfo`; this is confirmed working on the a7CR over Wi-Fi. `remote-transfer` uses card contents listing and explicit `GetRemoteTransferContentsDataFile`; useful for models where contents listing works. |
+| `--host-pc`, `--remote-transfer` | Short aliases for `--transfer-mode host-pc` and `--transfer-mode remote-transfer`. |
+| `--username USER`, `--password PW` | Access Authentication credentials from the camera. `--user` is accepted as an alias; env fallbacks are `SONY_USERNAME`/`SONY_USER` and `SONY_PW`. |
+| `--fingerprint-cache-path PATH` | Binary SDK fingerprint cache. Defaults to `~/.cache/sony-capture/fingerprint.bin`. Delete it if Access Auth pairing gets stuck. |
 
 Exit codes:
 - `0` on success; the absolute path of the written file is printed to stdout
@@ -75,27 +104,53 @@ sony-capture --out /Volumes/SSD/Scans/Roll001/Roll001_Frame001_R.ARW
 # exit 0
 ```
 
+Wi-Fi probe before capture:
+
+```bash
+sony-capture --list
+sony-capture --connect-only --ip-address 192.168.1.1 --user USER --password PW
+sony-capture --out /tmp/test.ARW --ip-address 192.168.1.1 --user USER --password PW
+sony-capture --live-view-out /tmp/sony-live-view.jpg --ip-address 192.168.1.1 --user USER --password PW
+sony-capture --live-view-stream-out /tmp/sony-live-view.jpg --ip-address 192.168.1.1 --user USER --password PW
+```
+
+Known-good a7CR Wi-Fi path as of 2026-05-22:
+
+```bash
+sony-capture --out /tmp/test.ARW \
+  --ip-address 10.0.0.247 \
+  --mac-address 10:32:2C:26:1A:3F \
+  --user USER \
+  --password PW
+```
+
+That path uses host-PC auto-download and produced a valid 63 MB `ILCE-7CR` RAW. The RemoteTransfer contents-list path authenticated and triggered the shutter, but did not return a card contents list on this body.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | Gatekeeper dialog on first run | SDK dylibs are quarantined | `xattr -dr com.apple.quarantine` on the SDK tree (see Build §2) |
 | `EnumCameraObjects failed` | Camera not in PC Remote mode, USB cable is power-only, camera not powered | Check body menu, swap to a known-good USB-C **data** cable, confirm dummy battery is connected |
-| `Connect failed (CrError 0x…)` | Other host already claimed the camera; PC Remote authentication setting | Quit Imaging Edge / any other tether app; on newer bodies, disable "Connection Authentication" in menu for headless use |
+| `Connect failed (CrError 0x…)` | Other host already claimed the camera; PC Remote authentication setting | Quit Imaging Edge / any other tether app; for Wi-Fi use `--connect-only` first and check Access Authentication credentials/fingerprint cache |
 | `timed out waiting for image download` | Shutter speed longer than `--timeout`, or file transfer is genuinely slow | Bump `--timeout`; check shutter speed; consider tether speed (USB 3.x vs 2.0) |
-| Capture happens but no file written | Camera-side save destination is "Camera" or "Camera+PC" instead of "PC" | Change save destination to **PC** in body menu |
+| Capture happens but no file written | Camera-side save destination excludes host-PC transfer, or another app claimed the PC Remote session | Use **PC** or **PC + memory card** in body menu; quit Imaging Edge / other tether apps |
+| `GetRemoteTransferContentsInfoList failed ... 36101` | RemoteTransfer card contents listing is still processing or disabled on this body/session | Use the default host-PC mode; keep `--remote-transfer` only as a model-specific experiment |
 
 ## Implementation notes
 
-- `IDeviceCallback` is implemented in-line as `CaptureCallback`. The capture flow blocks on a `condition_variable` for `OnConnected` and `OnCompleteDownload`.
-- The SDK's `EnumCameraObjects` returns a `const ICrCameraObjectInfo*`, but `Connect` requires non-const. We follow the official sample's pattern: re-build the info via `SDK::CreateCameraObjectInfo(...)` copying values out of the enumerated entry, then release the enumeration immediately.
-- `SetSaveInfo` points the SDK at a unique per-invocation scratch dir (`.sony-capture-tmp-<pid>-<ts>` alongside `--out`). After the download callback fires, we `rename` the result onto `--out` and `remove_all` the scratch dir.
+- `IDeviceCallback` is implemented in-line as `CaptureCallback`. The default capture flow blocks on `OnConnected` and the SDK host-PC `OnCompleteDownload` callback.
+- USB enumeration passes the SDK's enumerated `ICrCameraObjectInfo` directly to `Connect`, matching Sony's SimpleCli behavior.
+- Wi-Fi/direct IP prefers the SDK-enumerated camera object when it matches IP/MAC and falls back to `CreateCameraObjectInfoEthernetConnection`.
+- Wi-Fi/direct IP does a short TCP preflight against port 22 before entering the Sony SDK so camera-off cases fail quickly instead of hanging inside `Connect`.
+- Host-PC mode uses `CrSdkControlMode_Remote` + `SetSaveInfo`, which works on the a7CR with Access Authentication over Wi-Fi.
+- Live view uses the SDK preview JPEG path (`GetLiveViewImageInfo` + `GetLiveViewImage`). The streaming mode keeps one SDK connection open and atomically replaces the same JPEG file for the Swift UI.
+- In RemoteTransfer mode the CLI does not call `SetSaveInfo`; it explicitly pulls the newest RAW with `GetRemoteTransferContentsDataFile`. On the tested a7CR this path triggers the shutter but card contents listing returns `CrError_RemoteTransfer_GetContentsInfoListProcessing` (`36101`).
 - `rpath` is set to `@executable_path/../third_party/sony_sdk/external/crsdk` (and the `CrAdapter` subdir) at link time — the binary finds its dylibs without `DYLD_LIBRARY_PATH`.
 
 ## Not implemented in Phase 1
 
 These are explicitly deferred:
-- Live view (Phase 3)
 - Setting capture parameters from the CLI (operator drives the camera)
 - Picking among multiple cameras (we always use the first)
 - Reconnect/retry logic (left to the orchestrator)

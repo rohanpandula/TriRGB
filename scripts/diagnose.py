@@ -212,14 +212,11 @@ def check_sony_capture_binary(sony_capture: str) -> tuple[bool, str | None]:
 
 
 def check_camera_enumeration(sony_capture_path: str) -> bool:
-    """Step 7: tickle the SDK by running sony-capture with an unwritable
-    --out path. We won't actually capture but enumeration runs first.
-    """
+    """Step 7: tickle the SDK with a no-shutter camera enumeration."""
     _step(7, "Sony SDK + camera enumeration")
-    # Use --timeout 2 so we don't wait long; the SDK lifecycle runs anyway.
     try:
         proc = subprocess.run(
-            [sony_capture_path, "--out", "/tmp/.diag-sony-capture-probe.ARW", "--timeout", "2"],
+            [sony_capture_path, "--list"],
             capture_output=True, text=True, timeout=15,
         )
     except FileNotFoundError:
@@ -230,10 +227,8 @@ def check_camera_enumeration(sony_capture_path: str) -> bool:
         return False
 
     out = (proc.stdout + proc.stderr).strip()
-    # If the camera is present + in PC Remote, the binary will get past
-    # EnumCameraObjects and either succeed or time out at OnConnected /
-    # download. We're using a very short timeout so success isn't expected
-    # without an actual frame; what we want to confirm is "it got past enumeration".
+    # If the camera is present + in PC Remote, the binary prints at least one
+    # SDK-visible camera. This path never connects or fires the shutter.
     if "EnumCameraObjects failed" in out or "no cameras found" in out:
         _fail("camera not detected by SDK. Check: camera powered (dummy battery), "
               "USB-C data cable, PC Remote mode ON, save destination = PC")

@@ -90,6 +90,16 @@ private func makeStubSession() -> URLSession {
     return URLSession(configuration: config)
 }
 
+private func containsAdjacent(_ values: [String], _ pair: [String]) -> Bool {
+    guard pair.count == 2, values.count >= 2 else { return false }
+    for idx in 0..<(values.count - 1) {
+        if values[idx] == pair[0], values[idx + 1] == pair[1] {
+            return true
+        }
+    }
+    return false
+}
+
 /// Returns Data encoding a valid OrchestratorState JSON object.
 private func makeStateJSON() -> Data {
     let json = """
@@ -123,6 +133,73 @@ private func makeTripletJSON(success: Bool = true, frameNumber: Int = 1, nextFra
     return json.data(using: .utf8)!
 }
 
+private func makeExposureJSONData(ledR: Int = 180, ledG: Int = 160, ledB: Int = 230) -> Data {
+    let json = """
+    {
+        "r": {"channel":"R","led_level":\(ledR),"black_level":256,"gain":1,"clip_fraction":0,"p99":55000,"target":55700,"exposure_status":"target","schema_version":1},
+        "g": {"channel":"G","led_level":\(ledG),"black_level":256,"gain":1,"clip_fraction":0,"p99":55000,"target":55700,"exposure_status":"target","schema_version":1},
+        "b": {"channel":"B","led_level":\(ledB),"black_level":256,"gain":1,"clip_fraction":0,"p99":55000,"target":55700,"exposure_status":"target","schema_version":1},
+        "base_region": {"x":10,"y":20,"w":128,"h":128,"base_rgb":[1,1,1],"uniformity_cv":1,"source":"manual","schema_version":1},
+        "ffc_cal_dir": "",
+        "schema_version": 1
+    }
+    """
+    return json.data(using: .utf8)!
+}
+
+private func makeExposureSeed() -> ExposureCalibrationResult {
+    ExposureCalibrationResult(
+        r: WizardChannelCalibration(
+            channel: "R",
+            ledLevel: 180,
+            blackLevel: 256,
+            gain: 1,
+            clipFraction: 0,
+            shutterSpeed: "1/40",
+            p99: 55000,
+            target: 55700,
+            exposureStatus: "target",
+            schemaVersion: 1
+        ),
+        g: WizardChannelCalibration(
+            channel: "G",
+            ledLevel: 190,
+            blackLevel: 256,
+            gain: 1,
+            clipFraction: 0,
+            shutterSpeed: "1/30",
+            p99: 55000,
+            target: 55700,
+            exposureStatus: "target",
+            schemaVersion: 1
+        ),
+        b: WizardChannelCalibration(
+            channel: "B",
+            ledLevel: 220,
+            blackLevel: 256,
+            gain: 1,
+            clipFraction: 0,
+            shutterSpeed: "1/20",
+            p99: 55000,
+            target: 55700,
+            exposureStatus: "target",
+            schemaVersion: 1
+        ),
+        baseRegion: WizardBaseRegion(
+            x: 10,
+            y: 20,
+            w: 128,
+            h: 128,
+            baseRgb: [1, 1, 1],
+            uniformityCv: 1,
+            source: "manual",
+            schemaVersion: 1
+        ),
+        ffcCalDir: "",
+        schemaVersion: 1
+    )
+}
+
 // MARK: - Test Suite
 
 @MainActor
@@ -133,6 +210,24 @@ final class OrchestratorClientTests: XCTestCase {
         StubURLProtocol.routes = [:]
         StubURLProtocol.lastRequest = nil
         StubURLProtocol.lastBody = nil
+    }
+
+    // MARK: - Error copy
+
+    func testOrchestratorErrorLocalizedDescriptionIncludesStartupDiagnosticsAndRedactsSecrets() {
+        let stderr = """
+        Traceback (most recent call last):
+        command: sony-capture --sony-user 6SCzVb --sony-password D8MM1Ktc
+        ModuleNotFoundError: No module named 'rawpy'
+        """
+
+        let message = OrchestratorError.startupFailed(exitCode: 1, stderr: stderr).localizedDescription
+
+        XCTAssertTrue(message.contains("exit 1"))
+        XCTAssertTrue(message.contains("ModuleNotFoundError"))
+        XCTAssertTrue(message.contains("<redacted>"))
+        XCTAssertFalse(message.contains("6SCzVb"))
+        XCTAssertFalse(message.contains("D8MM1Ktc"))
     }
 
     // MARK: - Test 1: State decoding
@@ -257,6 +352,83 @@ final class OrchestratorClientTests: XCTestCase {
         )
     }
 
+    func testLocatorPrefersCheckoutTripletCaptureOverInstalledPath() throws {
+        let url = try PythonToolLocator.resolve("triplet-capture")
+        XCTAssertTrue(
+            url.path.hasSuffix("/scripts/triplet-capture"),
+            "Expected checkout wrapper, got: \(url.path)"
+        )
+        XCTAssertTrue(
+            FileManager.default.isExecutableFile(atPath: url.path),
+            "Resolved path should be executable: \(url.path)"
+        )
+    }
+
+    func testParseTripletProcessesFindsPythonModuleBackends() {
+        let psOutput = """
+          111     1 /opt/homebrew/bin/python3 -m triplet_capture.app --roll-name Roll001
+          222   100 /bin/zsh -lc rg triplet_capture.app
+          333   300 /opt/homebrew/bin/python3 -m other_module
+        """
+
+        let processes = OrchestratorClient.parseTripletProcesses(from: psOutput)
+
+        XCTAssertEqual(processes, [
+            RunningTripletProcess(
+                pid: 111,
+                parentPID: 1,
+                command: "/opt/homebrew/bin/python3 -m triplet_capture.app --roll-name Roll001"
+            ),
+        ])
+    }
+
+    func testStaleTripletCleanupOnlyTargetsSameCheckoutOrphans() {
+        let orphan = RunningTripletProcess(
+            pid: 111,
+            parentPID: 1,
+            command: "/opt/homebrew/bin/python3 -m triplet_capture.app --sony-capture /repo/phase1/sony-capture/build/sony-capture"
+        )
+        let managedChild = RunningTripletProcess(
+            pid: 222,
+            parentPID: 999,
+            command: "/opt/homebrew/bin/python3 -m triplet_capture.app --sony-capture /repo/phase1/sony-capture/build/sony-capture"
+        )
+        let unrelatedOrphan = RunningTripletProcess(
+            pid: 333,
+            parentPID: 1,
+            command: "/opt/homebrew/bin/python3 -m triplet_capture.app --roll-name Other"
+        )
+
+        XCTAssertTrue(OrchestratorClient.shouldCleanupStaleTripletProcess(
+            orphan,
+            repoHints: ["/repo"],
+            currentWorkingDirectory: "/repo",
+            cwdLookup: { _ in nil }
+        ))
+        XCTAssertFalse(OrchestratorClient.shouldCleanupStaleTripletProcess(
+            managedChild,
+            repoHints: ["/repo"],
+            currentWorkingDirectory: "/repo",
+            cwdLookup: { _ in "/repo" }
+        ))
+        XCTAssertFalse(OrchestratorClient.shouldCleanupStaleTripletProcess(
+            unrelatedOrphan,
+            repoHints: ["/repo"],
+            currentWorkingDirectory: "/repo",
+            cwdLookup: { _ in "/other" }
+        ))
+    }
+
+    func testProcessOutputDrainsLargeStdoutBeforeWaiting() {
+        let output = OrchestratorClient.processOutput(
+            executable: "/bin/zsh",
+            arguments: ["-c", "for i in {1..20000}; do echo line; done"]
+        )
+
+        XCTAssertGreaterThan(output.count, 80_000)
+        XCTAssertTrue(output.hasSuffix("line\n"))
+    }
+
     // MARK: - Test 7: Startup timeout throws with stderr
 
     /// Exercises the readiness poll: when /api/state always returns HTTP 503,
@@ -370,11 +542,15 @@ final class OrchestratorClientTests: XCTestCase {
         )
 
         try await client.start(settings: settings)
-        defer { Task { await client.stop() } }
-
-        let state = try await client.fetchState()
-        XCTAssertEqual(state.rollName, "LiveTest")
-        XCTAssertTrue(client.isRunning)
+        do {
+            let state = try await client.fetchState()
+            XCTAssertEqual(state.rollName, "LiveTest")
+            XCTAssertTrue(client.isRunning)
+            await client.stop()
+        } catch {
+            await client.stop()
+            throw error
+        }
     }
 
     // MARK: - Test 10: waitForReady fails fast when the child exits during startup
@@ -514,6 +690,353 @@ final class OrchestratorClientTests: XCTestCase {
                      "applyRuntimeSettings must NOT post output_folder (would revert the roll subfolder)")
         XCTAssertNil(decoded["roll_name"],
                      "applyRuntimeSettings must NOT post roll_name")
+    }
+
+    // MARK: - Test 13b: sdk launch args include Sony Wi-Fi auth
+
+    func testBuildArgsIncludesSonyNetworkAuthForSDKMode() {
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            scanlightPort: "/dev/cu.usbmodem1234",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let args = client.buildArgs(settings: settings, portFile: "/tmp/port", readyNonce: "nonce")
+
+        XCTAssertTrue(containsAdjacent(args, ["--port", "/dev/cu.usbmodem1234"]))
+        XCTAssertTrue(containsAdjacent(args, ["--sony-capture", "/tmp/sony-capture"]))
+        XCTAssertTrue(containsAdjacent(args, ["--sony-ip-address", "10.0.0.247"]))
+        XCTAssertTrue(containsAdjacent(args, ["--sony-mac-address", "10:32:2C:26:1A:3F"]))
+        XCTAssertTrue(containsAdjacent(args, ["--sony-user", "sdk-user"]))
+        XCTAssertTrue(containsAdjacent(args, ["--sony-password", "sdk-password"]))
+        XCTAssertTrue(containsAdjacent(args, ["--sony-iso", "100or125"]))
+        XCTAssertTrue(containsAdjacent(args, ["--capture-timeout-s", "60"]))
+    }
+
+    func testSettingsWithResolvedSonyIPUsesARPEntryForSavedMAC() {
+        let oldProvider = OrchestratorClient.sonyARPTableProvider
+        OrchestratorClient.sonyARPTableProvider = {
+            """
+            ? (10.0.0.244) at 10:32:2c:26:1a:3f on en0 ifscope [ethernet]
+            ? (10.0.0.247) at (incomplete) on en0 ifscope [ethernet]
+            """
+        }
+        defer { OrchestratorClient.sonyARPTableProvider = oldProvider }
+
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let resolved = client.settingsWithResolvedSonyIP(settings)
+
+        XCTAssertEqual(resolved.sonyIpAddress, "10.0.0.244")
+        XCTAssertEqual(resolved.sonyMacAddress, "10:32:2C:26:1A:3F")
+    }
+
+    func testBuildSonyConnectionProbeUsesConnectOnly() throws {
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let command = try client.buildSonyConnectionProbeCommand(settings: settings, timeoutSeconds: 10)
+
+        XCTAssertEqual(command.executableURL.path, "/tmp/sony-capture")
+        XCTAssertTrue(command.arguments.contains("--connect-only"))
+        XCTAssertFalse(command.arguments.contains("--out"))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--timeout", "10"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--ip-address", "10.0.0.247"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--mac-address", "10:32:2C:26:1A:3F"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--user", "sdk-user"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--password", "sdk-password"]))
+    }
+
+    func testBuildSonyLiveViewFrameUsesLiveViewOut() throws {
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let outputURL = URL(fileURLWithPath: "/tmp/sony-live-view.jpg")
+        let command = try client.buildSonyLiveViewFrameCommand(
+            settings: settings,
+            outputURL: outputURL,
+            timeoutSeconds: 8
+        )
+
+        XCTAssertEqual(command.executableURL.path, "/tmp/sony-capture")
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--live-view-out", "/tmp/sony-live-view.jpg"]))
+        XCTAssertFalse(command.arguments.contains("--out"))
+        XCTAssertFalse(command.arguments.contains("--connect-only"))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--timeout", "8"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--ip-address", "10.0.0.247"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--mac-address", "10:32:2C:26:1A:3F"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--user", "sdk-user"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--password", "sdk-password"]))
+    }
+
+    func testBuildSonyLiveViewStreamUsesPersistentLiveViewOut() throws {
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let outputURL = URL(fileURLWithPath: "/tmp/sony-live-view-stream.jpg")
+        let command = try client.buildSonyLiveViewStreamCommand(
+            settings: settings,
+            outputURL: outputURL,
+            intervalMs: 250,
+            timeoutSeconds: 8
+        )
+
+        XCTAssertEqual(command.executableURL.path, "/tmp/sony-capture")
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--live-view-stream-out", "/tmp/sony-live-view-stream.jpg"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--live-view-interval-ms", "250"]))
+        XCTAssertFalse(command.arguments.contains("--out"))
+        XCTAssertFalse(command.arguments.contains("--connect-only"))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--timeout", "8"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--ip-address", "10.0.0.247"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--mac-address", "10:32:2C:26:1A:3F"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--user", "sdk-user"]))
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--password", "sdk-password"]))
+    }
+
+    func testSonyConnectionProbeTimeoutDoesNotReadStatusWhileProcessRuns() async throws {
+        let result = try await OrchestratorClient.runSonyProbeProcess(
+            executableURL: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: ["-c", "trap '' TERM; while true; do :; done"],
+            timeout: 0.1
+        )
+
+        XCTAssertTrue(result.timedOut)
+        XCTAssertNotEqual(result.exitCode, 0)
+    }
+
+    func testCalibrationExposureUsesLongRequestTimeout() async throws {
+        StubURLProtocol.routes["/api/calibrate/exposure"] = (
+            "{\"error\":\"forced failure\"}".data(using: .utf8)!,
+            500
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        do {
+            _ = try await client.calibrateExposure()
+            XCTFail("Expected forced calibration route failure")
+        } catch OrchestratorError.httpError {
+            // Expected; the request was still captured by StubURLProtocol.
+        }
+
+        XCTAssertGreaterThanOrEqual(
+            StubURLProtocol.lastRequest?.timeoutInterval ?? 0,
+            1800.0
+        )
+    }
+
+    func testCalibrationExposureSendsRealRebateRegionBody() async throws {
+        StubURLProtocol.routes["/api/calibrate/exposure"] = (
+            "{\"error\":\"forced failure\"}".data(using: .utf8)!,
+            500
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        do {
+            _ = try await client.calibrateExposure(
+                rebateCol: 4464,
+                rebateRow: 3108,
+                rebateW: 640,
+                rebateH: 160,
+                seed: makeExposureSeed(),
+                callID: "cal-run-123",
+                targetFraction: 0.80
+            )
+            XCTFail("Expected forced calibration route failure")
+        } catch OrchestratorError.httpError {
+            // Expected; inspect the captured request body below.
+        }
+
+        guard let bodyData = StubURLProtocol.lastBody else {
+            XCTFail("No body was recorded by StubURLProtocol")
+            return
+        }
+        let decoded = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
+        XCTAssertEqual(decoded?["rebate_col"] as? Int, 4464)
+        XCTAssertEqual(decoded?["rebate_row"] as? Int, 3108)
+        XCTAssertEqual(decoded?["rebate_w"] as? Int, 640)
+        XCTAssertEqual(decoded?["rebate_h"] as? Int, 160)
+        XCTAssertEqual(decoded?["call_id"] as? String, "cal-run-123")
+        XCTAssertEqual(decoded?["target_fraction"] as? Double, 0.80)
+        let seed = decoded?["seed"] as? [String: Any]
+        let red = seed?["R"] as? [String: Any]
+        let green = seed?["G"] as? [String: Any]
+        let blue = seed?["B"] as? [String: Any]
+        XCTAssertEqual(red?["led_level"] as? Int, 180)
+        XCTAssertEqual(red?["shutter_speed"] as? String, "1/40")
+        XCTAssertEqual(green?["led_level"] as? Int, 190)
+        XCTAssertEqual(blue?["shutter_speed"] as? String, "1/20")
+    }
+
+    func testCalibrationPreviewLightPostsEnabledAndLevel() async throws {
+        StubURLProtocol.routes["/api/calibrate/preview-light"] = (
+            "{}".data(using: .utf8)!,
+            200
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        try await client.setCalibrationPreviewLight(enabled: true, level: 177)
+
+        XCTAssertEqual(StubURLProtocol.lastRequest?.httpMethod, "POST")
+        guard let bodyData = StubURLProtocol.lastBody else {
+            XCTFail("No body was recorded by StubURLProtocol")
+            return
+        }
+        let decoded = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
+        XCTAssertEqual(decoded?["enabled"] as? Bool, true)
+        XCTAssertEqual(decoded?["level"] as? Int, 177)
+    }
+
+    func testCalibrationProgressDecodesLatestEvent() async throws {
+        StubURLProtocol.routes["/api/calibrate/progress"] = (
+            """
+            {
+                "event": "sony_capture_start",
+                "message": "Camera is capturing/downloading R RAW at shutter 1/2.",
+                "ts": "2026-05-23T05:47:43.983356+00:00",
+                "channel": "R",
+                "level": 128,
+                "shutter_speed": "1/2",
+                "label": "exposure-R"
+            }
+            """.data(using: .utf8)!,
+            200
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        let progress = try await client.calibrationProgress()
+
+        XCTAssertEqual(progress.event, "sony_capture_start")
+        XCTAssertEqual(progress.channel, "R")
+        XCTAssertEqual(progress.level, 128)
+        XCTAssertEqual(progress.shutterSpeed, "1/2")
+        XCTAssertTrue(progress.message.contains("capturing/downloading R RAW"))
+    }
+
+    func testCalibrationProgressAndResultCanScopeToCallID() async throws {
+        StubURLProtocol.routes["/api/calibrate/progress"] = (
+            """
+            {
+                "event": "calibration_started",
+                "message": "Exposure calibration started; preparing the camera and Scanlight.",
+                "call_id": "call-abc",
+                "recent_events": []
+            }
+            """.data(using: .utf8)!,
+            200
+        )
+        StubURLProtocol.routes["/api/calibrate/exposure-result"] = (
+            makeExposureJSONData(ledR: 210),
+            200
+        )
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        let progress = try await client.calibrationProgress(callID: "call-abc")
+        XCTAssertEqual(progress.event, "calibration_started")
+        XCTAssertEqual(progress.callId, "call-abc")
+        XCTAssertEqual(StubURLProtocol.lastRequest?.url?.query, "call_id=call-abc")
+
+        let result = try await client.lastExposureResult(callID: "call-abc")
+        XCTAssertEqual(result?.r.ledLevel, 210)
+        XCTAssertEqual(StubURLProtocol.lastRequest?.url?.query, "call_id=call-abc")
     }
 
     // MARK: - Test 14: waitForReady accepts the matching readiness nonce

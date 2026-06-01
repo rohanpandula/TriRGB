@@ -118,6 +118,8 @@ final class ScanViewUITests: XCTestCase {
                        "One capture should produce one FrameStatus entry")
         XCTAssertEqual(coordinator.frameStatuses.first?.frameNumber, 3)
         XCTAssertEqual(coordinator.frameStatuses.first?.compositeState, "captured")
+        XCTAssertEqual(coordinator.nextFrameNumber, 4,
+                       "ScanView's next-shot counter should mirror the backend next_frame value.")
     }
 
     // MARK: - Unit: composite-status poll updates frame status

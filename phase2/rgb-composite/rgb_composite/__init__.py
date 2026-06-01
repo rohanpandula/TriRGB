@@ -3,6 +3,7 @@ from .composite import (
     DEMOSAIC_KWARGS,
     DimensionMismatchError,
     OUTPUT_FORMATS,
+    auto_positive_from_composite,
     composite_triplet,
     demosaic_linear,
     invert_composite,
@@ -29,6 +30,7 @@ from c41_core.contracts import CheckResult
 __all__ = [
     # composite
     "composite_triplet",
+    "auto_positive_from_composite",
     "demosaic_linear",
     "invert_composite",
     "DEMOSAIC_KWARGS",

@@ -2,7 +2,7 @@
 //
 // ScanPhase is the exclusive-ownership invariant:
 //   .idle       → app's light panel owns the serial port; manual controls live.
-//   .calibrating → calibration script owns the port; manual controls disabled.
+//   .calibrating → triplet-capture owns the port for calibration; manual controls disabled.
 //   .scanning   → orchestrator owns the port; manual controls disabled with
 //                 the "controlled by active scan" overlay.
 //
@@ -23,8 +23,8 @@
 //
 // Crash recovery: OrchestratorClient.isRunning flips false when the child
 //   exits for any reason (Phase 05 termination handler). ScanCoordinator
-//   observes isRunning via Combine and transitions scanning→idle on crash,
-//   then attempts to reconnect the light panel.
+//   observes isRunning via Combine and transitions scanning/calibrating→idle
+//   on crash, then attempts to reconnect the light panel.
 //
 // Composite polling: a Task loops every 1s while .scanning, cancelled on
 //   transition to .idle. Merged frame-status list is exposed via @Published
@@ -107,6 +107,7 @@ extension OrchestratorClient: OrchestratorClientProtocol {
 protocol LightPanelProtocol: AnyObject {
     var isConnected: Bool { get }
     var portOwner: PortOwner { get set }
+    var scanlightPort: String { get }
     func connect()
     func disconnect()
 }
@@ -114,6 +115,16 @@ protocol LightPanelProtocol: AnyObject {
 // MARK: ScanlightViewModel conformance
 
 extension ScanlightViewModel: LightPanelProtocol {}
+
+private extension ScanSettings {
+    func withScanlightPort(_ port: String) -> ScanSettings {
+        let trimmed = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return self }
+        var copy = self
+        copy.scanlightPort = trimmed
+        return copy
+    }
+}
 
 // MARK: - ScanCoordinator
 
@@ -150,10 +161,17 @@ final class ScanCoordinator: ObservableObject {
     /// True while a captureFrame round-trip is in progress.
     @Published private(set) var captureInFlight: Bool = false
 
+    /// Next frame number the backend will shoot. Updated from capture outcomes.
+    @Published private(set) var nextFrameNumber: Int = 1
+
     // MARK: - Dependencies (injected via protocol)
 
     private let client: any OrchestratorClientProtocol
     private let lightPanel: any LightPanelProtocol
+
+    var scanlightPort: String {
+        lightPanel.scanlightPort
+    }
 
     // MARK: - Privates
 
@@ -180,14 +198,14 @@ final class ScanCoordinator: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] isRunning in
                 guard let self else { return }
-                // Act ONLY on an UNEXPECTED false-flip mid-scan — i.e. a real
-                // orchestrator crash. An intentional stopScan() also flips
-                // isRunning false (client.stop() → SIGTERM → termination handler)
-                // while phase is still .scanning and stopScan is awaiting the
-                // grace period; without the !transitionInFlight guard that would
-                // mislabel a normal stop as a crash and double-connect the light
-                // panel. stopScan/startScan set transitionInFlight for exactly this.
-                if !isRunning && self.phase == .scanning && !self.transitionInFlight {
+                // Act ONLY on an UNEXPECTED false-flip mid-owned-run — i.e. a
+                // real orchestrator crash. Intentional stopScan()/stopCalibration()
+                // also flip isRunning false while the phase still owns the port;
+                // without the !transitionInFlight guard that would mislabel a
+                // normal stop as a crash and double-connect the light panel.
+                if !isRunning
+                    && (self.phase == .scanning || self.phase == .calibrating)
+                    && !self.transitionInFlight {
                     Task { @MainActor in
                         await self.handleOrchestratorCrash()
                     }
@@ -212,6 +230,20 @@ final class ScanCoordinator: ObservableObject {
     ///
     /// On failure at step 2, reconnect the light panel before re-throwing.
     func startScan(settings: ScanSettings) async {
+        if phase == .calibrating, !transitionInFlight, client.isRunning {
+            transitionInFlight = true
+            defer { transitionInFlight = false }
+            lastError = ""
+            reconnectNeeded = false
+            frameStatuses = []
+            compositePending = 0
+            nextFrameNumber = 1
+            lightPanel.portOwner = .scanning
+            phase = .scanning
+            startCompositePolling()
+            return
+        }
+
         guard phase == .idle, !transitionInFlight, lightPanel.portOwner == .idle else {
             let reason: String
             if phase != .idle { reason = "not idle" }
@@ -228,6 +260,7 @@ final class ScanCoordinator: ObservableObject {
         reconnectNeeded = false
         frameStatuses = []
         compositePending = 0
+        nextFrameNumber = 1
 
         // Step 1: Claim port ownership for the scan, THEN release the panel's
         // connection. portOwner is set BEFORE the (multi-second) client.start()
@@ -239,7 +272,7 @@ final class ScanCoordinator: ObservableObject {
 
         // Step 2: Spawn the orchestrator (it grabs the serial port).
         do {
-            try await client.start(settings: settings)
+            try await client.start(settings: settings.withScanlightPort(lightPanel.scanlightPort))
         } catch {
             // Orchestrator failed to start — release ownership and reclaim the port.
             lightPanel.portOwner = .idle
@@ -290,6 +323,76 @@ final class ScanCoordinator: ObservableObject {
         }
     }
 
+    /// Transition idle → calibrating.
+    ///
+    /// Calibration uses the same `triplet-capture` child process as scanning,
+    /// because the exposure/FFC routes reuse the orchestrator capture loop. The
+    /// port handoff mirrors startScan(): claim ownership first, disconnect the
+    /// manual light panel, then spawn the Python server.
+    func startCalibration(settings: ScanSettings) async {
+        if phase == .scanning, !transitionInFlight, client.isRunning {
+            guard !captureInFlight else {
+                lastError = "Cannot start calibration: capture in progress"
+                return
+            }
+            transitionInFlight = true
+            defer { transitionInFlight = false }
+            stopCompositePolling()
+            lastError = ""
+            reconnectNeeded = false
+            compositePending = 0
+            lightPanel.portOwner = .calibrating
+            phase = .calibrating
+            return
+        }
+
+        guard phase == .idle, !transitionInFlight, lightPanel.portOwner == .idle else {
+            let reason: String
+            if phase == .scanning { reason = "scan in progress" }
+            else if phase == .calibrating { reason = "calibration already running" }
+            else if transitionInFlight { reason = "transition in flight" }
+            else { reason = "serial port is busy" }
+            lastError = "Cannot start calibration: \(reason)"
+            return
+        }
+        transitionInFlight = true
+        defer { transitionInFlight = false }
+
+        lastError = ""
+        reconnectNeeded = false
+
+        lightPanel.portOwner = .calibrating
+        lightPanel.disconnect()
+
+        do {
+            try await client.start(settings: settings.withScanlightPort(lightPanel.scanlightPort))
+        } catch {
+            lightPanel.portOwner = .idle
+            lightPanel.connect()
+            lastError = "Failed to start calibration: \(error.localizedDescription)"
+            return
+        }
+
+        phase = .calibrating
+    }
+
+    /// Transition calibrating → idle and reclaim the light panel.
+    func stopCalibration() async {
+        guard phase == .calibrating, !transitionInFlight else { return }
+        transitionInFlight = true
+        defer { transitionInFlight = false }
+
+        await client.stop()
+
+        phase = .idle
+        lightPanel.portOwner = .idle
+        lightPanel.connect()
+        if !lightPanel.isConnected {
+            reconnectNeeded = true
+            lastError = "Light panel failed to reconnect after calibration. Use 'Reconnect Light' to retry."
+        }
+    }
+
     /// Manual reconnect after a failed port-reclaim. Shown in ScanView when
     /// reconnectNeeded == true.
     func reconnectLight() {
@@ -315,6 +418,7 @@ final class ScanCoordinator: ObservableObject {
         do {
             let outcome = try await client.captureFrame(retake: retake)
             let frameNum = outcome.frameNumber
+            nextFrameNumber = outcome.nextFrame
             if outcome.success {
                 // A retake re-shoots an existing frame: reset its row to
                 // "captured" even if a prior composite advanced it to
@@ -334,12 +438,14 @@ final class ScanCoordinator: ObservableObject {
     /// Called when OrchestratorClientProtocol.isRunning flips false during a scan.
     /// Transitions .scanning → .idle and tries to reclaim the light panel.
     private func handleOrchestratorCrash() async {
-        guard phase == .scanning else { return }
+        guard phase == .scanning || phase == .calibrating else { return }
+        let crashedPhase = phase
         // The orchestrator has already exited — no need to call client.stop().
         stopCompositePolling()
         phase = .idle
         lightPanel.portOwner = .idle
-        lastError = "Orchestrator crashed — scan stopped. "
+        let noun = crashedPhase == .calibrating ? "calibration" : "scan"
+        lastError = "Orchestrator crashed — \(noun) stopped. "
             + (client.lastError.isEmpty ? "" : client.lastError)
 
         // Attempt to reclaim the serial port.

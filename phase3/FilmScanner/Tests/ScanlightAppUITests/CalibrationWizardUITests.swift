@@ -107,9 +107,9 @@ final class CalibrationWizardUITests: XCTestCase {
         )
     }
 
-    // MARK: - All 44 wizard AX-IDs compile-time reference + count check
+    // MARK: - All 48 wizard AX-IDs compile-time reference + count check
 
-    /// Reference all 44 Phase 14 wizard AX-IDs, assert the count, and verify prefixes.
+    /// Reference all 48 Phase 14 wizard AX-IDs, assert the count, and verify prefixes.
     /// This is a pure compile-time assertion — any rename breaks the build.
     /// No app launch required.
     func testWizardAXIDsCountAndPrefixes() {
@@ -128,7 +128,7 @@ final class CalibrationWizardUITests: XCTestCase {
             AccessibilityID.rigCheckFirmwareLabel,
             AccessibilityID.rigCheckCameraLabel,
             AccessibilityID.rigCheckFolderLabel,
-            // Exposure — Step 2 (12)
+            // Exposure — Step 2 (16)
             AccessibilityID.exposureClipR,
             AccessibilityID.exposureClipG,
             AccessibilityID.exposureClipB,
@@ -141,6 +141,10 @@ final class CalibrationWizardUITests: XCTestCase {
             AccessibilityID.exposureOverall,
             AccessibilityID.rebatePicker,
             AccessibilityID.rebateClearBtn,
+            AccessibilityID.stockProfileNameField,
+            AccessibilityID.stockProfileSaveBtn,
+            AccessibilityID.stockProfilePicker,
+            AccessibilityID.stockProfileApplyBtn,
             // Flat Field — Step 3 (12)
             AccessibilityID.ffcFalloffR,
             AccessibilityID.ffcFalloffG,
@@ -166,7 +170,7 @@ final class CalibrationWizardUITests: XCTestCase {
             AccessibilityID.resultsRollVerdict,
         ]
 
-        XCTAssertEqual(wizardIDs.count, 44, "Phase 14 calibration wizard must define exactly 44 AX-IDs")
+        XCTAssertEqual(wizardIDs.count, 48, "Phase 14 calibration wizard must define exactly 48 AX-IDs")
 
         // Verify prefix conventions.
         XCTAssertTrue(AccessibilityID.wizardStep1Indicator.hasPrefix("indicator-"))
@@ -180,6 +184,10 @@ final class CalibrationWizardUITests: XCTestCase {
         XCTAssertTrue(AccessibilityID.exposureClipR.hasPrefix("lbl-"))
         XCTAssertTrue(AccessibilityID.rebatePicker.hasPrefix("picker-"))
         XCTAssertTrue(AccessibilityID.rebateClearBtn.hasPrefix("btn-"))
+        XCTAssertTrue(AccessibilityID.stockProfileNameField.hasPrefix("field-"))
+        XCTAssertTrue(AccessibilityID.stockProfileSaveBtn.hasPrefix("btn-"))
+        XCTAssertTrue(AccessibilityID.stockProfilePicker.hasPrefix("picker-"))
+        XCTAssertTrue(AccessibilityID.stockProfileApplyBtn.hasPrefix("btn-"))
         XCTAssertTrue(AccessibilityID.ffcFalloffR.hasPrefix("lbl-"))
         XCTAssertTrue(AccessibilityID.ffcUseBtn.hasPrefix("btn-"))
         XCTAssertTrue(AccessibilityID.resultsRollVerdict.hasPrefix("lbl-"))

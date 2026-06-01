@@ -157,6 +157,13 @@ class ChannelCalibration(JsonContract):
     gain         : calibrated exposure gain.  > 0.
     clip_fraction: fraction of pixels at or above clipping threshold in
                    the rebate, 0.0–1.0.
+    shutter_speed: Sony shutter speed used for this channel, e.g. "1/4".
+                   Empty means "unknown / camera-current" for older records.
+    p99          : black-subtracted rebate 99th percentile for this channel.
+    target       : target black-subtracted p99 used by exposure calibration.
+    exposure_status:
+                   "under", "target", "hot", "clipped", "clip_limited",
+                   "source_limited", or "unknown".
     schema_version: default 1.
     """
 
@@ -165,6 +172,10 @@ class ChannelCalibration(JsonContract):
     black_level: float
     gain: float
     clip_fraction: float
+    shutter_speed: str = ""
+    p99: float = 0.0
+    target: float = 0.0
+    exposure_status: str = "unknown"
     schema_version: int = 1
 
     def __post_init__(self) -> None:
@@ -184,6 +195,29 @@ class ChannelCalibration(JsonContract):
             raise ValueError(f"clip_fraction must be finite, got {self.clip_fraction}")
         if not 0.0 <= self.clip_fraction <= 1.0:
             raise ValueError(f"clip_fraction must be 0–1, got {self.clip_fraction}")
+        if not isinstance(self.shutter_speed, str):
+            raise TypeError(f"shutter_speed must be a string, got {type(self.shutter_speed).__name__}")
+        if not math.isfinite(self.p99):
+            raise ValueError(f"p99 must be finite, got {self.p99}")
+        if self.p99 < 0:
+            raise ValueError(f"p99 must be >= 0, got {self.p99}")
+        if not math.isfinite(self.target):
+            raise ValueError(f"target must be finite, got {self.target}")
+        if self.target < 0:
+            raise ValueError(f"target must be >= 0, got {self.target}")
+        if self.exposure_status not in (
+            "under",
+            "target",
+            "hot",
+            "clipped",
+            "clip_limited",
+            "source_limited",
+            "unknown",
+        ):
+            raise ValueError(
+                "exposure_status must be one of under/target/hot/clipped/clip_limited/source_limited/unknown, "
+                f"got {self.exposure_status!r}"
+            )
 
 
 # ---------------------------------------------------------------------------

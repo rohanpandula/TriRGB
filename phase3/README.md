@@ -1,35 +1,70 @@
-# Phase 3 — Live preview app (scaffold)
+# Phase 3 — Swift Scanner App
 
 Phase 3 of the film scanner build — see `../PROJECT.md`.
 
-**Status: scaffolded, not yet a working app.** Only the parts safe to build without hardware are in here. The SwiftUI shell, the Sony SDK Obj-C++ bridge, and the live-preview filter chain are all deferred until the Phase 1 hardware smoke test passes, because they all need a real camera to exercise.
+**Current status:** this is now a real SwiftPM macOS app target, not only a
+driver scaffold. The app is the intended unified operator surface for the
+scanner: Light, Settings, Calibrate, and Scan tabs all share one set of
+state objects.
 
-## What's shipped now
+The app still wraps the tested Python/C++ pipeline instead of reimplementing
+image processing in Swift. That is intentional. The Swift app owns UI,
+settings, process lifecycle, serial-port handoff, and calibration workflow;
+the Python tools own capture orchestration, FFC, compositing, calibration
+math, and inversion helpers.
 
-| Module | What it does | Tested? |
+## What's Shipped Now
+
+| Module | What it does | Hardware required? |
 |---|---|---|
-| `FilmScanner/Sources/ScanlightSwift/Protocol.swift` | Wire codec — packet framing, encode `SET_COLOR`, decode `LED_TEMP`/`VBUS`/`FW_VERSION`/`DEFAULT_RGB` | Yes, 12 tests |
-| `FilmScanner/Sources/ScanlightSwift/Scanlight.swift` | Driver class — background reader, request/response by header, telemetry cache, white+RGB rejection | Yes, 9 tests, in-memory `FakeTransport` |
-| `FilmScanner/Sources/ScanlightSwift/Transport.swift` | `ScanlightTransport` protocol abstraction | (interface) |
-| `FilmScanner/Sources/ScanlightSwift/SerialPortTransport.swift` | Real POSIX `/dev/cu.usbmodem*` impl | **Compiles, not yet HW-verified** |
+| `ScanlightSwift` | Swift Scanlight protocol/driver and fake transport | no for tests, yes for real serial |
+| `scanlight-swift-cli` | JSON-capable CLI/selftest for automation | optional |
+| `scanlight-app` | SwiftUI control hub with Light, Settings, Calibrate, and Scan tabs | no for fake-transport UI tests, yes for real scanning |
+| `OrchestratorClient` | Starts/stops `triplet-capture` as a child process and drives its HTTP API | yes for real capture |
+| `ScanCoordinator` | Owns the serial-port handoff between the manual Light panel and the Python scan/calibration process | no for tests |
+| Calibration wizard | Starts `triplet-capture`, enters `.calibrating`, drives exposure calibration, FFC capture, and numeric checks through the Python backend, then releases the port | yes for real calibration |
 
-The Swift driver is a direct port of `phase1/scanlightctl/scanlight/device.py` with the same correctness invariants (BE on the wire for LED_TEMP/VBUS/FW_VERSION, FW lives in the low 16 bits of the version word). The Python and Swift implementations should produce byte-identical wire output; a future cross-language test could feed the Python `Scanlight.set_color(...)` packet into Swift's `consumeBuffer` and vice versa, but that's overkill until the app actually exists.
+Known remaining gap: manual IED mode still needs operator-visible R/G/B
+prompts while capture/calibration routes are waiting for the next IED file.
+FFC persistence also needs a final contract pass because the compositor still
+expects a calibration triplet directory while the newer radiometric FFC route
+can produce flat-stack data.
 
-## What's deferred
+## Current Capture Direction
 
-- `FilmScanner/Sources/PreviewPipeline/` — Core Image filter chain (`CIColorMatrix` → `CIColorInvert` → `CIToneCurve`). Buildable now on a static image but **the per-stock WB neutralization matrix coefficients require calibration data we won't have until the optical dry run is run on a real frame**, so investing here is premature.
-- `FilmScanner/Sources/SonyBridge/` — Obj-C++ wrapper around the Sony Camera Remote SDK. Live-view delivery is the entire point of Phase 3 and it can only be exercised against a real camera. Phase 1B's `sony-capture` C++ binary already proves the SDK lifecycle works on this platform; the Phase 3 bridge is a port + live-view callback hook.
-- `FilmScanner/App/` — SwiftUI shell with the two modes (Framing / Capture). Worth scaffolding only once the Sony bridge can deliver a JPEG to render.
+Sony SDK capture is CLI-verified over Wi-Fi and wired through the Swift app's
+SDK trigger mode. Imaging Edge Desktop remains the fallback:
 
-## Build / test
+1. `manual` trigger mode: the app lights R/G/B and waits for you to trigger
+   each channel manually in IED. This is the safest fallback because it uses
+   no SDK and no Scanlight shutter pulse.
+2. `hw` trigger mode: the app lights R/G/B and asks the Scanlight to pulse
+   the 3.5 mm shutter output. Use this after the cable/pulse path is proven.
+3. `sdk` trigger mode: the app passes Sony IP/MAC/Access Auth fields to
+   `triplet-capture`, which calls `sony-capture` in the verified host-PC
+   auto-download path.
+
+Film advance is always manual through the Valoi 360.
+
+## Still Deferred
+
+- Live inverted preview from camera live-view frames.
+- Sony SDK Obj-C++ bridge / direct Swift integration. The app currently uses
+  the C++ CLI as the SDK boundary.
+- Any motorized film advance.
+
+## Build / Test
 
 ```bash
 cd phase3/FilmScanner
 swift test
 ```
 
-21 tests pass; no hardware needed.
+For manual app testing without hardware:
 
-## When HW arrives
+```bash
+swift run scanlight-app -FakeTransport YES
+```
 
-See `../HANDOFF.md`. The Phase 3 work picks up after Phase 1 + 2 are smoke-tested against real hardware.
+Real scanning also needs the Python packages installed in editable mode so
+`triplet-capture` is on `PATH`.

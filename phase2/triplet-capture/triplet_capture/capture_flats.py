@@ -1,6 +1,6 @@
 """Flat-field capture loop for radiometric FFC (Phase 10 R-26).
 
-Drives the Config-B Orchestrator N times to capture blank-light flat frames,
+Drives the IED-backed Orchestrator N times to capture blank-light flat frames,
 keeps all N demosaiced frames to build a flat_stack (NxHxWx3 uint16), averages
 them for the uniformity-improvement metric, and returns (flat_stack, FlatFieldResult).
 
@@ -61,7 +61,7 @@ def capture_flats(
 ) -> tuple[np.ndarray, FlatFieldResult]:
     """Capture N blank-light flat frames and return (flat_stack, FlatFieldResult).
 
-    Reuses ``Orchestrator.capture_triplet()`` (Config-B loop) so all
+    Reuses ``Orchestrator.capture_triplet()`` (IED-backed loop) so all
     the existing inbox/quarantine/retry logic is inherited rather than
     reimplemented (NFR-14).
 
@@ -118,7 +118,7 @@ def capture_flats(
     # 1. Warmup sleep (noop in tests via injected sleep=lambda _: None)
     sleep(warmup_s)
 
-    # 2. Construct one Orchestrator reusing the existing Config-B path.
+    # 2. Construct one Orchestrator reusing the existing IED-backed path.
     #    Pass sleep through so settle delays are also noop in tests.
     orch = Orchestrator(
         scanlight,

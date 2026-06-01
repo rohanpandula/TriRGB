@@ -16,7 +16,9 @@
 //       coordinator out of .scanning and doesn't permanently lock the light panel.
 
 import Combine
+import Darwin
 import Foundation
+import ScanlightSwift
 import XCTest
 @testable import ScanlightApp
 
@@ -30,6 +32,7 @@ final class FakeLightPanel: LightPanelProtocol {
     private(set) var callLog: [String] = []
     private(set) var isConnected: Bool = false
     var portOwner: PortOwner = .idle
+    var scanlightPort: String = ""
 
     func connect() {
         callLog.append("connect")
@@ -352,6 +355,89 @@ final class ScanCoordinatorTests: XCTestCase {
             "After a mid-scan crash, coordinator.lastError must be set.")
     }
 
+    // MARK: - T4b: calibration owns and releases the port
+
+    func testCalibrationLifecycleOwnsAndReleasesPort() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+
+        await coordinator.startCalibration(settings: makeScanSettings())
+
+        XCTAssertEqual(coordinator.phase, .calibrating,
+                       "startCalibration() must move the coordinator to .calibrating")
+        XCTAssertEqual(lightPanel.portOwner, .calibrating,
+                       "calibration must claim the serial port")
+        XCTAssertEqual(lightPanel.callLog.first, "disconnect",
+                       "calibration must disconnect the light panel before starting the orchestrator")
+        XCTAssertEqual(client.callLog.first, "start",
+                       "calibration must start the orchestrator")
+
+        await coordinator.stopCalibration()
+
+        XCTAssertEqual(coordinator.phase, .idle,
+                       "stopCalibration() must return the coordinator to .idle")
+        XCTAssertEqual(lightPanel.portOwner, .idle,
+                       "stopCalibration() must release the serial port")
+        XCTAssertTrue(client.callLog.contains("stop"),
+                      "stopCalibration() must stop the orchestrator")
+        XCTAssertEqual(lightPanel.callLog.last, "connect",
+                       "stopCalibration() must reconnect the light panel")
+    }
+
+    func testMidCalibrationCrashTransitionsToIdle() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+
+        await coordinator.startCalibration(settings: makeScanSettings())
+        XCTAssertEqual(coordinator.phase, .calibrating)
+
+        client.simulateCrash()
+
+        let deadline = Date(timeIntervalSinceNow: 2.0)
+        while coordinator.phase == .calibrating && Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        XCTAssertEqual(coordinator.phase, .idle,
+                       "After a calibration crash, coordinator.phase must be .idle")
+        XCTAssertEqual(lightPanel.portOwner, .idle,
+                       "After a calibration crash, the light panel port must be released")
+        XCTAssertTrue(coordinator.lastError.lowercased().contains("calibration"),
+                      "Calibration crash error should name calibration. Got: \(coordinator.lastError)")
+    }
+
+    func testSwitchFromCalibrationToScanReusesRunningBackend() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+
+        await coordinator.startCalibration(settings: makeScanSettings())
+        let clientLogAfterCalibrationStart = client.callLog
+        let lightLogAfterCalibrationStart = lightPanel.callLog
+
+        await coordinator.startScan(settings: makeScanSettings())
+
+        XCTAssertEqual(coordinator.phase, .scanning)
+        XCTAssertEqual(lightPanel.portOwner, .scanning)
+        XCTAssertEqual(client.callLog, clientLogAfterCalibrationStart,
+                       "Switching calibration → scan should reuse the running backend, not start another one")
+        XCTAssertEqual(lightPanel.callLog, lightLogAfterCalibrationStart,
+                       "Switching calibration → scan should not disconnect/reconnect the light")
+    }
+
+    func testSwitchFromScanToCalibrationReusesRunningBackend() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+
+        await coordinator.startScan(settings: makeScanSettings())
+        let clientLogAfterScanStart = client.callLog
+        let lightLogAfterScanStart = lightPanel.callLog
+
+        await coordinator.startCalibration(settings: makeScanSettings())
+
+        XCTAssertEqual(coordinator.phase, .calibrating)
+        XCTAssertEqual(lightPanel.portOwner, .calibrating)
+        XCTAssertEqual(client.callLog, clientLogAfterScanStart,
+                       "Switching scan → calibration should reuse the running backend, not start another one")
+        XCTAssertEqual(lightPanel.callLog, lightLogAfterScanStart,
+                       "Switching scan → calibration should not disconnect/reconnect the light")
+    }
+
     // MARK: - T5: startScan is no-op if already scanning
 
     func testStartScanIsNoOpIfAlreadyScanning() async throws {
@@ -387,6 +473,28 @@ final class ScanCoordinatorTests: XCTestCase {
                        "After startScan() failure, coordinator.lastError must be set.")
     }
 
+    func testStartCalibrationFailureShowsStartupDiagnosticsAndRedactsSecrets() async throws {
+        let (coordinator, client, _) = makeCoordinator()
+        client.startError = OrchestratorError.startupFailed(
+            exitCode: 1,
+            stderr: """
+            Traceback (most recent call last):
+            command: triplet_capture.app --sony-user 6SCzVb --sony-password D8MM1Ktc
+            ModuleNotFoundError: No module named 'rawpy'
+            """
+        )
+
+        await coordinator.startCalibration(settings: makeScanSettings())
+
+        XCTAssertEqual(coordinator.phase, .idle)
+        XCTAssertTrue(coordinator.lastError.contains("Failed to start calibration"))
+        XCTAssertTrue(coordinator.lastError.contains("exit 1"))
+        XCTAssertTrue(coordinator.lastError.contains("ModuleNotFoundError"))
+        XCTAssertTrue(coordinator.lastError.contains("<redacted>"))
+        XCTAssertFalse(coordinator.lastError.contains("6SCzVb"))
+        XCTAssertFalse(coordinator.lastError.contains("D8MM1Ktc"))
+    }
+
     // MARK: - T7: captureFrame advances frame status
 
     func testCaptureFrameAddsFrameStatus() async throws {
@@ -408,6 +516,8 @@ final class ScanCoordinatorTests: XCTestCase {
                        "After one captureFrame(), frameStatuses must have 1 entry.")
         XCTAssertEqual(coordinator.frameStatuses.first?.frameNumber, 1)
         XCTAssertEqual(coordinator.frameStatuses.first?.compositeState, "captured")
+        XCTAssertEqual(coordinator.nextFrameNumber, 2,
+                       "The scan shot counter should advance from the backend's next_frame value.")
     }
 
     // MARK: - T8: captureFrame is no-op when idle
@@ -535,6 +645,103 @@ final class ScanCoordinatorTests: XCTestCase {
         vm.connect()
         XCTAssertTrue(factoryCalled,
                       "connect() must attempt the transport when the port is idle")
+    }
+
+    // MARK: - T13: serial device loss resets the Light tab state
+
+    /// Real-run regression: if the Scanlight USB serial device disappears
+    /// after a successful connect, POSIX writes can fail with ENXIO/errno 6.
+    /// The app must mark the light as disconnected and reject follow-up manual
+    /// actions instead of repeatedly writing to the stale descriptor.
+    func testWriteFailureDisconnectsLightViewModel() throws {
+        final class DisconnectingTransport: ScanlightTransport {
+            private let lock = NSLock()
+            private let cv = NSCondition()
+            private var rx = Data()
+            private var writesRemainingBeforeFailure: Int
+            private var closed = false
+
+            init(writesRemainingBeforeFailure: Int) {
+                self.writesRemainingBeforeFailure = writesRemainingBeforeFailure
+            }
+
+            func write(_ data: Data) throws {
+                lock.lock()
+                if closed {
+                    lock.unlock()
+                    throw ScanlightError.transportClosed
+                }
+                if writesRemainingBeforeFailure == 0 {
+                    lock.unlock()
+                    throw SerialPortTransport.OpenError.writeFailed(errno: ENXIO)
+                }
+                writesRemainingBeforeFailure -= 1
+                lock.unlock()
+
+                guard data.count >= 3, data[data.startIndex] == ScanlightProtocol.startByte else {
+                    return
+                }
+                let header = data[data.startIndex + 1]
+                if header == ScanlightProtocol.h2dGetFWVersion {
+                    feed(Data([
+                        ScanlightProtocol.startByte, ScanlightProtocol.d2hFWVersion, 4,
+                        0x00, 0x01, 0x00, 0x01,
+                    ]))
+                } else if header == ScanlightProtocol.h2dGetDefaultRGB {
+                    feed(Data([
+                        ScanlightProtocol.startByte, ScanlightProtocol.d2hDefaultRGB, 3,
+                        255, 200, 180,
+                    ]))
+                }
+            }
+
+            func readAvailable() throws -> Data {
+                cv.lock()
+                if rx.isEmpty {
+                    cv.wait(until: Date(timeIntervalSinceNow: 0.05))
+                }
+                let out = rx
+                rx.removeAll(keepingCapacity: true)
+                cv.unlock()
+                return out
+            }
+
+            func close() {
+                lock.lock()
+                closed = true
+                lock.unlock()
+                cv.lock()
+                cv.broadcast()
+                cv.unlock()
+            }
+
+            private func feed(_ data: Data) {
+                cv.lock()
+                rx.append(data)
+                cv.broadcast()
+                cv.unlock()
+            }
+        }
+
+        let transport = DisconnectingTransport(writesRemainingBeforeFailure: 2)
+        let vm = ScanlightViewModel(transportFactory: { .success(transport) })
+
+        vm.connect()
+        XCTAssertTrue(vm.isConnected)
+        XCTAssertTrue(vm.manualControlsEnabled)
+
+        vm.allOff()
+
+        XCTAssertFalse(vm.isConnected)
+        XCTAssertFalse(vm.manualControlsEnabled)
+        XCTAssertNil(vm.activeChannel)
+        XCTAssertEqual(vm.connectionStatusString, "disconnected")
+        XCTAssertTrue(vm.lastError.contains("Scanlight disconnected"))
+        XCTAssertTrue(vm.lastError.contains("Reconnect"))
+
+        vm.allOff()
+
+        XCTAssertTrue(vm.lastError.contains("not connected"))
     }
 }
 

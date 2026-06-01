@@ -23,6 +23,10 @@ struct WizardChannelCalibration: Codable {
     let blackLevel: Double
     let gain: Double
     let clipFraction: Double
+    let shutterSpeed: String?
+    let p99: Double?
+    let target: Double?
+    let exposureStatus: String?
     let schemaVersion: Int
 }
 

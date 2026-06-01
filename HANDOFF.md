@@ -2,7 +2,26 @@
 
 > **For the next Claude session:** Point me at this file when hardware arrives. It tells you (a) exactly what was built before HW, (b) what's verified vs. assumed, (c) where the assumptions can break, (d) the exact order to do things on plug-in day. Read **all** of this before touching the hardware.
 
-Last updated: 2026-05-13. Built against PROJECT.md and the upstream `jackw01/scanlight` repo + Sony Camera Remote SDK v2.01.
+Last updated: 2026-05-22. Built against PROJECT.md and the upstream
+`jackw01/scanlight` repo. Sony SDK capture is verified over Wi-Fi and
+wired into the Swift app through the `sony-capture` CLI boundary.
+
+## Current State Update — 2026-05-22
+
+- **Default capture path:** Configuration C, `--trigger-mode manual`.
+  The app sets each Scanlight channel and waits for the operator to
+  manually trigger an Imaging Edge Desktop capture into the watched inbox.
+- **Optional capture path:** Configuration B, `--trigger-mode hw`, only if
+  the Scanlight 3.5mm shutter pulse is verified reliable.
+- **CLI-verified path:** Configuration A / Sony SDK Wi-Fi still capture.
+  `sony-capture` can authenticate, fire, and download ARW via host-PC
+  auto-download. The Swift app passes these SDK settings through
+  `triplet-capture`.
+- **Film advance:** always manual through the Valoi 360. There is no
+  motorized film advance in scope.
+- **Swift app direction:** the SwiftUI app is the unified operator surface
+  for Light, Settings, Calibrate, and Scan. It wraps the Python pipeline;
+  it does not reimplement FFC, compositing, or calibration math in Swift.
 
 ---
 
@@ -34,7 +53,7 @@ contracts you need to drive the system are in
 | Deliverable | Path | Status | What works in software | What's HW-gated |
 |---|---|---|---|---|
 | 1A `scanlightctl` | `phase1/scanlightctl/` | Software-complete, 42/42 tests | Protocol codec, driver class, CLI, fake-serial coverage of every error path | Auto-discovery against real Pico VID:PID `2E8A:000A`; actual serial round-trip |
-| 1B `sony-capture` | `phase1/sony-capture/` | Software-complete, builds clean, no-camera path verified | SDK loads via `@rpath`, `Init`→`EnumCameraObjects` runs, error path returns clean exit 1, in-tree SDK install (~56MB, gitignored) | `Connect`, `SetSaveInfo`, `SendCommand(Release)`, `OnCompleteDownload`, atomic rename — all need the camera |
+| 1B `sony-capture` | `phase1/sony-capture/` | **HW-verified over Wi-Fi on a7CR** | SDK loads via `@rpath`; `--list` sees `ILCE-7CR` at `10.0.0.247`; default host-PC mode authenticates, fires stills, downloads 63 MB ARW, and atomically renames to `--out`; RemoteTransfer mode authenticates/fires but card contents listing returns `36101` | Swift/orchestrator unification; live-view SDK bridge |
 | 1C `docs/optical_dry_run.md` | `docs/` | Complete | Paper checklist | (Operator runs it once with film + Scanlight) |
 | **Phase 1 exit criteria** | — | **HW-blocked** | — | `scripts/smoketest.sh` is the literal sequence from PROJECT.md, ready to run on plug-in day |
 
@@ -44,22 +63,23 @@ contracts you need to drive the system are in
 
 | Deliverable | Path | Status | What works in software | What's HW-gated |
 |---|---|---|---|---|
-| 2A `triplet-capture` | `phase2/triplet-capture/` | Software-complete, 16/16 tests | Flask single-page UI, R→G→B sequencing, frame-counter advance-only-on-success, retake/overwrite semantics, JSONL action log, plausible-RAW-size guard, Flask routes | Real subprocess hand-off to `sony-capture`; settle-time tuning against actual LED step-response |
+| 2A `triplet-capture` | `phase2/triplet-capture/` | Software-complete | Manual IED trigger, hardware pulse trigger, SDK reference path, R→G→B sequencing, frame-counter advance-only-on-success, retake/overwrite semantics, JSONL action log, plausible-RAW-size guard, Flask routes | Real IED inbox timing; real Scanlight serial; optional 3.5mm pulse reliability |
 | 2B `rgb-composite` | `phase2/rgb-composite/` | Software-complete, 15/15 tests (incl. real ARW) | Channel-from-correct-input invariant, dimension-mismatch abort, TIFF writer with colorspace metadata + sidecar, rawpy params locked to PROJECT.md, **end-to-end rawpy decode verified against a real a7CR ARW** | Three actual narrowband-RGB exposures of the same frame — only achievable after Phase 1 smoke |
 | 2C `batch-composite` | `phase2/batch-composite/` | Software-complete, 14/14 tests | Roll discovery (frame number + roll-name keyed), parallelism cap to bound memory, missing-channel skip, overwrite flag | — (purely orchestrational around 2B) |
 | **Phase 2 exit criteria** | — | **HW-blocked** | — | 36 TIFFs from a real roll that invert correctly in FilmLab / NLP |
 
-### Phase 3 — Live preview app
+### Phase 3 — Swift app + future live preview
 
-**Goal:** replace Phase 2's disposable UI with a native macOS app that adds an inverted live preview during framing.
+**Goal:** use the native macOS app as the unified control surface now;
+live inverted preview remains future hardware-gated work.
 
 | Deliverable | Path | Status | Why |
 |---|---|---|---|
 | `ScanlightSwift` package (protocol + driver) | `phase3/FilmScanner/Sources/ScanlightSwift/` | Scaffolded, 21/21 tests | Direct Swift port of the Python driver, same fake-transport test pattern. `SerialPortTransport.swift` compiles but is not HW-verified — the real round-trip needs the device. |
-| SwiftUI shell (Framing/Capture modes) | `phase3/FilmScanner/App/` (not created) | **Not built** | Deferred — nothing to render until the Sony bridge can deliver JPEG live-view frames, which is HW-only. |
-| Sony SDK Obj-C++ bridge | `phase3/FilmScanner/Sources/SonyBridge/` (not created) | **Not built** | Deferred — the entire reason to write the bridge is live view, which is HW-only. The capture path is already covered by 1B and the Phase 3 app can simply shell out to `sony-capture` for triplets in v1. |
-| Core Image filter chain (invert + WB + tone curve) | `phase3/FilmScanner/Sources/PreviewPipeline/` (not created) | **Not built** | Deferred — the per-stock WB-neutralization matrix coefficients are derived from real Phase 2 output (a calibration step that runs after Phase 2 smoke). Writing them now would be guessing. |
-| **Phase 3 exit criteria** | — | **HW + Phase 1+2 smoke required first** | Live preview at 15–30 fps with inverted color, mode-switch without dropping the USB connection, byte-identical output to Phase 2. |
+| SwiftUI app shell | `phase3/FilmScanner/Sources/ScanlightApp/` | Built | Four tabs: Light, Settings, Calibrate, Scan. Starts `triplet-capture` and drives its HTTP API. |
+| Calibration wizard | `phase3/FilmScanner/Sources/ScanlightApp/` + `phase2/triplet-capture/` | Built pre-hardware | Drives exposure calibration, FFC capture, and numeric checks through the Python backend. |
+| Sony SDK Obj-C++ bridge | `phase3/FilmScanner/Sources/SonyBridge/` (not created) | **Pending** | CLI capture works; native app bridge/live preview still not built. |
+| Core Image live-preview filter chain | `phase3/FilmScanner/Sources/PreviewPipeline/` (not created) | **Deferred** | Needs real live-view frames and calibration data; not required for manual IED scanning. |
 
 ### Cross-cutting tooling (built, HW-free)
 
@@ -86,7 +106,7 @@ contracts you need to drive the system are in
 - **92 tests** all green (42 + 15 + 14 + 16 + 21, including 5 real-ARW integration tests)
 - **1 codex audit** done, 5 findings fixed (2 MEDIUM + 3 LOW), regression tests added
 - **Real-ARW pipeline verified** — `rgb-composite` runs end-to-end against an a7CR ARW from the user's existing scan archive (`/Volumes/FilmscanWorkingDrive/.../Roll2-070.ARW`). One bug caught and fixed (rawpy 0.27 requires `user_wb` as a `list`, not a tuple).
-- **Sony SDK installed in-tree** at `phase1/sony-capture/third_party/sony_sdk/`, ~56 MB, gitignored. Quarantine stripped. Binary loads dylib via `@rpath` and runs the no-camera error path cleanly.
+- **Sony SDK installed in-tree** at `phase1/sony-capture/third_party/sony_sdk/`, ~56 MB, gitignored. Quarantine stripped. Binary loads dylib via `@rpath`. On 2026-05-22 the Wi-Fi host-PC path produced valid `ILCE-7CR` ARWs at `/tmp/sony-hostpc.ARW` and `/tmp/sony-default.ARW`.
 - **3 deferred Phase 3 pieces** intentionally not built (SwiftUI shell, Sony bridge, filter chain) — each has a specific reason that resolves after Phase 1+2 smoke
 
 See "Codex audit" below for what the review caught.
@@ -97,12 +117,13 @@ See "Codex audit" below for what the review caught.
 
 Pick a configuration first (see PROJECT.md §Hardware architecture):
 
-- **Configuration A** — USB tether, SDK fires the shutter. No 3.5mm cable. Default.
-- **Configuration B** — Wi-Fi tether via Imaging Edge Desktop, Scanlight fires the shutter via 3.5mm. Faster on the trigger side; transfer time is Wi-Fi-bound.
+- **Configuration C** — Wi-Fi/IED tether, operator manually fires IED per channel. Current default and safest fallback.
+- **Configuration B** — Wi-Fi/IED tether, Scanlight fires the shutter via 3.5mm. Optional after pulse path is verified.
+- **Configuration A** — Wi-Fi Sony SDK capture/download through Swift SDK mode.
 
 Verify these before powering anything:
 
-**Both configurations:**
+**All configurations:**
 - [ ] `brew install cmake` (sony-capture build path; only required for Configuration A)
 - [ ] Camera body settings:
   - PC Remote mode **on**
@@ -117,10 +138,13 @@ Verify these before powering anything:
 **Configuration A only:**
 - [ ] USB-C **data** cable for camera, not charge-only. Verify by plugging the camera into a Mac you trust and confirming the body appears as a USB device, not just charging.
 
+**Configuration B/C only:**
+- [ ] Imaging Edge Desktop installed and paired with the a7CR over Wi-Fi. Save folder set to a dedicated inbox path (e.g. `/Volumes/SSD/_ied_inbox/`).
+- [ ] 5 GHz Wi-Fi between AP and camera, with the AP close enough that single-RAW transfer stays under the configured capture timeout.
+
 **Configuration B only:**
 - [ ] Sony USB-C → 3.5mm trigger cable (the camera's USB-C port carries trigger pins; the cable converts them to a 3.5mm jack that mates with the Scanlight's shutter output).
-- [ ] Imaging Edge Desktop installed and paired with the a7CR over Wi-Fi. Save folder set to a dedicated inbox path (e.g. `/Volumes/SSD/_ied_inbox/`).
-- [ ] 5 GHz Wi-Fi between AP and camera, with the AP close enough that single-RAF transfer stays under ~6 s. Bench-test by firing one shot in IED before committing to a roll.
+- [ ] Bench-test one Scanlight pulse before committing to a roll.
 
 ---
 
@@ -128,17 +152,13 @@ Verify these before powering anything:
 
 Run these top to bottom. Each step verifies an assumption before the next one runs.
 
-### Step 0 — Verify the in-tree SDK install (already done)
+### Step 0 — Choose camera path
 
-The Sony SDK is unzipped into `phase1/sony-capture/third_party/sony_sdk/` and Gatekeeper quarantine has been stripped. `phase1/sony-capture/build/sony-capture` already builds clean and the no-camera error path runs (see `phase1/sony-capture/third_party/sony_sdk/INSTALL.md` if a clean re-install is needed).
-
-To confirm the install survived (e.g., after a `git clean` or fresh clone where someone re-extracted the SDK), one command:
-
-```bash
-xattr -dr com.apple.quarantine phase1/sony-capture/third_party/sony_sdk
-```
-
-Idempotent — safe to run any time.
+For production scanning today, start with IED manual capture unless you
+are deliberately testing the now-verified `sony-capture` CLI path. If
+testing SDK capture, use the default host-PC mode; do not use
+`--remote-transfer` on the a7CR unless you are specifically investigating
+the contents-list `36101` failure.
 
 ### Step 1 — Plug in only the Scanlight first
 
@@ -173,41 +193,29 @@ scanlightctl status              # prints fw version, temp, vbus
 
 If all four colors light up, you're done with the Scanlight side.
 
-### Step 2 — Plug in the camera
+### Step 2 — Bring up Imaging Edge Desktop
 
-Camera USB-C → Mac. Dummy battery → wall power. Set the body to PC Remote mode (see pre-flight checklist).
+Dummy battery → wall power. Pair the camera to Imaging Edge Desktop and
+set IED to save RAWs into a dedicated inbox, for example
+`/Volumes/SSD/_ied_inbox/`. Fire one manual IED capture and confirm one
+new `.ARW` lands in that inbox.
 
-Build sony-capture (or rebuild if Step 0 was the first time stripping quarantine):
+### Step 3 — Smoke test current capture path
 
-```bash
-cd phase1/sony-capture
-# Install the SDK first if you haven't:
-#   - Unzip CrSDK_v2.01_Mac.zip somewhere
-#   - ln -sf /that/unpacked/path/app      third_party/sony_sdk/app
-#   - ln -sf /that/unpacked/path/external third_party/sony_sdk/external
-# Then:
-cmake -B build && cmake --build build
-```
-
-Run the full diagnose:
+Run the manual IED path first:
 
 ```bash
-python3 scripts/diagnose.py
+triplet-capture \
+    --roll-name SmokeManual \
+    --output-folder /Volumes/SSD/_smoke_manual \
+    --trigger-mode manual \
+    --ied-inbox /Volumes/SSD/_ied_inbox \
+    --capture-timeout-s 30
 ```
 
-Step 7 is the new one — it runs the sony-capture binary with a short timeout to see if the SDK enumerates the camera. If the camera is in PC Remote mode and the cable is data-capable, you'll see "camera enumerated by SDK" (the binary won't actually capture because the timeout is short and no shutter is fired — that's fine).
-
-### Step 3 — Smoke test (Phase 1 exit criteria)
-
-This is the test PROJECT.md calls the Phase 1 exit criteria:
-
-```bash
-scripts/smoketest.sh /tmp/smoke
-```
-
-It cycles `scanlightctl on r` → `sony-capture` → `on g` → `sony-capture` → `on b` → `sony-capture` → `off`, then verifies three .ARW files of plausible size (40–120 MB each) landed on disk.
-
-This is the moment that confirms Phase 1 actually works end-to-end. If this passes, every assumption in the codebase has been validated.
+Click Capture once. When the Scanlight changes color, manually fire one
+IED capture for R, one for G, and one for B. Confirm three files end up
+in `/Volumes/SSD/_smoke_manual/SmokeManual/` with canonical names.
 
 **Configuration B only — additionally verify the hardware-trigger path:**
 
@@ -231,7 +239,9 @@ triplet-capture \
 # /Volumes/SSD/_smoke_hw/SmokeHW/ with the canonical naming.
 ```
 
-If the IED inbox file doesn't appear within `--capture-timeout-s` of the pulse, you have a Wi-Fi or PC Remote pairing problem; the SDK path (Configuration A) is the fallback.
+If the IED inbox file doesn't appear within `--capture-timeout-s`, you
+have a Wi-Fi/IED pairing or save-folder problem. Fix that before trying
+the optional hardware-pulse path.
 
 ### Step 4 — Optical dry run
 
@@ -240,7 +250,12 @@ Paper deliverable. Walk through `docs/optical_dry_run.md` with a real film strip
 ### Step 5 — First real roll
 
 ```bash
-triplet-capture --roll-name TestRoll --output-folder /Volumes/SSD/Scans
+triplet-capture \
+    --roll-name TestRoll \
+    --output-folder /Volumes/SSD/Scans \
+    --trigger-mode manual \
+    --ied-inbox /Volumes/SSD/_ied_inbox \
+    --stream-composite
 # → http://127.0.0.1:8765
 ```
 
@@ -314,7 +329,14 @@ If the output looks wrong (e.g., heavy cyan cast, banding, posterization), the b
 
 ### Assumption 5 — Sony SDK lifecycle order is correct
 
-`sony-capture` follows the order from the official `RemoteCli.cpp` + `CameraDevice.cpp` sample: Init → EnumCameraObjects → CreateCameraObjectInfo → Connect → SetSaveInfo → SendCommand(Release, Down) → SendCommand(Release, Up) → wait OnCompleteDownload → Disconnect → ReleaseDevice → Release. If a capture *almost* works (camera fires) but the file doesn't show up, look at the SetSaveInfo path — the SDK may have written to a different location than expected.
+`sony-capture` follows this verified order for the working host-PC path:
+Init → EnumCameraObjects → Connect with `CrSdkControlMode_Remote` →
+SetSaveInfo → S1 lock → SendCommand(Release Down/Up) → wait
+OnCompleteDownload → atomic rename → Disconnect → ReleaseDevice →
+Release. If a capture fires but no file shows up, inspect SetSaveInfo and
+the scratch directory. The separate RemoteTransfer path connects and
+fires, but `GetRemoteTransferContentsInfoList` returns `36101` on the
+tested a7CR session.
 
 ### Assumption 6 — Settle time of 50 ms between LED switch and capture
 

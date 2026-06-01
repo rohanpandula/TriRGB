@@ -41,6 +41,7 @@ class CompositeResult:
     frame_number: int
     output_path: Optional[Path]  # None on failure
     error: Optional[str] = None  # set on failure
+    positive_path: Optional[Path] = None
 
     @property
     def ok(self) -> bool:
@@ -55,6 +56,7 @@ def _composite_job(
     output_format: str,
     ffc_calibration_dir: Optional[str],
     dng_camera_model: Optional[str],
+    positive_profile_json: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Top-level worker entrypoint (must be picklable for ProcessPoolExecutor).
 
@@ -76,6 +78,7 @@ def _composite_job(
             ffc_calibration_dir=Path(ffc_calibration_dir) if ffc_calibration_dir else None,
             output_format=output_format,
             dng_camera_model=dng_camera_model,
+            positive_profile_json=positive_profile_json,
         )
         return (str(out), None)
     except Exception as exc:  # noqa: BLE001 — isolate every failure
@@ -104,6 +107,7 @@ class CompositeWorker:
         output_format: str = "dng",
         ffc_calibration_dir: Optional[Path] = None,
         dng_camera_model: Optional[str] = None,
+        positive_profile_json: Optional[str] = None,
         executor=None,
         job_fn=None,
     ):
@@ -126,6 +130,7 @@ class CompositeWorker:
         self._output_format = output_format
         self._ffc = Path(ffc_calibration_dir) if ffc_calibration_dir else None
         self._camera_model = dng_camera_model
+        self._positive_profile_json = positive_profile_json
         self._executor = executor or ProcessPoolExecutor(max_workers=max_workers)
         self._job_fn = job_fn or _composite_job
         # _futures maps frame_number → (generation, Future). The generation
@@ -187,8 +192,7 @@ class CompositeWorker:
             gen = self._frame_gen.get(frame_number, 0) + 1
             self._frame_gen[frame_number] = gen
             temp_path = self._temp_output_path(frame_number, gen)
-            fut = self._executor.submit(
-                self._job_fn,
+            job_args = [
                 str(files["R"]),
                 str(files["G"]),
                 str(files["B"]),
@@ -196,6 +200,12 @@ class CompositeWorker:
                 self._output_format,
                 str(self._ffc) if self._ffc else None,
                 self._camera_model,
+            ]
+            if self._positive_profile_json is not None:
+                job_args.append(self._positive_profile_json)
+            fut = self._executor.submit(
+                self._job_fn,
+                *job_args,
             )
             self._futures[frame_number] = (gen, fut)
         logger.info(
@@ -222,6 +232,7 @@ class CompositeWorker:
                         self._frame_gen.get(frame_number, gen),
                         self._output_path(frame_number),
                         self._output_format,
+                        self._positive_profile_json is not None,
                     ))
                     del self._futures[frame_number]
             # Record every collected result so a second poll() caller (the
@@ -250,6 +261,7 @@ class CompositeWorker:
                 current_gens.get(frame_number, gen),
                 canonical_paths[frame_number],
                 self._output_format,
+                self._positive_profile_json is not None,
             ))
         # End-of-roll results belong in the history too.
         with self._lock:
@@ -264,6 +276,7 @@ class CompositeWorker:
         current_gen: int,
         canonical_path: Path,
         output_format: str,
+        write_positive: bool = False,
     ) -> CompositeResult:
         """Collect the result of a finished composite job.
 
@@ -320,6 +333,11 @@ class CompositeWorker:
                     actual_temp_path.with_suffix(ext).unlink(missing_ok=True)
                 except OSError:
                     pass
+            if write_positive:
+                try:
+                    actual_temp_path.with_name(actual_temp_path.stem + "_positive.tif").unlink(missing_ok=True)
+                except OSError:
+                    pass
             # Report as superseded (not an error — the retake job will win).
             return CompositeResult(
                 frame_number, None,
@@ -334,11 +352,17 @@ class CompositeWorker:
         # "both" promotes <temp>.tif + <temp>.dng (so the DNG isn't orphaned);
         # tiff/dng promotes only the returned path. (Audit M5; scoped per Codex.)
         final_canonical = canonical_path.with_suffix(actual_temp_path.suffix)
+        positive_canonical: Optional[Path] = None
         try:
             for ext in produced_exts:
                 temp_variant = actual_temp_path.with_suffix(ext)
                 if temp_variant.exists():
                     temp_variant.replace(canonical_path.with_suffix(ext))
+            if write_positive:
+                positive_temp = actual_temp_path.with_name(actual_temp_path.stem + "_positive.tif")
+                if positive_temp.exists():
+                    positive_canonical = canonical_path.with_name(canonical_path.stem + "_positive.tif")
+                    positive_temp.replace(positive_canonical)
         except OSError as exc:
             return CompositeResult(frame_number, None, f"rename failed: {exc}")
 
@@ -346,7 +370,7 @@ class CompositeWorker:
             "composite frame %d gen %d complete: %s",
             frame_number, job_gen, final_canonical,
         )
-        return CompositeResult(frame_number, final_canonical, None)
+        return CompositeResult(frame_number, final_canonical, None, positive_canonical)
 
     @property
     def pending(self) -> int:

@@ -6,13 +6,16 @@ invest more here than the operator needs to push a button per frame.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
 import sys
 import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from flask import Flask, jsonify, render_template, request
 from scanlight import Scanlight
@@ -29,6 +32,10 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     """
     app = Flask(__name__)
     app.config["ORCHESTRATOR"] = orchestrator
+    app.config["PROGRESS_STARTED_AT"] = None
+    app.config["LAST_CAL_RESULT"] = None
+    app.config["LAST_CAL_CALL_ID"] = None
+    app.config["CURRENT_CAL_CALL_ID"] = None
 
     @app.get("/")
     def index():
@@ -51,12 +58,16 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             allowed = {
                 "roll_name", "frame_number", "output_folder",
                 "level_r", "level_g", "level_b", "settle_ms",
+                "shutter_r", "shutter_g", "shutter_b",
             }
             updates = {k: v for k, v in data.items() if k in allowed}
             # Coerce ints
             for k in ("frame_number", "level_r", "level_g", "level_b", "settle_ms"):
                 if k in updates:
                     updates[k] = int(updates[k])
+            for k in ("shutter_r", "shutter_g", "shutter_b"):
+                if k in updates:
+                    updates[k] = str(updates[k]).strip() or None
             settings = orchestrator.update_settings(**updates)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
@@ -76,6 +87,68 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             "next_frame": orchestrator.settings.frame_number,
         }), (200 if result.success else 500)
 
+    @app.get("/api/calibrate/progress")
+    def get_calibrate_progress():
+        call_id = request.args.get("call_id") or None
+        recent_events = _recent_scan_log_events(
+            orchestrator.settings.output_folder,
+            since=app.config.get("PROGRESS_STARTED_AT"),
+            call_id=call_id,
+        )
+        if not recent_events:
+            return jsonify({
+                "event": "idle",
+                "message": "Waiting for calibration capture to start.",
+                "recent_events": [],
+            })
+
+        summarized_events = [_summarized_calibration_event(e) for e in recent_events]
+        response = dict(summarized_events[-1])
+        response["recent_events"] = summarized_events
+        return jsonify(response)
+
+    @app.get("/api/calibrate/exposure-result")
+    def get_calibrate_exposure_result():
+        requested_call_id = request.args.get("call_id") or None
+        result = app.config.get("LAST_CAL_RESULT", None)
+        if result is None:
+            return jsonify({"error": "No completed exposure calibration result yet."}), 404
+        if requested_call_id is not None and requested_call_id != app.config.get("LAST_CAL_CALL_ID"):
+            return jsonify({"error": "No completed exposure calibration result for this run."}), 404
+
+        body = json.loads(result.to_json())
+        if app.config.get("LAST_CAL_CALL_ID"):
+            body["call_id"] = app.config["LAST_CAL_CALL_ID"]
+        return jsonify(body)
+
+    @app.post("/api/calibrate/preview-light")
+    def post_calibrate_preview_light():
+        orch = app.config["ORCHESTRATOR"]
+        lock_acquired = orch._lock.acquire(blocking=False)
+        if not lock_acquired:
+            return jsonify({"error": "A capture is in progress — wait for it to finish."}), 409
+
+        try:
+            data = request.get_json(force=True, silent=True) or {}
+            enabled = bool(data.get("enabled", False))
+            try:
+                level = int(data.get("level", 200))
+            except (TypeError, ValueError) as e:
+                return jsonify({"error": f"level must be an integer: {e}"}), 400
+            if not 0 <= level <= 255:
+                return jsonify({"error": f"level must be 0-255, got {level}"}), 400
+
+            if enabled and level > 0:
+                orch._scanlight.set_color(r=0, g=0, b=0, w=level)
+                return jsonify({"enabled": True, "level": level})
+
+            orch._scanlight.off()
+            return jsonify({"enabled": False, "level": 0})
+        except Exception as e:  # noqa: BLE001 - surface hardware errors as JSON
+            return jsonify({"error": str(e)}), 500
+        finally:
+            orch._lock.release()
+
     @app.post("/api/calibrate/exposure")
     def post_calibrate_exposure():
         orch = app.config["ORCHESTRATOR"]
@@ -83,7 +156,10 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
         # internal _lock is the true serializer. This probe is a UX convenience only.
         lock_acquired = orch._lock.acquire(blocking=False)
         if not lock_acquired:
-            return jsonify({"error": "A scan is in progress — wait for it to finish."}), 409
+            return jsonify({
+                "error": "A scan is in progress — wait for it to finish.",
+                "call_id": app.config.get("CURRENT_CAL_CALL_ID"),
+            }), 409
         orch._lock.release()
 
         data = request.get_json(force=True, silent=True) or {}
@@ -105,6 +181,28 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             return jsonify({"error": f"rebate_w must be > 0, got {rebate_w}"}), 400
         if rebate_h <= 0:
             return jsonify({"error": f"rebate_h must be > 0, got {rebate_h}"}), 400
+
+        try:
+            target_fraction = float(data.get("target_fraction", 0.85))
+        except (ValueError, TypeError) as e:
+            return jsonify({"error": f"target_fraction must be numeric: {e}"}), 400
+        if not 0.5 <= target_fraction <= 0.9:
+            return jsonify({
+                "error": (
+                    "target_fraction must be between 0.50 and 0.90 "
+                    f"(got {target_fraction:.3f})"
+                )
+            }), 400
+
+        try:
+            seed_recipe = _parse_exposure_seed_recipe(data)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+        call_id = str(data.get("call_id") or uuid.uuid4())
+        app.config["CURRENT_CAL_CALL_ID"] = call_id
+        app.config["LAST_CAL_RESULT"] = None
+        app.config["LAST_CAL_CALL_ID"] = None
 
         from c41_core.contracts import BaseRegionDescriptor
         if rebate_col is not None and rebate_row is not None:
@@ -128,6 +226,20 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
         try:
             import json as _json
             from triplet_capture.calibrate_exposure import calibrate_exposure
+            _append_calibration_log(
+                orch,
+                "calibration_started",
+                call_id=call_id,
+                rebate_region={
+                    "x": base_region.x,
+                    "y": base_region.y,
+                    "w": base_region.w,
+                    "h": base_region.h,
+                    "source": base_region.source,
+                },
+                has_seed=seed_recipe is not None,
+                target_fraction=target_fraction,
+            )
             result = calibrate_exposure(
                 orch._scanlight,
                 orch.settings,
@@ -135,11 +247,20 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                 orchestrator=orch,
                 sleep=lambda _: None,
                 demosaic_factory=demosaic_factory,
+                seed_recipe=seed_recipe,
+                call_id=call_id,
+                target_fraction=target_fraction,
             )
             app.config["LAST_CAL_RESULT"] = result
-            return jsonify(_json.loads(result.to_json()))
+            app.config["LAST_CAL_CALL_ID"] = call_id
+            body = _json.loads(result.to_json())
+            body["call_id"] = call_id
+            return jsonify(body)
         except (RuntimeError, ValueError) as e:
             return jsonify({"error": str(e)}), 500
+        finally:
+            if app.config.get("CURRENT_CAL_CALL_ID") == call_id:
+                app.config["CURRENT_CAL_CALL_ID"] = None
 
     @app.post("/api/calibrate/ffc")
     def post_calibrate_ffc():
@@ -170,6 +291,51 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                 level_r=last_cal.r.led_level,
                 level_g=last_cal.g.led_level,
                 level_b=last_cal.b.led_level,
+                shutter_r=last_cal.r.shutter_speed or None,
+                shutter_g=last_cal.g.shutter_speed or None,
+                shutter_b=last_cal.b.shutter_speed or None,
+            )
+        elif all(k in data for k in (
+            "led_level_r", "led_level_g", "led_level_b",
+            "black_level_r", "black_level_g", "black_level_b",
+        )):
+            from c41_core import ChannelCalibration
+            try:
+                black_levels = (
+                    ChannelCalibration(
+                        channel="R",
+                        led_level=int(data["led_level_r"]),
+                        black_level=float(data["black_level_r"]),
+                        gain=1.0,
+                        clip_fraction=0.0,
+                        shutter_speed=str(data.get("shutter_r", "") or ""),
+                    ),
+                    ChannelCalibration(
+                        channel="G",
+                        led_level=int(data["led_level_g"]),
+                        black_level=float(data["black_level_g"]),
+                        gain=1.0,
+                        clip_fraction=0.0,
+                        shutter_speed=str(data.get("shutter_g", "") or ""),
+                    ),
+                    ChannelCalibration(
+                        channel="B",
+                        led_level=int(data["led_level_b"]),
+                        black_level=float(data["black_level_b"]),
+                        gain=1.0,
+                        clip_fraction=0.0,
+                        shutter_speed=str(data.get("shutter_b", "") or ""),
+                    ),
+                )
+            except (ValueError, TypeError) as e:
+                return jsonify({"error": f"calibration levels must be numeric: {e}"}), 400
+            orch.update_settings(
+                level_r=black_levels[0].led_level,
+                level_g=black_levels[1].led_level,
+                level_b=black_levels[2].led_level,
+                shutter_r=black_levels[0].shutter_speed or None,
+                shutter_g=black_levels[1].shutter_speed or None,
+                shutter_b=black_levels[2].shutter_speed or None,
             )
         else:
             from c41_core import ChannelCalibration
@@ -332,6 +498,7 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                 "frame_number": cr.frame_number,
                 "status": "done" if cr.ok else "failed",
                 "output_path": str(cr.output_path) if cr.output_path else None,
+                "positive_output_path": str(cr.positive_path) if cr.positive_path else None,
                 "error": cr.error,
             }
             for cr in composite_worker.history
@@ -354,7 +521,257 @@ def _settings_dict(s: CaptureSettings) -> dict:
         "level_g": s.level_g,
         "level_b": s.level_b,
         "settle_ms": s.settle_ms,
+        "shutter_r": s.shutter_r,
+        "shutter_g": s.shutter_g,
+        "shutter_b": s.shutter_b,
     }
+
+
+def _append_calibration_log(orch: Orchestrator, event: str, **kwargs: Any) -> None:
+    log_path = orch.settings.output_folder / "scan_log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    Orchestrator._append_log(
+        log_path,
+        event,
+        frame=orch.settings.frame_number,
+        roll=orch.settings.roll_name,
+        **kwargs,
+    )
+
+
+def _latest_scan_log_event(output_folder: Path) -> Optional[dict[str, Any]]:
+    events = _recent_scan_log_events(output_folder, limit=1)
+    return events[-1] if events else None
+
+
+def _recent_scan_log_events(
+    output_folder: Path,
+    limit: int = 40,
+    since: Optional[datetime] = None,
+    call_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    log_path = output_folder / "scan_log.jsonl"
+    if not log_path.exists():
+        return []
+
+    try:
+        lines = log_path.read_text().splitlines()
+    except OSError:
+        return []
+
+    events: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            if call_id is not None and parsed.get("call_id") != call_id:
+                continue
+            if since is not None and _event_is_before(parsed, since):
+                break
+            events.append(parsed)
+            if len(events) >= limit:
+                break
+    events.reverse()
+    return events
+
+
+def _event_is_before(event: dict[str, Any], since: datetime) -> bool:
+    raw_ts = event.get("ts")
+    if not isinstance(raw_ts, str) or not raw_ts:
+        return False
+    try:
+        event_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if event_ts.tzinfo is None:
+        event_ts = event_ts.replace(tzinfo=timezone.utc)
+    return event_ts < since
+
+
+def _parse_exposure_seed_recipe(data: dict[str, Any]) -> Optional[dict[str, tuple[int, str]]]:
+    raw = data.get("seed")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("seed must be an object keyed by R/G/B")
+
+    seed: dict[str, tuple[int, str]] = {}
+    for channel in ("R", "G", "B"):
+        raw_channel = raw.get(channel) or raw.get(channel.lower())
+        if raw_channel is None:
+            continue
+        if not isinstance(raw_channel, dict):
+            raise ValueError(f"seed.{channel} must be an object")
+        try:
+            level = int(raw_channel.get("led_level", raw_channel.get("level")))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"seed.{channel}.led_level must be an integer: {e}") from e
+        if not 0 <= level <= 255:
+            raise ValueError(f"seed.{channel}.led_level must be 0-255, got {level}")
+        shutter = str(raw_channel.get("shutter_speed", "") or "").strip()
+        seed[channel] = (level, shutter)
+
+    return seed or None
+
+
+def _summarized_calibration_event(event: dict[str, Any]) -> dict[str, Any]:
+    keys = {
+        "ts",
+        "event",
+        "call_id",
+        "channel",
+        "phase",
+        "level",
+        "shutter_speed",
+        "label",
+        "p99",
+        "p999",
+        "target",
+        "clip_fraction",
+        "sensor_clip_fraction",
+        "output_clip_fraction",
+        "next_level",
+        "next_shutter",
+        "source_level",
+        "source_shutter",
+        "source_p999",
+        "solve_hint",
+        "exposure_status",
+        "limit_reason",
+        "converged",
+        "error",
+    }
+    summarized = {k: event[k] for k in keys if k in event}
+    summarized["message"] = _calibration_progress_message(event)
+    return summarized
+
+
+def _calibration_progress_message(event: dict[str, Any]) -> str:
+    name = str(event.get("event", "idle"))
+    channel = str(event.get("channel") or "")
+    level = event.get("level")
+    shutter = event.get("shutter_speed")
+    label = str(event.get("label") or "")
+    try:
+        numeric_level = int(level or 0)
+    except (TypeError, ValueError):
+        numeric_level = 0
+
+    if name == "calibration_started":
+        return "Exposure calibration started; preparing the camera and Scanlight."
+    if name == "single_capture_start":
+        if label == "dark-frame":
+            return "Capturing dark frame with the Scanlight off."
+        return f"Starting {channel} exposure probe at LED {level}, shutter {shutter or 'camera-current'}."
+    if name == "scanlight_on":
+        if label == "dark-frame":
+            return "Scanlight is off for the dark frame."
+        if numeric_level <= 0:
+            return f"Scanlight is off for {label or channel or 'dark'} capture."
+        return f"Scanlight {channel} is on at LED {level}, shutter {shutter or 'camera-current'}."
+    if name == "sony_capture_start":
+        if label == "dark-frame":
+            return f"Camera is capturing/downloading the dark frame at shutter {shutter or 'camera-current'}."
+        return f"Camera is capturing/downloading {channel} RAW at shutter {shutter or 'camera-current'}."
+    if name == "sony_capture_ok":
+        return f"Captured {channel} RAW; measuring rebate exposure."
+    if name == "calibration_probe":
+        p99 = event.get("p99")
+        p999 = event.get("p999")
+        clip_fraction = event.get("clip_fraction")
+        sensor_clip_fraction = event.get("sensor_clip_fraction")
+        target = event.get("target")
+        next_level = event.get("next_level")
+        status = str(event.get("exposure_status") or "measured")
+        clip_text = f"clip {clip_fraction}"
+        if sensor_clip_fraction is not None:
+            clip_text = f"clip {clip_fraction}, sensor clip {sensor_clip_fraction}"
+        if event.get("converged"):
+            return (
+                f"{channel} exposure is target at LED {level}, shutter {shutter or 'camera-current'}; "
+                f"{clip_text}."
+            )
+        if next_level is not None:
+            if status == "clipped":
+                return (
+                    f"{channel} is clipped at LED {level}, shutter {shutter or 'camera-current'}; "
+                    f"{clip_text}. Backing off to LED {next_level}."
+                )
+            if status == "under":
+                return (
+                    f"{channel} is under target at LED {level}; p99.9 {p999} / {target}. "
+                    f"Trying LED {next_level}."
+                )
+            if status == "hot":
+                return (
+                    f"{channel} is hot at LED {level}; p99.9 {p999} / {target}. "
+                    f"Trying LED {next_level}."
+                )
+            return (
+                f"Measured {channel} p99.9 {p999} / {target}, p99 {p99}, "
+                f"{clip_text}; trying LED {next_level} next."
+            )
+        return f"Measured {channel} p99.9 {p999} / {target}, p99 {p99}, {clip_text}."
+    if name == "calibration_solve":
+        source_level = event.get("source_level")
+        source_shutter = event.get("source_shutter")
+        source_p999 = event.get("source_p999")
+        next_level = event.get("next_level")
+        next_shutter = event.get("next_shutter")
+        target = event.get("target")
+        return (
+            f"Solved {channel} from LED {source_level}, shutter {source_shutter or 'camera-current'}, "
+            f"p99.9 {source_p999} / {target}: try LED {next_level}, "
+            f"shutter {next_shutter or 'camera-current'}."
+        )
+    if name == "calibration_shutter_escalate":
+        source_level = event.get("source_level")
+        source_shutter = event.get("source_shutter")
+        source_p999 = event.get("source_p999")
+        next_level = event.get("next_level")
+        next_shutter = event.get("next_shutter")
+        target = event.get("target")
+        return (
+            f"{channel} hit LED ceiling at shutter {source_shutter}; "
+            f"p99.9 {source_p999} / {target}. Trying slower shutter "
+            f"{next_shutter} at LED {next_level}."
+        )
+    if name == "calibration_channel_complete":
+        raw_status = str(event.get("exposure_status") or "measured")
+        status = raw_status.replace("_", " ")
+        p99 = event.get("p99")
+        target = event.get("target")
+        clip_fraction = event.get("clip_fraction")
+        if raw_status == "source_limited":
+            status = "source RAW limited"
+        elif raw_status == "clip_limited":
+            status = "clean output limited"
+        return (
+            f"{channel} calibration finished: {status} at LED {level}, "
+            f"shutter {shutter or 'camera-current'}; p99.9 {p99} / {target}, clip {clip_fraction}."
+        )
+    if name == "calibration_complete":
+        levels = event.get("levels") or {}
+        shutters = event.get("shutters") or {}
+        statuses = event.get("statuses") or {}
+        return (
+            "Exposure calibration finished. "
+            f"R {levels.get('R')} @ {shutters.get('R')} ({statuses.get('R')}), "
+            f"G {levels.get('G')} @ {shutters.get('G')} ({statuses.get('G')}), "
+            f"B {levels.get('B')} @ {shutters.get('B')} ({statuses.get('B')})."
+        )
+    if name in {"sony_capture_fail", "single_capture_abort", "triplet_abort"}:
+        error = event.get("error")
+        return f"Capture failed: {error}" if error else "Capture failed."
+    if name == "single_capture_complete":
+        if label == "dark-frame":
+            return "Dark frame captured; starting RGB exposure probes."
+        return f"{channel} exposure probe captured; measuring next adjustment."
+    return name.replace("_", " ").capitalize() + "."
 
 
 # ---------- standalone entry point ----------
@@ -399,13 +816,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     p.add_argument(
         "--trigger-mode",
-        choices=("sdk", "hw"),
-        default="sdk",
+        choices=("sdk", "hw", "manual"),
+        default="manual",
         help=(
-            "How to fire the camera. 'sdk' = Mac → USB → SDK (default, "
-            "uses sony-capture). 'hw' = Scanlight pulses its 3.5mm trigger "
-            "output; the camera saves over Wi-Fi to Imaging Edge Desktop, "
-            "and we pick the file up from --ied-inbox."
+            "How to fire the camera. 'manual' = operator fires the shutter in "
+            "Imaging Edge Desktop while we set R/G/B and wait on --ied-inbox "
+            "(default, no SDK and no Scanlight shutter pulse). 'hw' = Scanlight "
+            "pulses its 3.5mm trigger output; the camera saves over Wi-Fi to "
+            "IED and we pick the file up from --ied-inbox. 'sdk' = Sony SDK "
+            "via sony-capture over Wi-Fi."
         ),
     )
     p.add_argument(
@@ -413,7 +832,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help=(
             "Imaging Edge Desktop's save folder (required when "
-            "--trigger-mode hw). Files arriving here are moved into "
+            "--trigger-mode hw or manual). Files arriving here are moved into "
             "the roll's canonical naming convention."
         ),
     )
@@ -434,9 +853,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=30,
         help=(
             "Per-channel capture timeout. In sdk mode this caps the "
-            "sony-capture subprocess; in hw mode this caps how long we "
-            "wait for a file to land in --ied-inbox after pulsing. "
-            "Bump to 60+ on slow Wi-Fi."
+            "sony-capture subprocess; in hw/manual mode this caps how long we "
+            "wait for a file to land in --ied-inbox after the pulse or manual "
+            "IED trigger. Bump to 60+ on slow Wi-Fi."
         ),
     )
     p.add_argument(
@@ -447,17 +866,60 @@ def main(argv: Optional[list[str]] = None) -> int:
             "How long an ARW file's size must hold steady in --ied-inbox "
             "before we treat the download as complete. Default 3.0 s — "
             "bump if you see partial files moved (signals: downstream "
-            "decode failures, truncated RAFs). hw mode only."
+            "decode failures, truncated RAFs). hw/manual modes only."
         ),
     )
     p.add_argument(
         "--inbox-poll-interval-s",
         type=float,
         default=0.2,
-        help="How often to re-scan --ied-inbox while waiting. hw mode only.",
+        help="How often to re-scan --ied-inbox while waiting. hw/manual modes only.",
     )
     p.add_argument("--sony-capture", default="sony-capture",
                    help="Path to the sony-capture binary (default: search $PATH).")
+    p.add_argument(
+        "--sony-ip-address",
+        default=None,
+        help="Sony Camera Remote SDK Wi-Fi IP address for --trigger-mode sdk.",
+    )
+    p.add_argument(
+        "--sony-mac-address",
+        default=None,
+        help="Optional Sony camera MAC address for SDK direct-IP sessions.",
+    )
+    p.add_argument(
+        "--sony-user",
+        default=None,
+        help="Sony Access Authentication username for SDK Wi-Fi sessions.",
+    )
+    p.add_argument(
+        "--sony-password",
+        default=None,
+        help="Sony Access Authentication password for SDK Wi-Fi sessions.",
+    )
+    p.add_argument(
+        "--sony-iso",
+        default="100or125",
+        help=(
+            "ISO value passed to sony-capture in SDK mode. Default '100or125' "
+            "selects ISO 100 when available, otherwise ISO 125; ISO 50 is not used."
+        ),
+    )
+    p.add_argument(
+        "--shutter-r",
+        default=None,
+        help="SDK shutter speed for red captures, e.g. 1/4. Empty uses camera-current.",
+    )
+    p.add_argument(
+        "--shutter-g",
+        default=None,
+        help="SDK shutter speed for green captures, e.g. 1/4. Empty uses camera-current.",
+    )
+    p.add_argument(
+        "--shutter-b",
+        default=None,
+        help="SDK shutter speed for blue captures, e.g. 1/4. Empty uses camera-current.",
+    )
     p.add_argument(
         "--stream-composite",
         action="store_true",
@@ -498,6 +960,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     p.add_argument(
+        "--positive-profile-json",
+        default=None,
+        help=(
+            "Base-region JSON from the selected stock calibration profile. "
+            "Only used with --stream-composite. When present, each composite "
+            "also gets a sibling *_positive.tif rendered with d-min balance, "
+            "inversion, automatic levels, and a display curve."
+        ),
+    )
+    p.add_argument(
         "--no-browser",
         action="store_true",
         help="Start in headless mode; suppresses the startup browser-launch hint.",
@@ -509,9 +981,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    if args.trigger_mode == "hw" and not args.ied_inbox:
+    if args.trigger_mode in ("hw", "manual") and not args.ied_inbox:
         print(
-            "triplet-capture: --trigger-mode hw requires --ied-inbox PATH "
+            f"triplet-capture: --trigger-mode {args.trigger_mode} requires --ied-inbox PATH "
             "(Imaging Edge Desktop's save folder).",
             file=sys.stderr,
         )
@@ -524,6 +996,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         output_folder=output_folder,
         sony_capture_path=args.sony_capture,
         sony_capture_timeout_s=args.capture_timeout_s,
+        sony_ip_address=args.sony_ip_address,
+        sony_mac_address=args.sony_mac_address,
+        sony_user=args.sony_user,
+        sony_password=args.sony_password,
+        sony_iso=args.sony_iso,
+        shutter_r=args.shutter_r,
+        shutter_g=args.shutter_g,
+        shutter_b=args.shutter_b,
         trigger_mode=args.trigger_mode,
         shutter_pulse_ms=args.shutter_pulse_ms,
         inbox_stable_for_s=args.inbox_stable_for_s,
@@ -557,6 +1037,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             output_format=args.composite_format,
             ffc_calibration_dir=Path(args.ffc_calibration) if args.ffc_calibration else None,
             dng_camera_model=args.camera_model,
+            positive_profile_json=args.positive_profile_json,
         )
 
         def on_triplet_complete(result):
@@ -577,6 +1058,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         orch = Orchestrator(scanlight, settings, on_triplet_complete=on_triplet_complete)
         app = create_app(orch, composite_worker=composite_worker, ready_nonce=args.ready_nonce)
+        app.config["PROGRESS_STARTED_AT"] = datetime.now(timezone.utc)
 
         if args.web_port == 0:
             # Child-owned ephemeral port path: bind to port 0, let the OS pick,

@@ -42,7 +42,9 @@ struct ScanlightView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         if viewModel.portOwner != .idle {
-                            Text("Serial port is held by an active \(viewModel.portOwner == .scanning ? "scan" : "calibration") — stop it before connecting here.")
+                            Text(viewModel.portOwner == .scanning
+                                 ? "Light is being driven by Scan. Controls unlock when scanning stops."
+                                 : "Light is being driven by Calibrate. Controls unlock when calibration stops.")
                                 .font(.caption)
                                 .foregroundStyle(Theme.State.warning)
                         }
@@ -95,32 +97,28 @@ struct ScanlightView: View {
                 GroupBox(label: Text("Channels")) {
                     VStack(spacing: Theme.Space.md) {
                         channelRow(
-                            label: "Red", tint: Theme.Channel.red,
+                            label: "Red", tint: Theme.Channel.red, channel: .red,
                             level: $viewModel.redLevel,
                             sliderId: AccessibilityID.redSlider,
-                            onButtonId: AccessibilityID.redOnButton,
-                            onAction: { viewModel.turnOnRed() }
+                            onButtonId: AccessibilityID.redOnButton
                         )
                         channelRow(
-                            label: "Green", tint: Theme.Channel.green,
+                            label: "Green", tint: Theme.Channel.green, channel: .green,
                             level: $viewModel.greenLevel,
                             sliderId: AccessibilityID.greenSlider,
-                            onButtonId: AccessibilityID.greenOnButton,
-                            onAction: { viewModel.turnOnGreen() }
+                            onButtonId: AccessibilityID.greenOnButton
                         )
                         channelRow(
-                            label: "Blue", tint: Theme.Channel.blue,
+                            label: "Blue", tint: Theme.Channel.blue, channel: .blue,
                             level: $viewModel.blueLevel,
                             sliderId: AccessibilityID.blueSlider,
-                            onButtonId: AccessibilityID.blueOnButton,
-                            onAction: { viewModel.turnOnBlue() }
+                            onButtonId: AccessibilityID.blueOnButton
                         )
                         channelRow(
-                            label: "White", tint: Theme.Channel.white,
+                            label: "White", tint: Theme.Channel.white, channel: .white,
                             level: $viewModel.whiteLevel,
                             sliderId: AccessibilityID.whiteSlider,
-                            onButtonId: AccessibilityID.whiteOnButton,
-                            onAction: { viewModel.turnOnWhite() }
+                            onButtonId: AccessibilityID.whiteOnButton
                         )
                     }
                 }
@@ -130,15 +128,12 @@ struct ScanlightView: View {
                 GroupBox(label: Text("Actions")) {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         HStack(spacing: Theme.Space.md) {
-                            Button("Set RGB") { viewModel.setAllRGB() }
-                                .accessibilityIdentifier(AccessibilityID.setAllRGBButton)
-                                .buttonStyle(.borderedProminent)
-
                             Button("All Off") { viewModel.allOff() }
                                 .accessibilityIdentifier(AccessibilityID.allChannelsOffButton)
                                 .buttonStyle(.bordered)
+                                .disabled(!viewModel.manualControlsEnabled)
                         }
-                        Text("White and RGB are mutually exclusive — the firmware blocks them together.")
+                        Text("Turns off every light channel.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -165,6 +160,7 @@ struct ScanlightView: View {
                                 .accessibilityIdentifier(AccessibilityID.firePulseButton)
                                 .buttonStyle(.borderedProminent)
                                 .padding(.leading, Theme.Space.xs)
+                                .disabled(!viewModel.manualControlsEnabled)
                         }
                         Text("10–2550 ms, in steps of 10.")
                             .font(.caption)
@@ -256,39 +252,73 @@ struct ScanlightView: View {
 
     // MARK: - Private helpers
 
+    /// One channel: a tap-to-toggle switch (on at full brightness, exclusive)
+    /// plus a slider that live-dims the channel while it's on.
     @ViewBuilder
     private func channelRow(
         label: String,
         tint: Color,
+        channel: ScanlightViewModel.LightChannel,
         level: Binding<Double>,
         sliderId: String,
-        onButtonId: String,
-        onAction: @escaping () -> Void
+        onButtonId: String
     ) -> some View {
+        let isOn = viewModel.activeChannel == channel
         HStack(spacing: Theme.Space.md) {
-            HStack(spacing: Theme.Space.sm) {
-                Circle()
-                    .fill(tint)
-                    .frame(width: 9, height: 9)
-                    .accessibilityHidden(true)
-                Text(label)
-                    .font(.subheadline)
-                    .frame(width: 46, alignment: .leading)
-            }
+            channelToggle(label: label, tint: tint, channel: channel,
+                          isOn: isOn, onButtonId: onButtonId)
             Slider(value: level, in: 0...255)
                 .accessibilityIdentifier(sliderId)
                 .tint(tint)
-                .frame(minWidth: 140)
+                .frame(minWidth: 130)
+                .disabled(!viewModel.manualControlsEnabled)
+                .onChange(of: level.wrappedValue) { newValue in
+                    viewModel.setLevel(channel, to: newValue)
+                }
             Text("\(Int(level.wrappedValue))")
                 .font(.body)
                 .monospacedDigit()
-                .foregroundStyle(tint)
+                .foregroundStyle(isOn ? tint : Color.secondary)
                 .frame(width: 36, alignment: .trailing)
-            Button("On") { onAction() }
+        }
+    }
+
+    /// The channel switch: tap to turn this channel on at full brightness
+    /// (exclusive — others go off), tap again to turn it off. Filled when on.
+    @ViewBuilder
+    private func channelToggle(
+        label: String,
+        tint: Color,
+        channel: ScanlightViewModel.LightChannel,
+        isOn: Bool,
+        onButtonId: String
+    ) -> some View {
+        let content = HStack(spacing: Theme.Space.sm) {
+            Circle()
+                .fill(isOn ? tint : tint.opacity(0.25))
+                .frame(width: 10, height: 10)
+            Text(label)
+                .font(.subheadline.weight(.medium))
+            Spacer(minLength: Theme.Space.sm)
+            Text(isOn ? "ON" : "OFF")
+                .font(.caption2.weight(.bold))
+                .monospacedDigit()
+        }
+        .frame(width: 104)
+        .contentShape(Rectangle())
+
+        if isOn {
+            Button(action: { viewModel.toggle(channel) }) { content }
+                .accessibilityIdentifier(onButtonId)
+                .buttonStyle(.borderedProminent)
+                .tint(tint)
+                .disabled(!viewModel.manualControlsEnabled)
+        } else {
+            Button(action: { viewModel.toggle(channel) }) { content }
                 .accessibilityIdentifier(onButtonId)
                 .buttonStyle(.bordered)
-                .controlSize(.small)
                 .tint(tint)
+                .disabled(!viewModel.manualControlsEnabled)
         }
     }
 }

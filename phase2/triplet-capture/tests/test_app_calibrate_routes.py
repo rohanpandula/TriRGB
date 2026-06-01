@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -140,7 +141,7 @@ def test_calibrate_exposure_route(app_and_orch):
     app, _ = app_and_orch
     client = app.test_client()
 
-    r = client.post("/api/calibrate/exposure", json={})
+    r = client.post("/api/calibrate/exposure", json={"call_id": "run-001"})
     assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.data}"
     body = r.get_json()
     # Top-level keys: r, g, b, base_region, ffc_cal_dir, schema_version
@@ -151,8 +152,231 @@ def test_calibrate_exposure_route(app_and_orch):
         assert "black_level" in ch_data, f"missing black_level in {ch}"
         assert "gain" in ch_data, f"missing gain in {ch}"
         assert "clip_fraction" in ch_data, f"missing clip_fraction in {ch}"
+        assert "shutter_speed" in ch_data, f"missing shutter_speed in {ch}"
     assert "base_region" in body
+    assert body["base_region"]["base_rgb"] != [8930.0, 12097.0, 2952.0]
+    assert body["base_region"]["base_rgb"] == pytest.approx([
+        body["r"]["p99"],
+        body["g"]["p99"],
+        body["b"]["p99"],
+    ])
     assert "ffc_cal_dir" in body
+    assert body["call_id"] == "run-001"
+
+    result_r = client.get("/api/calibrate/exposure-result")
+    assert result_r.status_code == 200
+    assert result_r.get_json()["r"]["led_level"] == body["r"]["led_level"]
+
+    result_for_call = client.get("/api/calibrate/exposure-result?call_id=run-001")
+    assert result_for_call.status_code == 200
+    assert result_for_call.get_json()["call_id"] == "run-001"
+
+    stale_result = client.get("/api/calibrate/exposure-result?call_id=old-run")
+    assert stale_result.status_code == 404
+
+    log_path = app_and_orch[1].settings.output_folder / "scan_log.jsonl"
+    events = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(
+        event["event"] == "calibration_started" and event["call_id"] == "run-001"
+        for event in events
+    )
+    assert any(
+        event["event"] == "calibration_complete" and "base_rgb" in event
+        for event in events
+    )
+
+
+def test_calibrate_exposure_route_accepts_target_fraction(app_and_orch):
+    """The app can request a lower exposure target for extra RAW headroom."""
+    app, _ = app_and_orch
+    client = app.test_client()
+
+    r = client.post(
+        "/api/calibrate/exposure",
+        json={"call_id": "run-080", "target_fraction": 0.80},
+    )
+
+    assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.data}"
+    body = r.get_json()
+    assert 52000 <= body["r"]["target"] <= 52500
+    assert body["call_id"] == "run-080"
+
+
+def test_calibrate_exposure_route_rejects_bad_target_fraction(app_and_orch):
+    app, _ = app_and_orch
+    client = app.test_client()
+
+    r = client.post("/api/calibrate/exposure", json={"target_fraction": 0.95})
+
+    assert r.status_code == 400
+    assert "target_fraction" in r.get_json()["error"]
+
+
+def test_calibrate_exposure_result_route_404_before_completion(app_and_orch):
+    """GET /api/calibrate/exposure-result lets Swift reattach after completion."""
+    app, _ = app_and_orch
+    client = app.test_client()
+
+    r = client.get("/api/calibrate/exposure-result")
+
+    assert r.status_code == 404
+    assert "error" in r.get_json()
+
+
+def test_calibrate_progress_route_reports_latest_scan_log_event(app_and_orch):
+    """GET /api/calibrate/progress turns the JSONL tail into operator status text."""
+    app, orch = app_and_orch
+    log_path = orch.settings.output_folder / "scan_log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        json.dumps({
+            "ts": "2026-05-23T05:47:43.983356+00:00",
+            "event": "sony_capture_start",
+            "frame": 1,
+            "roll": "CalibTest",
+            "channel": "R",
+            "out": "/tmp/CalibTest_Frame001_Cal_R.ARW",
+            "shutter_speed": "1/2",
+        }) + "\n"
+    )
+
+    client = app.test_client()
+    r = client.get("/api/calibrate/progress")
+
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["event"] == "sony_capture_start"
+    assert body["channel"] == "R"
+    assert body["shutter_speed"] == "1/2"
+    assert "capturing/downloading R RAW" in body["message"]
+    assert body["recent_events"][0]["event"] == "sony_capture_start"
+    assert "capturing/downloading R RAW" in body["recent_events"][0]["message"]
+
+    log_path.write_text(
+        json.dumps({
+            "ts": "2026-05-23T06:02:04.312322+00:00",
+            "event": "calibration_probe",
+            "frame": 1,
+            "roll": "CalibTest",
+            "channel": "R",
+            "level": 128,
+            "shutter_speed": "1/2",
+            "p99": 51234.0,
+            "target": 62258,
+            "next_level": 156,
+            "converged": False,
+        }) + "\n"
+    )
+
+    r = client.get("/api/calibrate/progress")
+    body = r.get_json()
+    assert body["event"] == "calibration_probe"
+    assert "trying LED 156 next" in body["message"]
+    assert body["recent_events"][0]["event"] == "calibration_probe"
+    assert "trying LED 156 next" in body["recent_events"][0]["message"]
+
+    log_path.write_text(
+        json.dumps({
+            "ts": "2026-05-23T06:05:04.312322+00:00",
+            "event": "sony_capture_start",
+            "frame": 1,
+            "roll": "CalibTest",
+            "channel": "R",
+            "label": "dark-frame",
+            "out": "/tmp/CalibTest_Frame001_Cal_Dark.ARW",
+            "shutter_speed": "1/40",
+        }) + "\n"
+    )
+
+    r = client.get("/api/calibrate/progress")
+    body = r.get_json()
+    assert "dark frame" in body["message"]
+    assert "R RAW" not in body["message"]
+
+
+def test_calibrate_progress_route_ignores_events_before_backend_start(app_and_orch):
+    """Current-run progress should not replay stale scan_log rows from a prior backend."""
+    app, orch = app_and_orch
+    app.config["PROGRESS_STARTED_AT"] = datetime(2026, 5, 23, 6, 0, tzinfo=timezone.utc)
+    log_path = orch.settings.output_folder / "scan_log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old_event = {
+        "ts": "2026-05-23T05:47:43.983356+00:00",
+        "event": "sony_capture_start",
+        "channel": "R",
+        "shutter_speed": "1/2",
+    }
+    new_event = {
+        "ts": "2026-05-23T06:02:04.312322+00:00",
+        "event": "calibration_probe",
+        "channel": "G",
+        "level": 192,
+        "shutter_speed": "1/40",
+        "p99": 59000.0,
+        "target": 62258,
+        "next_level": 208,
+        "converged": False,
+    }
+    log_path.write_text(json.dumps(old_event) + "\n" + json.dumps(new_event) + "\n")
+
+    body = app.test_client().get("/api/calibrate/progress").get_json()
+
+    assert body["event"] == "calibration_probe"
+    assert [event["event"] for event in body["recent_events"]] == ["calibration_probe"]
+
+    log_path.write_text(json.dumps(old_event) + "\n")
+    body = app.test_client().get("/api/calibrate/progress").get_json()
+    assert body["event"] == "idle"
+    assert body["recent_events"] == []
+
+
+def test_calibrate_progress_route_filters_by_call_id(app_and_orch):
+    """Current-run progress should not replay events from a different calibration run."""
+    app, orch = app_and_orch
+    log_path = orch.settings.output_folder / "scan_log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    old_event = {
+        "ts": "2026-05-23T06:01:00+00:00",
+        "event": "calibration_started",
+        "call_id": "old-run",
+    }
+    current_event = {
+        "ts": "2026-05-23T06:02:00+00:00",
+        "event": "calibration_started",
+        "call_id": "current-run",
+    }
+    log_path.write_text(json.dumps(old_event) + "\n" + json.dumps(current_event) + "\n")
+
+    body = app.test_client().get(
+        "/api/calibrate/progress?call_id=current-run"
+    ).get_json()
+
+    assert body["event"] == "calibration_started"
+    assert body["call_id"] == "current-run"
+    assert [event["call_id"] for event in body["recent_events"]] == ["current-run"]
+
+    missing = app.test_client().get(
+        "/api/calibrate/progress?call_id=missing-run"
+    ).get_json()
+    assert missing["event"] == "idle"
+    assert missing["recent_events"] == []
+
+
+def test_calibrate_preview_light_route_controls_white_light(app_and_orch):
+    """POST /api/calibrate/preview-light drives backend-owned white preview light."""
+    app, orch = app_and_orch
+    client = app.test_client()
+
+    r = client.post("/api/calibrate/preview-light", json={"enabled": True, "level": 177})
+    assert r.status_code == 200
+    assert r.get_json() == {"enabled": True, "level": 177}
+    assert orch._scanlight.calls[-1] == ("set_color", 0, 0, 0, 177, False)
+
+    r = client.post("/api/calibrate/preview-light", json={"enabled": False})
+    assert r.status_code == 200
+    assert r.get_json() == {"enabled": False, "level": 0}
+    assert orch._scanlight.calls[-1] == ("off",)
 
 
 def test_calibrate_exposure_route_rebate_bounds(app_and_orch):
@@ -207,6 +431,33 @@ def test_calibrate_ffc_route(app_and_orch):
         assert "verdict" in ch_data, f"missing verdict in inspection.channels.{ch}"
 
 
+def test_calibrate_ffc_route_uses_posted_exposure_without_last_cal(app_and_orch):
+    """The Swift app sends exposureResult into the FFC route; honor it even if
+    LAST_CAL_RESULT is not populated in this process."""
+    app, orch = app_and_orch
+    client = app.test_client()
+
+    r = client.post("/api/calibrate/ffc", json={
+        "led_level_r": 120,
+        "led_level_g": 130,
+        "led_level_b": 140,
+        "black_level_r": 256.0,
+        "black_level_g": 256.0,
+        "black_level_b": 256.0,
+        "shutter_r": "1/8",
+        "shutter_g": "1/4",
+        "shutter_b": "1/2",
+    })
+
+    assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.data}"
+    assert orch.settings.level_r == 120
+    assert orch.settings.level_g == 130
+    assert orch.settings.level_b == 140
+    assert orch.settings.shutter_r == "1/8"
+    assert orch.settings.shutter_g == "1/4"
+    assert orch.settings.shutter_b == "1/2"
+
+
 def test_calibrate_ffc_n_frames_bad_input_returns_400(app_and_orch):
     """FIX-D: non-integer n_frames must return 400, not 500."""
     app, _ = app_and_orch
@@ -253,6 +504,7 @@ def test_calibrate_route_locked_returns_409(app_and_orch):
     client = app.test_client()
 
     # Acquire the lock to simulate a capture in progress
+    app.config["CURRENT_CAL_CALL_ID"] = "active-run"
     acquired = orch._lock.acquire(blocking=False)
     assert acquired, "could not acquire lock for test setup"
     try:
@@ -260,6 +512,7 @@ def test_calibrate_route_locked_returns_409(app_and_orch):
         assert r.status_code == 409, (
             f"expected 409 when lock is held, got {r.status_code}: {r.data}"
         )
+        assert r.get_json()["call_id"] == "active-run"
     finally:
         orch._lock.release()
 

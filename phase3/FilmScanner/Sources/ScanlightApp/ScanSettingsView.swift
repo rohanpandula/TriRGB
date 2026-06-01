@@ -2,14 +2,15 @@
 //
 // Validation: store.validate() mirrors CaptureSettings.__post_init__ rules.
 // Inline errors appear as a danger Banner below the offending control.
+// There is no Save button: controls update SettingsStore immediately, and
+// runtime-safe settings are pushed to a running orchestrator as they change.
 //
 // Folder pickers delegate to store.folderPicker (injectable in tests to avoid
 // real NSOpenPanel in headless runs).
 //
 // Visual language: shared PanelGroupBoxStyle + Theme tokens (see DesignSystem).
-// All AccessibilityIDs, element types, and the conditional rendering of the
-// HW-trigger inbox row and the composite-format picker are preserved exactly —
-// the AX-ID coverage gate (SettingsCalibrationUITests) depends on them.
+// All AccessibilityIDs and conditional rendering for the IED inbox row and
+// composite-format picker are kept stable for automation.
 
 import SwiftUI
 
@@ -19,9 +20,12 @@ struct ScanSettingsView: View {
     /// orchestrator is running (R-20). Not @StateObject here — AppMain owns
     /// the lifetime.
     @ObservedObject var orchestratorClient: OrchestratorClient
+    @ObservedObject var lightViewModel: ScanlightViewModel
+    @ObservedObject var cameraConnection: SonyCameraConnection
 
     /// Local state for camera model "Custom…" text entry.
     @State private var customCameraModel: String = ""
+    @State private var sonyLiveViewActive: Bool = false
 
     var body: some View {
         ScrollView {
@@ -39,6 +43,9 @@ struct ScanSettingsView: View {
                             TextField("Roll001", text: $store.settings.rollName)
                                 .accessibilityIdentifier(AccessibilityID.settingsRollNameField)
                                 .textFieldStyle(.roundedBorder)
+                                .onChange(of: store.settings.rollName) { _ in
+                                    refreshValidationIfNeeded()
+                                }
                         }
                         validationError("rollName")
                     }
@@ -55,7 +62,10 @@ struct ScanSettingsView: View {
                             path: store.settings.outputFolder,
                             placeholder: "No folder selected",
                             prompt: "Select output folder"
-                        ) { url in store.settings.outputFolder = url.path }
+                        ) { url in
+                            store.settings.outputFolder = url.path
+                            refreshValidationIfNeeded()
+                        }
                         validationError("outputFolder")
                     }
                 }
@@ -65,20 +75,58 @@ struct ScanSettingsView: View {
                 GroupBox(label: Text("Trigger")) {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Picker("Trigger", selection: $store.settings.triggerMode) {
-                            Text("Hardware").tag("hw")
+                            Text("Manual").tag("manual")
+                            Text("Pulse").tag("hw")
                             Text("SDK").tag("sdk")
                         }
                         .pickerStyle(.segmented)
                         .labelsHidden()
                         .accessibilityIdentifier(AccessibilityID.settingsTriggerModePicker)
+                        .onChange(of: store.settings.triggerMode) { _ in
+                            refreshValidationIfNeeded()
+                        }
 
-                        Text(store.settings.triggerMode == "hw"
-                             ? "Scanlight fires the shutter over the 3.5 mm jack; RAWs arrive in the IED inbox."
-                             : "The Sony SDK fires the shutter over USB tether.")
+                        Text(triggerModeHelp)
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
-                        if store.settings.triggerMode == "hw" {
+                        if store.settings.triggerMode == "sdk" {
+                            HStack(spacing: Theme.Space.md) {
+                                Button(cameraConnection.isChecking ? "Checking..." : "Check Camera") {
+                                    Task { await checkSonyConnection() }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(cameraConnection.isChecking || orchestratorClient.isRunning || sonyLiveViewActive)
+                                .accessibilityIdentifier(AccessibilityID.settingsSonyConnectButton)
+
+                                HStack(spacing: Theme.Space.sm) {
+                                    StatusDot(color: cameraConnection.tint)
+                                    Text(cameraConnection.statusText)
+                                        .font(.caption)
+                                        .foregroundStyle(cameraConnection.tint)
+                                        .lineLimit(2)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .accessibilityIdentifier(AccessibilityID.settingsSonyConnectionStatusLabel)
+                                .accessibilityLabel(cameraConnection.statusText)
+
+                                Spacer(minLength: 0)
+                            }
+
+                            Text(cameraConnection.detailText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            SonyLiveViewPanel(
+                                settings: store.settings,
+                                orchestratorClient: orchestratorClient,
+                                lightViewModel: lightViewModel,
+                                isLiveViewActive: $sonyLiveViewActive
+                            )
+                        }
+
+                        if usesIedInbox {
                             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                                 folderRow(
                                     label: "IED inbox",
@@ -87,36 +135,17 @@ struct ScanSettingsView: View {
                                     path: store.settings.iedInbox ?? "",
                                     placeholder: "No folder selected",
                                     prompt: "Select IED inbox folder"
-                                ) { url in store.settings.iedInbox = url.path }
+                                ) { url in
+                                    store.settings.iedInbox = url.path
+                                    refreshValidationIfNeeded()
+                                }
                                 validationError("iedInbox")
                             }
                         }
                     }
                 }
 
-                // MARK: 4. Levels
-
-                GroupBox(label: Text("Levels")) {
-                    VStack(spacing: Theme.Space.md) {
-                        settingsChannelRow(
-                            label: "Red", tint: Theme.Channel.red,
-                            level: Binding(get: { store.settings.levelR }, set: { store.settings.levelR = $0 }),
-                            sliderId: AccessibilityID.settingsLevelRSlider
-                        )
-                        settingsChannelRow(
-                            label: "Green", tint: Theme.Channel.green,
-                            level: Binding(get: { store.settings.levelG }, set: { store.settings.levelG = $0 }),
-                            sliderId: AccessibilityID.settingsLevelGSlider
-                        )
-                        settingsChannelRow(
-                            label: "Blue", tint: Theme.Channel.blue,
-                            level: Binding(get: { store.settings.levelB }, set: { store.settings.levelB = $0 }),
-                            sliderId: AccessibilityID.settingsLevelBSlider
-                        )
-                    }
-                }
-
-                // MARK: 5. Timing
+                // MARK: 4. Timing
 
                 GroupBox(label: Text("Timing")) {
                     HStack(spacing: Theme.Space.md) {
@@ -130,14 +159,36 @@ struct ScanSettingsView: View {
                             .accessibilityIdentifier(AccessibilityID.settingsSettleStepper)
                             .monospacedDigit()
                             .fixedSize()
+                            .onChange(of: store.settings.settleMs) { _ in
+                                Task { await applyRuntimeSettingsIfRunning() }
+                            }
                         Spacer()
                     }
                 }
 
-                // MARK: 6. Calibration (FFC dir)
+                // MARK: 5. Calibration (FFC dir)
 
                 GroupBox(label: Text("Calibration")) {
                     VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        HStack(spacing: Theme.Space.md) {
+                            Text("Target")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 96, alignment: .leading)
+                            Picker("Exposure target", selection: calibrationTargetPercentBinding) {
+                                Text("75%").tag(75)
+                                Text("80%").tag(80)
+                                Text("85%").tag(85)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(maxWidth: 260)
+                            Spacer()
+                        }
+                        Text("Lower targets keep more RAW headroom. 80% is the default for this rig.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
                         folderRow(
                             label: "FFC dir",
                             buttonId: AccessibilityID.settingsPickFfcBtn,
@@ -156,7 +207,7 @@ struct ScanSettingsView: View {
                     }
                 }
 
-                // MARK: 7. Camera
+                // MARK: 6. Camera
 
                 GroupBox(label: Text("Camera")) {
                     VStack(alignment: .leading, spacing: Theme.Space.sm) {
@@ -206,15 +257,63 @@ struct ScanSettingsView: View {
                                     }
                                 }
                         }
+
+                        if store.settings.triggerMode == "sdk" {
+                            Divider()
+                                .padding(.vertical, Theme.Space.xs)
+
+                            Text("Sony SDK uses Wi-Fi PC Remote and saves each ARW directly to the roll folder.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            settingsTextFieldRow(
+                                label: "IP",
+                                placeholder: "Camera IP, e.g. 10.0.0.x",
+                                id: AccessibilityID.settingsSonyIpField,
+                                text: optionalStringBinding(\.sonyIpAddress)
+                            )
+                            validationError("sonyIpAddress")
+
+                            settingsTextFieldRow(
+                                label: "MAC",
+                                placeholder: "Camera MAC from Access Auth screen",
+                                id: AccessibilityID.settingsSonyMacField,
+                                text: optionalStringBinding(\.sonyMacAddress)
+                            )
+
+                            settingsTextFieldRow(
+                                label: "User",
+                                placeholder: "Access Auth user",
+                                id: AccessibilityID.settingsSonyUserField,
+                                text: optionalStringBinding(\.sonyUser)
+                            )
+                            validationError("sonyUser")
+
+                            HStack(spacing: Theme.Space.md) {
+                                Text("Password")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 96, alignment: .leading)
+                                SecureField("Access Auth password", text: optionalStringBinding(\.sonyPassword))
+                                    .textFieldStyle(.roundedBorder)
+                                    .accessibilityIdentifier(AccessibilityID.settingsSonyPasswordField)
+                                Spacer(minLength: 0)
+                            }
+                            validationError("sonyPassword")
+                        }
                     }
                 }
 
-                // MARK: 8. Composite
+                // MARK: 7. Composite
 
                 GroupBox(label: Text("Composite")) {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Toggle("Stream composite", isOn: $store.settings.streamComposite)
                             .accessibilityIdentifier(AccessibilityID.settingsStreamToggle)
+
+                        Text("Build each frame's RGB composite in the background as captures finish. DNG is best for RAW-editor workflows; TIFF is the compatibility fallback.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
 
                         if store.settings.streamComposite {
                             HStack(spacing: Theme.Space.md) {
@@ -234,26 +333,6 @@ struct ScanSettingsView: View {
                         }
                     }
                 }
-
-                // MARK: 9. Actions
-
-                GroupBox(label: Text("Save")) {
-                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        Button("Save Settings") {
-                            Task { await saveSettings() }
-                        }
-                        .accessibilityIdentifier(AccessibilityID.settingsSaveBtn)
-                        .buttonStyle(.borderedProminent)
-
-                        if !store.validationErrors.isEmpty {
-                            Banner(kind: .danger, text: "Please fix the errors above.")
-                        } else {
-                            Text("Settings apply on the next scan, or live when the orchestrator is running.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
             }
             .padding(Theme.Space.xl)
         }
@@ -262,26 +341,88 @@ struct ScanSettingsView: View {
 
     // MARK: - Actions
 
-    /// Execute the Save Settings action: validate then push live settings when
-    /// the orchestrator is running (R-20). Async so callers can await the push.
-    /// Exposed as internal (not private) so unit tests can call it directly to
-    /// verify the wiring without launching the app or clicking a SwiftUI button.
+    /// Push runtime-safe settings when the orchestrator is running.
+    /// Exposed as internal so tests can verify the wiring without launching the app.
     @MainActor
-    func saveSettings() async {
+    func applyRuntimeSettingsIfRunning() async {
+        refreshValidationIfNeeded()
+        guard orchestratorClient.isRunning else { return }
         store.validationErrors = store.validate()
-        // R-20: push live settings when the orchestrator is running.
-        // If not running, just store — start() applies them later (Phase 7).
-        if store.validationErrors.isEmpty && orchestratorClient.isRunning {
-            do {
-                try await orchestratorClient.applyRuntimeSettings(store.settings)
-            } catch {
-                store.validationErrors["_runtime"] =
-                    "Failed to push settings: \(error.localizedDescription)"
-            }
+        guard store.validationErrors.isEmpty else { return }
+        do {
+            try await orchestratorClient.applyRuntimeSettings(store.settings)
+        } catch {
+            store.validationErrors["_runtime"] =
+                "Failed to push settings: \(error.localizedDescription)"
         }
     }
 
+    @MainActor
+    private func checkSonyConnection() async {
+        guard store.settings.triggerMode == "sdk" else { return }
+
+        if orchestratorClient.isRunning {
+            cameraConnection.markOffline(
+                "Stop scan or calibration before checking the Sony SDK connection.",
+                settings: store.settings
+            )
+            return
+        }
+        if sonyLiveViewActive {
+            cameraConnection.markOffline(
+                "Close Sony live view before checking the connection.",
+                settings: store.settings
+            )
+            return
+        }
+
+        _ = await cameraConnection.check(store: store, orchestratorClient: orchestratorClient)
+    }
+
     // MARK: - Private helpers
+
+    private var usesIedInbox: Bool {
+        store.settings.triggerMode == "hw" || store.settings.triggerMode == "manual"
+    }
+
+    private var triggerModeHelp: String {
+        switch store.settings.triggerMode {
+        case "manual":
+            return "You fire each channel in Imaging Edge Desktop; the app sets R/G/B and waits for each RAW in the inbox."
+        case "hw":
+            return "Scanlight fires the shutter over the 3.5 mm jack; RAWs arrive in the IED inbox."
+        default:
+            return "Sony SDK fires the camera over Wi-Fi and downloads each ARW directly."
+        }
+    }
+
+    private var calibrationTargetPercentBinding: Binding<Int> {
+        Binding(
+            get: {
+                let fraction = store.settings.calibrationTargetFraction ?? 0.80
+                return Int((fraction * 100.0).rounded())
+            },
+            set: { newValue in
+                store.settings.calibrationTargetFraction = Double(newValue) / 100.0
+            }
+        )
+    }
+
+    func refreshValidationIfNeeded() {
+        if !store.validationErrors.isEmpty {
+            _ = store.validate()
+        }
+    }
+
+    private func optionalStringBinding(_ keyPath: WritableKeyPath<ScanSettings, String?>) -> Binding<String> {
+        Binding(
+            get: { store.settings[keyPath: keyPath] ?? "" },
+            set: { newValue in
+                store.settings[keyPath: keyPath] = newValue.isEmpty ? nil : newValue
+                refreshValidationIfNeeded()
+            }
+        )
+    }
 
     /// Inline validation message for a given field key, rendered as a danger Banner.
     @ViewBuilder
@@ -326,36 +467,23 @@ struct ScanSettingsView: View {
         }
     }
 
-    /// Channel row for the Levels GroupBox: a channel-tinted slider bound to an
-    /// Int field on ScanSettings (levelR/G/B). No "On" button — these are saved
-    /// capture levels, not live light controls.
     @ViewBuilder
-    private func settingsChannelRow(label: String, tint: Color, level: Binding<Int>, sliderId: String) -> some View {
+    private func settingsTextFieldRow(
+        label: String,
+        placeholder: String,
+        id: String,
+        text: Binding<String>
+    ) -> some View {
         HStack(spacing: Theme.Space.md) {
-            HStack(spacing: Theme.Space.sm) {
-                Circle()
-                    .fill(tint)
-                    .frame(width: 9, height: 9)
-                    .accessibilityHidden(true)
-                Text(label)
-                    .font(.subheadline)
-                    .frame(width: 46, alignment: .leading)
-            }
-            Slider(
-                value: Binding(
-                    get: { Double(level.wrappedValue) },
-                    set: { level.wrappedValue = Int($0) }
-                ),
-                in: 0...255
-            )
-            .accessibilityIdentifier(sliderId)
-            .tint(tint)
-            .frame(minWidth: 140)
-            Text("\(level.wrappedValue)")
-                .font(.body)
-                .monospacedDigit()
-                .foregroundStyle(tint)
-                .frame(width: 36, alignment: .trailing)
+            Text(label)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .frame(width: 96, alignment: .leading)
+            TextField(placeholder, text: text)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier(id)
+            Spacer(minLength: 0)
         }
     }
+
 }

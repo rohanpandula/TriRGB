@@ -47,7 +47,7 @@ if [[ -z "$CUA_DRIVER" ]]; then
     CUA_DRIVER="$(command -v cua-driver 2>/dev/null || echo "/Users/rohan/.local/bin/cua-driver")"
 fi
 
-# The 23 AccessibilityID string values mirrored from AccessibilityIDs.swift.
+# The 22 AccessibilityID string values mirrored from AccessibilityIDs.swift.
 # Keep in sync with that file; adding a new case requires adding here too.
 EXPECTED_AX_IDS=(
     btn-connect
@@ -67,7 +67,6 @@ EXPECTED_AX_IDS=(
     btn-blue-on
     btn-white-on
     btn-off
-    btn-set-rgb
     field-pulse-ms
     btn-fire-pulse
     lbl-last-error
@@ -76,8 +75,8 @@ EXPECTED_AX_IDS=(
 )
 
 # Sanity check at load time — catch off-by-one mistakes immediately
-if [[ "${#EXPECTED_AX_IDS[@]}" -ne 23 ]]; then
-    echo "INTERNAL ERROR: EXPECTED_AX_IDS has ${#EXPECTED_AX_IDS[@]} entries, expected 23" >&2
+if [[ "${#EXPECTED_AX_IDS[@]}" -ne 22 ]]; then
+    echo "INTERNAL ERROR: EXPECTED_AX_IDS has ${#EXPECTED_AX_IDS[@]} entries, expected 22" >&2
     exit 2
 fi
 

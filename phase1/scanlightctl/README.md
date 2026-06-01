@@ -6,7 +6,11 @@ Driver and CLI for the **Scanlight v4** narrowband-RGB light source ([jackw01](h
 
 - **LEFT** USB-C port on the Scanlight: data only, connects to the Mac.
 - **RIGHT** USB-C port: power only, connects to a wall PSU rated ≥5V/2A. **Never power the Scanlight from a Mac USB port.**
-- **3.5mm shutter jack: do not use.** It is not electrically isolated from USB ground; using it while USB-tethered to the same Mac as the camera creates a ground loop. We trigger the camera over the Sony SDK in a separate process.
+- **3.5mm shutter jack:** use only when the camera is not USB-tethered to
+  the same Mac. It is safe for the Wi-Fi/IED path after pulse verification,
+  but never combine it with USB camera tethering because that closes a
+  ground loop. The current safest path is manual IED trigger, which uses no
+  shutter cable.
 
 ## Install
 

@@ -12,9 +12,11 @@ with stubs. We verify:
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import signal
+import subprocess
 import threading
 from pathlib import Path
 
@@ -38,6 +40,39 @@ class FakeScanlight:
 
     def off(self):
         self.calls.append(("off",))
+
+
+class FakePopen:
+    def __init__(
+        self,
+        cmd,
+        *,
+        returncode: int = 0,
+        stdout_text: str = "",
+        stderr_text: str = "",
+        **kwargs,
+    ):
+        self.cmd = cmd
+        self.kwargs = kwargs
+        self.stdout = io.StringIO(stdout_text)
+        self.stderr = io.StringIO(stderr_text)
+        self._final_returncode = returncode
+        self.returncode: int | None = None
+        self.killed = False
+
+    def poll(self):
+        if self.returncode is None:
+            self.returncode = self._final_returncode
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = self._final_returncode
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
 
 
 def make_runner(success_size: int = 70 * 1024 * 1024):
@@ -99,6 +134,15 @@ def test_settings_rejects_zero_frame_number(tmp_path):
     with pytest.raises(ValueError):
         CaptureSettings(output_folder=tmp_path, frame_number=0)
 
+def test_settings_rejects_extended_low_iso(tmp_path):
+    with pytest.raises(ValueError, match="sony_iso"):
+        CaptureSettings(output_folder=tmp_path, sony_iso="50")
+
+def test_settings_maps_legacy_lowest_iso_to_scan_base(tmp_path):
+    settings = CaptureSettings(output_folder=tmp_path, sony_iso="lowest")
+
+    assert settings.sony_iso == "100or125"
+
 
 # ---------- happy path ----------
 
@@ -128,6 +172,24 @@ def test_capture_triplet_sets_each_channel_and_advances(settings):
 
     # Frame counter advanced
     assert orch.settings.frame_number == 2
+
+
+def test_capture_channel_sets_only_requested_channel_without_advancing(settings):
+    light = FakeScanlight()
+    runner, runner_calls = make_runner()
+    orch = Orchestrator(light, settings, sony_capture_runner=runner, sleep=_zero_sleep)
+    out = settings.output_folder / "cal_R.ARW"
+
+    result = orch.capture_channel("R", level=123, shutter_speed="1/4", out_path=out)
+
+    assert result.success
+    assert result.files == {"R": out}
+    assert orch.settings.frame_number == 1
+    assert light.calls == [
+        ("set_color", 123, 0, 0, 0, False),
+        ("off",),
+    ]
+    assert runner_calls == [("R", out, settings.sony_capture_timeout_s)]
 
 
 def test_log_records_every_action(settings):
@@ -166,6 +228,57 @@ def test_failure_does_not_advance_frame(settings):
     assert orch.settings.frame_number == 1
     # Scanlight was turned off even though we aborted
     assert ("off",) in light.calls
+
+
+def test_sdk_exit_127_reports_missing_sony_capture(settings):
+    light = FakeScanlight()
+    def runner(_channel, _out_path, _timeout_s):
+        return 127
+    orch = Orchestrator(light, settings, sony_capture_runner=runner, sleep=_zero_sleep)
+
+    result = orch.capture_triplet()
+
+    assert not result.success
+    assert "sony-capture could not be found or launched" in result.error
+    assert "Build phase1/sony-capture" in result.error
+    assert orch.settings.frame_number == 1
+    assert ("off",) in light.calls
+
+
+def test_sdk_runner_error_redacts_saved_auth(tmp_path, caplog):
+    """sony-capture stderr can echo argv; saved auth must not leak into UI errors/logs."""
+    fake_capture = tmp_path / "sony-capture-fail"
+    fake_capture.write_text(
+        "#!/bin/sh\n"
+        # Credentials now arrive via the environment, not argv. Echo them (as a
+        # misbehaving SDK binary might) to prove _redact_runner_detail still
+        # scrubs them — and that the env vars were actually passed through.
+        "printf 'auth failed (user=%s pw=%s) args: %s\\n' \"$SONY_USERNAME\" \"$SONY_PW\" \"$*\" >&2\n"
+        "exit 1\n"
+    )
+    fake_capture.chmod(0o755)
+    settings = CaptureSettings(
+        roll_name="Roll001",
+        frame_number=1,
+        output_folder=tmp_path,
+        level_r=200,
+        level_g=180,
+        level_b=160,
+        settle_ms=0,
+        sony_capture_path=str(fake_capture),
+        sony_user="USERSECRET",
+        sony_password="PASSSECRET",
+    )
+    orch = Orchestrator(FakeScanlight(), settings, sleep=_zero_sleep)
+
+    with caplog.at_level("ERROR", logger="triplet-capture"):
+        result = orch.capture_triplet()
+
+    assert not result.success
+    combined = f"{result.error}\n{caplog.text}"
+    assert "USERSECRET" not in combined
+    assert "PASSSECRET" not in combined
+    assert "<redacted>" in combined
 
 
 def test_missing_output_file_aborts(settings, tmp_path):
@@ -376,11 +489,43 @@ def _hw_settings(tmp_path, **overrides):
     return CaptureSettings(**defaults)
 
 
+def _manual_settings(tmp_path, **overrides):
+    """Build a manual-IED CaptureSettings with a freshly-created inbox dir."""
+    inbox_dir = tmp_path / "ied_inbox"
+    inbox_dir.mkdir()
+    out_dir = tmp_path / "scans"
+    defaults = dict(
+        roll_name="RollManual",
+        frame_number=1,
+        output_folder=out_dir,
+        level_r=200,
+        level_g=180,
+        level_b=160,
+        settle_ms=0,
+        trigger_mode="manual",
+        ied_inbox=inbox_dir,
+        sony_capture_timeout_s=5,
+        inbox_stable_for_s=0.4,
+        inbox_poll_interval_s=0.1,
+    )
+    defaults.update(overrides)
+    return CaptureSettings(**defaults)
+
+
 def test_hw_settings_requires_ied_inbox(tmp_path):
     with pytest.raises(ValueError, match="trigger_mode='hw' requires ied_inbox"):
         CaptureSettings(
             output_folder=tmp_path,
             trigger_mode="hw",
+            ied_inbox=None,
+        )
+
+
+def test_manual_settings_requires_ied_inbox(tmp_path):
+    with pytest.raises(ValueError, match="trigger_mode='manual' requires ied_inbox"):
+        CaptureSettings(
+            output_folder=tmp_path,
+            trigger_mode="manual",
             ied_inbox=None,
         )
 
@@ -442,6 +587,45 @@ def test_hw_mode_pulses_and_picks_up_arrived_file(tmp_path):
     assert set(result.files.values()) == expected_paths
     # And the inbox has been drained
     assert list(s.ied_inbox.iterdir()) == []
+
+
+def test_manual_mode_waits_for_ied_file_without_pulse(tmp_path):
+    """Manual IED mode sets each color and waits for operator-triggered
+    files to land in the inbox. It must not call pulse_shutter."""
+    s = _manual_settings(tmp_path)
+
+    advance = {"t": 0.0}
+    counter = {"n": 0}
+
+    def fake_sleep(dt):
+        advance["t"] += dt
+        # Simulate the operator pressing Capture in IED after the app
+        # lights each channel. Once the previous channel's file is claimed,
+        # the inbox is empty again and the next manual capture can arrive.
+        if counter["n"] < 3 and not list(s.ied_inbox.glob("*.ARW")):
+            counter["n"] += 1
+            f = s.ied_inbox / f"DSC_MANUAL_{counter['n']:05d}.ARW"
+            f.write_bytes(b"\x00" * (70 * 1024 * 1024))
+
+    def fake_clock():
+        return advance["t"]
+
+    light = FakeScanlightWithPulse()
+    orch = Orchestrator(light, s, clock=fake_clock, sleep=fake_sleep)
+    result = orch.capture_triplet()
+
+    assert result.success, f"failed: {result.error}"
+    assert light.pulses == []
+    assert [c for c in light.calls if c[0] == "set_color"] == [
+        ("set_color", 200, 0, 0, 0, False),
+        ("set_color", 0, 180, 0, 0, False),
+        ("set_color", 0, 0, 160, 0, False),
+    ]
+    expected_paths = {
+        s.output_folder / f"RollManual_Frame001_{ch}.ARW"
+        for ch in ("R", "G", "B")
+    }
+    assert set(result.files.values()) == expected_paths
 
 
 def test_hw_mode_times_out_when_no_file_arrives(tmp_path):
@@ -546,11 +730,138 @@ def test_hw_mode_selected_by_trigger_mode_setting(tmp_path):
     assert orch._runner.__func__ is Orchestrator._hw_runner
 
 
+def test_manual_mode_selected_by_trigger_mode_setting(tmp_path):
+    """Without an explicit runner, trigger_mode='manual' must select the
+    inbox-only runner, not the SDK subprocess or hardware pulse runner."""
+    s = _manual_settings(tmp_path)
+    light = FakeScanlightWithPulse()
+    orch = Orchestrator(light, s)
+    assert orch._runner.__func__ is Orchestrator._manual_runner
+
+
 def test_sdk_mode_remains_default(tmp_path):
     s = CaptureSettings(output_folder=tmp_path)  # default trigger_mode="sdk"
     light = FakeScanlight()
     orch = Orchestrator(light, s)
     assert orch._runner.__func__ is Orchestrator._default_runner
+
+
+def test_sdk_runner_passes_sony_network_auth_args(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_popen(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return FakePopen(cmd, returncode=0, stdout_text=str(tmp_path / "out.ARW"), stderr_text="", **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    s = CaptureSettings(
+        output_folder=tmp_path,
+        sony_capture_path="/bin/sony-capture",
+        sony_capture_timeout_s=12,
+        sony_ip_address="10.0.0.247",
+        sony_mac_address="10:32:2C:26:1A:3F",
+        sony_user="sdk-user",
+        sony_password="sdk-password",
+    )
+    orch = Orchestrator(FakeScanlight(), s)
+
+    exit_code = orch._default_runner("R", tmp_path / "out.ARW", 12)
+
+    assert exit_code == 0
+    cmd, kwargs = calls[0]
+    assert cmd == [
+        "/bin/sony-capture",
+        "--out", str(tmp_path / "out.ARW"),
+        "--timeout", "12",
+        "--ip-address", "10.0.0.247",
+        "--mac-address", "10:32:2C:26:1A:3F",
+        "--iso", "100or125",
+    ]
+    # Credentials must NOT appear on argv (argv is visible via `ps`); they are
+    # injected through the environment instead.
+    assert "--user" not in cmd and "--password" not in cmd
+    assert "sdk-user" not in cmd and "sdk-password" not in cmd
+    assert kwargs["stdout"] == subprocess.PIPE
+    assert kwargs["stderr"] == subprocess.PIPE
+    assert kwargs["text"] is True
+    env = kwargs["env"]
+    assert env["SONY_USERNAME"] == "sdk-user"
+    assert env["SONY_USER"] == "sdk-user"
+    assert env["SONY_PW"] == "sdk-password"
+
+
+def test_sdk_runner_passes_channel_shutter_speed(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_popen(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return FakePopen(cmd, returncode=0, stdout_text=str(tmp_path / "out.ARW"), stderr_text="", **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    s = CaptureSettings(
+        output_folder=tmp_path,
+        sony_capture_path="/bin/sony-capture",
+        shutter_r="1/8",
+        shutter_g="1/4",
+        shutter_b="1/2",
+    )
+    orch = Orchestrator(FakeScanlight(), s)
+
+    exit_code = orch._default_runner("B", tmp_path / "out.ARW", 30)
+
+    assert exit_code == 0
+    cmd, _kwargs = calls[0]
+    assert cmd[-4:] == ["--iso", "100or125", "--shutter-speed", "1/2"]
+
+
+def test_sdk_runner_failure_stderr_is_returned_in_triplet_error(tmp_path, monkeypatch):
+    """Real-run regression: calibration should show the SDK/camera reason,
+    not just a bare 'exit 1' from sony-capture.
+    """
+    def fake_popen(cmd, **kwargs):
+        return FakePopen(
+            cmd,
+            returncode=1,
+            stdout_text="",
+            stderr_text="sony-capture: Access Auth failed; camera busy",
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    s = CaptureSettings(
+        output_folder=tmp_path,
+        sony_capture_path="/bin/sony-capture",
+        settle_ms=0,
+    )
+    orch = Orchestrator(FakeScanlight(), s, sleep=_zero_sleep)
+
+    result = orch.capture_triplet()
+
+    assert not result.success
+    assert "capture failed for channel R (exit 1)" in result.error
+    assert "Access Auth failed" in result.error
+    assert "camera busy" in result.error
+
+
+def test_sdk_runner_turns_scanlight_off_after_exposure_marker(tmp_path, monkeypatch):
+    def fake_popen(cmd, **kwargs):
+        return FakePopen(
+            cmd,
+            returncode=0,
+            stdout_text=str(tmp_path / "out.ARW"),
+            stderr_text="sony-capture: exposure-complete\nsony-capture: RemoteTransfer download 10%\n",
+            **kwargs,
+        )
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    light = FakeScanlight()
+    s = CaptureSettings(output_folder=tmp_path, sony_capture_path="/bin/sony-capture")
+    orch = Orchestrator(light, s)
+
+    exit_code = orch._default_runner("R", tmp_path / "out.ARW", 30)
+
+    assert exit_code == 0
+    assert ("off",) in light.calls
 
 
 # ---------- codex review additions ----------
@@ -631,6 +942,12 @@ def test_update_settings_repicks_runner_on_trigger_mode_change(tmp_path):
     hw_inbox.mkdir()
     orch.update_settings(trigger_mode="hw", ied_inbox=hw_inbox)
     assert orch._runner.__func__ is Orchestrator._hw_runner
+
+    # Switch to manual IED mode at runtime
+    manual_inbox = tmp_path / "manual_inbox"
+    manual_inbox.mkdir()
+    orch.update_settings(trigger_mode="manual", ied_inbox=manual_inbox)
+    assert orch._runner.__func__ is Orchestrator._manual_runner
 
     # Switch back to sdk
     orch.update_settings(trigger_mode="sdk")
