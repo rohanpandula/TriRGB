@@ -1,22 +1,24 @@
 """Auto-positive rendering for an already-captured RGB-lit triplet.
 
 This module is the bridge between the operator-friendly workflow ("pick the
-three R/G/B files") and the existing narrowband RGB composite/inversion code.
-It accepts three RAW/TIFF inputs in any order, reads which channel each file is
-from its filename (an R/G/B or red/green/blue suffix — never from image color,
-so the assignment stays deterministic and colorblind-safe per NFR-11), keeps
-only the matching sensor channel from each exposure, then renders a positive
-TIFF using the same density-based inversion used by the scan pipeline.
+three RGB-lit files") and the existing narrowband RGB composite/inversion code.
+It accepts three RAW/TIFF inputs in any order and decides which is R, G, and B
+by measured per-channel signal energy — which narrowband LED dominated each
+exposure — NOT by file names. File names are never consulted: the camera's
+generic names (``DSC00448.ARW``) are accepted as-is, and assignment is
+colorblind-safe (NFR-11) because the software reads the sensor signal rather
+than asking anyone to judge color. It keeps only the matching sensor channel
+from each exposure, then renders a positive TIFF using the same density-based
+inversion used by the scan pipeline.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Sequence, TypedDict
 
 import numpy as np
 from PIL import Image
@@ -30,15 +32,28 @@ from .composite import (
     DEFAULT_POSITIVE_TONE_GAMMA,
     auto_positive_from_composite,
     demosaic_linear,
+    hd_sigmoid_tone,
 )
 
 
 CHANNEL_NAMES = ("R", "G", "B")
+AUTO_ASSIGN_MIN_CONFIDENCE = 1.5
+AUTO_ASSIGN_MIN_SIGNAL = 256.0
 TIFF_SUFFIXES = {".tif", ".tiff"}
 RAW_SUFFIXES = {
     ".arw", ".raw", ".dng", ".nef", ".cr2", ".cr3", ".raf", ".rw2", ".orf",
 }
-LOOK_SETTINGS: dict[str, dict[str, float]] = {
+class LookSettings(TypedDict, total=False):
+    black: float
+    white: float
+    gamma: float
+    curve: float
+    curve_type: str
+    contrast: float
+    pivot: float
+
+
+LOOK_SETTINGS: dict[str, LookSettings] = {
     # The old workprint behavior: deliberately gentle and editable.
     "flat": {
         "black": DEFAULT_POSITIVE_BLACK_PERCENTILE,
@@ -59,6 +74,14 @@ LOOK_SETTINGS: dict[str, dict[str, float]] = {
         "white": 99.9,
         "gamma": 0.9,
         "curve": 0.78,
+    },
+    "filmic": {
+        "black": 0.7,
+        "white": 99.82,
+        "gamma": 0.82,
+        "curve_type": "sigmoid",
+        "contrast": 5.0,
+        "pivot": 0.5,
     },
 }
 
@@ -146,101 +169,158 @@ def _to_uint16_rgb(arr: np.ndarray) -> np.ndarray:
     raise TripletPositiveError(f"unsupported TIFF dtype {arr.dtype}")
 
 
-# Filename tokens that name a channel. Single letter or full color word, so
-# both the canonical scan naming (Frame001_R.ARW) and friendly names
-# (scan-green.tif) work. This is the ONLY thing channel assignment looks at —
-# never image color (NFR-11: the operator is colorblind; no code branches on
-# the R/G/B color content of a frame).
-_CHANNEL_TOKENS: dict[str, str] = {
-    "r": "R", "red": "R",
-    "g": "G", "green": "G",
-    "b": "B", "blue": "B",
-}
+def _channel_scores_from_image(
+    path: Path,
+    cache: dict[str, np.ndarray],
+) -> dict[str, float]:
+    """Return robust per-channel signal scores used to assign the channel.
 
+    The score is a high percentile of each channel after subtracting a low
+    percentile pedestal. That makes the comparison insensitive to black level,
+    hot pixels, and small dark borders while preserving the narrowband LED
+    dominance signal that identifies which R/G/B exposure this frame is.
 
-def _channel_from_filename(path: Path) -> str | None:
-    """Return 'R'/'G'/'B' from the final filename token, or None if unknown.
+    Note: a clipped or perfectly flat dominant channel has near-zero spread and
+    can score low (pedestal ≈ peak). Properly exposed narrowband frames have
+    scene texture in the lit channel, so this is robust in practice; a corrupt
+    or clipped exposure fails closed via the signal/confidence gates in
+    ``detect_rgb_assignment`` rather than being silently mis-assigned.
 
-    The channel must be the LAST ``_ - . space``-delimited token of the stem
-    (e.g. ``Frame001_R``, ``a-green``, ``B``). Embedded matches (``BlueRidge``)
-    never count — only the trailing token — so the read is unambiguous.
+    Args:
+        path: Resolved path to the RAW/TIFF file.
+        cache: Dict keyed by str(path) — loaded arrays are stored here so
+            ``build_composite`` can reuse them without a second demosaic (F4).
     """
-    tokens = [t for t in re.split(r"[ _.\-]+", Path(path).stem) if t]
-    if not tokens:
-        return None
-    return _CHANNEL_TOKENS.get(tokens[-1].lower())
+    key = str(path)
+    img = cache.get(key)
+    if img is None:
+        img = load_linear_rgb(path)
+        cache[key] = img
+
+    scores: dict[str, float] = {}
+    for index, channel in enumerate(CHANNEL_NAMES):
+        plane = img[..., index].astype(np.float32, copy=False)
+
+        # F7: stride-8 subsample for percentile computation when the plane is
+        # large (> 4_000_000 elements — a 61 MP sensor has ~20 M per channel).
+        # A stride-8 sample (~315k elements) is statistically identical at
+        # p1/p99.9 for any real narrowband-LED exposure. Fixed stride is
+        # deterministic (NFR-11). Small test fixtures fall through unchanged.
+        work = plane[::8, ::8] if plane.size > 4_000_000 else plane
+
+        pedestal = float(np.percentile(work, 1.0))
+        signal = np.maximum(work - pedestal, 0.0)
+        scores[channel] = float(np.percentile(signal, 99.9))
+    return scores
 
 
-def detect_rgb_assignment(paths: Sequence[Path]) -> list[AssignedFile]:
-    """Assign three input paths to R/G/B from their FILENAMES (no color reading).
+def detect_rgb_assignment(
+    paths: Sequence[Path],
+    _image_cache: dict[str, np.ndarray] | None = None,
+) -> list[AssignedFile]:
+    """Assign three input paths to R/G/B by measured per-channel signal energy.
 
-    Each filename's final token must name its channel — a single letter
-    ``R``/``G``/``B`` or the word ``red``/``green``/``blue`` (case-insensitive),
-    delimited by ``_ - . space`` (e.g. ``Frame001_R.ARW``, ``scan-green.tif``,
-    ``B.ARW``). Assignment is therefore deterministic and makes no color-content
-    decision (NFR-11). Ambiguous, duplicate, or missing channel roles raise an
-    actionable ``TripletPositiveError`` instead of guessing — a wrong guess
-    would silently swap channels in the rendered positive.
+    Channel roles are decided by which narrowband LED dominated each exposure
+    (the sensor channel with the most signal) — **never** by file names. This is
+    robust to generic camera names (``DSC00448.ARW``) and colorblind-safe
+    (NFR-11): the software reads the sensor signal, the operator never judges
+    color, the result is deterministic, and a triplet that is ambiguous (no
+    clear dominant channel) or conflicting (two frames strongest in the same
+    channel) fails closed with an actionable error rather than silently swapping
+    channels.
+
+    Args:
+        paths: Exactly three RAW/TIFF paths.
+        _image_cache: Optional dict for caching loaded arrays across the
+            detect→build pipeline (F4). Pass the same dict to
+            ``build_composite`` to avoid re-demosaicing the same files.
+            If None, a fresh dict is created internally and discarded.
     """
     if len(paths) != 3:
         raise TripletPositiveError(f"expected exactly 3 inputs, got {len(paths)}")
 
-    by_channel: dict[str, Path] = {}
+    if _image_cache is None:
+        _image_cache = {}
+
+    by_channel: dict[str, AssignedFile] = {}
     for raw_path in paths:
         path = Path(raw_path)
-        channel = _channel_from_filename(path)
-        if channel is None:
+        scores = _channel_scores_from_image(path, _image_cache)
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_channel, best_score = ranked[0]
+        second_score = max(score for _ch, score in ranked[1:])
+        confidence = best_score / max(second_score, 1.0)
+        score_text = ", ".join(f"{ch}={scores[ch]:.0f}" for ch in CHANNEL_NAMES)
+
+        if best_score < AUTO_ASSIGN_MIN_SIGNAL or confidence < AUTO_ASSIGN_MIN_CONFIDENCE:
             raise TripletPositiveError(
-                f"{path.name}: cannot tell which channel this is from the filename. "
-                "Name each file so its last part is the channel — R/G/B or "
-                "red/green/blue (e.g. Frame001_R.ARW, scan-green.tif, B.ARW). "
-                "The positive renderer never guesses channels from image color."
+                f"{path.name}: no clear single-channel dominance "
+                f"({score_text}; confidence {confidence:.2f}x, need "
+                f"≥{AUTO_ASSIGN_MIN_CONFIDENCE:g}x). Each frame must be a single "
+                "narrowband R/G/B exposure — check the per-channel illumination."
             )
-        if channel in by_channel:
+        if best_channel in by_channel:
             raise TripletPositiveError(
-                f"two files map to channel {channel}: "
-                f"{by_channel[channel].name} and {path.name}. "
-                "Provide exactly one R, one G, and one B file."
+                f"two frames both read strongest in channel {best_channel}: "
+                f"{Path(by_channel[best_channel].path).name} and {path.name} "
+                f"({score_text}). Provide one R-lit, one G-lit, and one B-lit frame."
             )
-        by_channel[channel] = path
+
+        by_channel[best_channel] = AssignedFile(
+            channel=best_channel,
+            channel_index=CHANNEL_NAMES.index(best_channel),
+            path=str(path),
+            score=best_score,
+            confidence=confidence,
+        )
 
     missing = [ch for ch in CHANNEL_NAMES if ch not in by_channel]
     if missing:
         raise TripletPositiveError(
-            f"missing channel file(s): {', '.join(missing)}. "
-            "Provide one file per channel, named R/G/B (or red/green/blue)."
+            f"could not identify channel(s) {', '.join(missing)} from the triplet "
+            "by signal energy. Each frame must be a single narrowband R/G/B exposure."
         )
 
-    # score/confidence are kept for the report/UI contract; assignment is by
-    # filename, so confidence is a constant 1.0 (a deterministic, explicit role)
-    # rather than a measured color ratio.
-    return [
-        AssignedFile(
-            channel=channel,
-            channel_index=index,
-            path=str(by_channel[channel]),
-            score=1.0,
-            confidence=1.0,
-        )
-        for index, channel in enumerate(CHANNEL_NAMES)
-    ]
+    return [by_channel[ch] for ch in CHANNEL_NAMES]
 
 
-def build_composite(assignments: Sequence[AssignedFile]) -> np.ndarray:
-    """Build a channel-isolated RGB negative composite from detected files."""
+def build_composite(
+    assignments: Sequence[AssignedFile],
+    _image_cache: dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Build a channel-isolated RGB negative composite from detected files.
+
+    Args:
+        assignments: Ordered R/G/B assignment list from ``detect_rgb_assignment``.
+        _image_cache: Optional dict keyed by str(path) — loaded arrays from the
+            scoring pass in ``detect_rgb_assignment`` (F4). When provided, each
+            file is demosaiced exactly once across the full detect→build pipeline.
+            After extracting the needed channel, the full array is deleted from
+            the cache to release memory promptly.
+    """
+    if _image_cache is None:
+        _image_cache = {}
+
     channels: list[np.ndarray] = []
     expected_shape: tuple[int, int] | None = None
     for assignment in sorted(assignments, key=lambda item: item.channel_index):
-        img = load_linear_rgb(Path(assignment.path))
+        path = Path(assignment.path)
+        key = str(path)
+        img = _image_cache.get(key)
+        if img is None:
+            img = load_linear_rgb(path)
         shape = img.shape[:2]
         if expected_shape is None:
             expected_shape = shape
         elif shape != expected_shape:
             raise TripletPositiveError(
                 "input dimensions do not match: "
-                f"expected {expected_shape}, got {shape} for {Path(assignment.path).name}"
+                f"expected {expected_shape}, got {shape} for {path.name}"
             )
-        channels.append(img[..., assignment.channel_index])
+        # .copy() so we can del the full array (frees ~350MB per RAW).
+        channels.append(img[..., assignment.channel_index].copy())
+        # Remove from cache: the full HxWx3 is no longer needed.
+        _image_cache.pop(key, None)
         del img
     return np.stack(channels, axis=-1)
 
@@ -344,17 +424,34 @@ def manual_base_region(
     )
 
 
-def apply_render_look(positive: np.ndarray, *, curve_amount: float) -> np.ndarray:
-    """Apply a simple luminance-safe S-curve to a rendered positive."""
-    amount = max(0.0, min(float(curve_amount), 1.0))
-    if amount <= 0.0:
-        return positive
-    work = positive.astype(np.float32) / 65535.0
-    # Smoothstep is monotonic, keeps 0/1 pinned, and steepens the midtones.
-    curved = work * work * (3.0 - 2.0 * work)
-    work = work * (1.0 - amount) + curved * amount
-    np.clip(work, 0.0, 1.0, out=work)
-    return np.rint(work * 65535.0).astype(np.uint16)
+def apply_render_look(
+    positive: np.ndarray,
+    *,
+    curve_amount: float,
+    curve_type: str = "smoothstep",
+    contrast: float = 5.0,
+    pivot: float = 0.5,
+) -> np.ndarray:
+    """Apply the selected monotonic render-look curve to a positive image."""
+    normalized_curve_type = curve_type.lower()
+    if normalized_curve_type == "smoothstep":
+        amount = max(0.0, min(float(curve_amount), 1.0))
+        if amount <= 0.0:
+            return positive
+        work = positive.astype(np.float32) / 65535.0
+        # Smoothstep is monotonic, keeps 0/1 pinned, and steepens the midtones.
+        curved = work * work * (3.0 - 2.0 * work)
+        work = work * (1.0 - amount) + curved * amount
+        np.clip(work, 0.0, 1.0, out=work)
+        return np.rint(work * 65535.0).astype(np.uint16)
+
+    if normalized_curve_type == "sigmoid":
+        work = positive.astype(np.float32) / 65535.0
+        work = hd_sigmoid_tone(work, contrast=contrast, pivot=pivot)
+        np.clip(work, 0.0, 1.0, out=work)
+        return np.rint(work * 65535.0).astype(np.uint16)
+
+    raise ValueError(f"unknown render look curve_type {curve_type!r}")
 
 
 def render_triplet_preview(
@@ -364,6 +461,7 @@ def render_triplet_preview(
     max_dimension: int = 1600,
     look: str = "standard",
     patch_size: int = 256,
+    base_mode: str = "auto",
 ) -> TripletPreviewResult:
     """Render a small positive preview for visual base-patch selection."""
     preview_path.parent.mkdir(parents=True, exist_ok=True)
@@ -372,8 +470,10 @@ def render_triplet_preview(
         if not path.exists():
             raise TripletPositiveError(f"input not found: {path}")
 
-    assignments = detect_rgb_assignment(clean_paths)
-    composite = build_composite(assignments)
+    # F4: shared cache so each file is demosaiced exactly once (detect + build).
+    _cache: dict[str, np.ndarray] = {}
+    assignments = detect_rgb_assignment(clean_paths, _image_cache=_cache)
+    composite = build_composite(assignments, _image_cache=_cache)
     descriptor = auto_base_region(composite, patch_size=patch_size)
     look_key = look.lower()
     if look_key not in LOOK_SETTINGS:
@@ -387,8 +487,15 @@ def render_triplet_preview(
         display_black_percentile=look_settings["black"],
         display_white_percentile=look_settings["white"],
         tone_gamma=look_settings["gamma"],
+        base_mode=base_mode,
     )
-    positive = apply_render_look(positive, curve_amount=look_settings["curve"])
+    positive = apply_render_look(
+        positive,
+        curve_amount=float(look_settings.get("curve", 1.0)),
+        curve_type=str(look_settings.get("curve_type", "smoothstep")),
+        contrast=float(look_settings.get("contrast", 5.0)),
+        pivot=float(look_settings.get("pivot", 0.5)),
+    )
 
     full_h, full_w = positive.shape[:2]
     max_dim = max(16, int(max_dimension))
@@ -425,6 +532,7 @@ def render_triplet_positive(
     tone_gamma: float | None = None,
     look: str = "standard",
     base_region: tuple[int, int, int, int] | None = None,
+    base_mode: str = "auto",
 ) -> TripletPositiveResult:
     """Process three files and write negative composite, positive TIFF, report."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -438,8 +546,10 @@ def render_triplet_positive(
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         stem = f"{joined}_{timestamp}"
 
-    assignments = detect_rgb_assignment(clean_paths)
-    composite = build_composite(assignments)
+    # F4: shared cache so each file is demosaiced exactly once (detect + build).
+    _cache: dict[str, np.ndarray] = {}
+    assignments = detect_rgb_assignment(clean_paths, _image_cache=_cache)
+    composite = build_composite(assignments, _image_cache=_cache)
     descriptor = (
         manual_base_region(composite, base_region)
         if base_region is not None
@@ -452,25 +562,39 @@ def render_triplet_positive(
         )
     look_settings = LOOK_SETTINGS[look_key]
     effective_gamma = float(tone_gamma) if tone_gamma is not None else look_settings["gamma"]
+    # A manual base_region produces a descriptor with source="manual", which
+    # auto_positive_from_composite never auto-overrides — so passing base_mode
+    # straight through honors an operator-drawn box without a special case here.
     positive, meta = auto_positive_from_composite(
         composite,
         descriptor,
         display_black_percentile=look_settings["black"],
         display_white_percentile=look_settings["white"],
         tone_gamma=effective_gamma,
+        base_mode=base_mode,
     )
-    positive = apply_render_look(positive, curve_amount=look_settings["curve"])
+    positive = apply_render_look(
+        positive,
+        curve_amount=float(look_settings.get("curve", 1.0)),
+        curve_type=str(look_settings.get("curve_type", "smoothstep")),
+        contrast=float(look_settings.get("contrast", 5.0)),
+        pivot=float(look_settings.get("pivot", 0.5)),
+    )
     meta["look"] = look_key
-    meta["look_curve_amount"] = look_settings["curve"]
+    meta["look_curve_amount"] = float(look_settings.get("curve", 1.0))
 
     composite_path = out_dir / f"{stem}_negative-composite.tif"
     positive_path = out_dir / f"{stem}_positive.tif"
     report_path = out_dir / f"{stem}_report.json"
 
+    # F8: zlib+predictor compression matches the archival writer in composite.py.
+    # ~361 MB uncompressed → ~150 MB compressed for a typical 61 MP frame.
     tifffile.imwrite(
         composite_path,
         composite,
         photometric="rgb",
+        compression="zlib",
+        predictor=True,
         description="channel-isolated RGB negative composite from imported triplet",
         metadata=None,
     )
@@ -478,6 +602,8 @@ def render_triplet_positive(
         positive_path,
         positive,
         photometric="rgb",
+        compression="zlib",
+        predictor=True,
         description="auto positive render from channel-isolated RGB triplet",
         metadata=None,
     )
@@ -579,6 +705,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Override the selected look's tone gamma.",
     )
+    parser.add_argument(
+        "--base-mode",
+        choices=("patch", "whole_frame", "auto"),
+        default="auto",
+        help=(
+            "Clear-film base estimation. 'patch' uses the rebate box; "
+            "'whole_frame' uses the frame's per-channel high percentile (best for "
+            "full-bleed scans with no rebate); 'auto' (default) falls back to "
+            "whole-frame only when the picked patch is non-uniform."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -589,6 +726,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_dimension=args.preview_max,
                 look=args.look,
                 patch_size=args.base_patch,
+                base_mode=args.base_mode,
             )
         else:
             result = render_triplet_positive(
@@ -599,6 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tone_gamma=args.tone_gamma,
                 look=args.look,
                 base_region=args.base_region,
+                base_mode=args.base_mode,
             )
     except Exception as exc:
         print(f"scanlight-triplet-positive: {type(exc).__name__}: {exc}", file=__import__("sys").stderr)

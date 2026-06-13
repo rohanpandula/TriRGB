@@ -1,12 +1,22 @@
 """rgb_composite — narrowband-RGB triplet → 16-bit linear ProPhoto-RGB."""
 from .composite import (
     DEMOSAIC_KWARGS,
+    DEFAULT_AUTO_BASE_CV_THRESHOLD,
+    DensityBounds,
     DimensionMismatchError,
     OUTPUT_FORMATS,
+    DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION,
+    DEFAULT_POSITIVE_BLACK_PERCENTILE,
+    DEFAULT_POSITIVE_TONE_GAMMA,
+    DEFAULT_POSITIVE_WHITE_PERCENTILE,
+    DEFAULT_WHOLE_FRAME_BASE_PERCENTILE,
+    aggregate_positive_density_bounds,
     auto_positive_from_composite,
     composite_triplet,
     demosaic_linear,
+    hd_sigmoid_tone,
     invert_composite,
+    positive_density_bounds_from_composite,
 )
 from .dng import (
     build_dng_extratags,
@@ -30,10 +40,20 @@ from c41_core.contracts import CheckResult
 __all__ = [
     # composite
     "composite_triplet",
+    "aggregate_positive_density_bounds",
     "auto_positive_from_composite",
     "demosaic_linear",
+    "hd_sigmoid_tone",
     "invert_composite",
+    "positive_density_bounds_from_composite",
     "DEMOSAIC_KWARGS",
+    "DEFAULT_AUTO_BASE_CV_THRESHOLD",
+    "DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION",
+    "DEFAULT_POSITIVE_BLACK_PERCENTILE",
+    "DEFAULT_POSITIVE_TONE_GAMMA",
+    "DEFAULT_POSITIVE_WHITE_PERCENTILE",
+    "DEFAULT_WHOLE_FRAME_BASE_PERCENTILE",
+    "DensityBounds",
     "DimensionMismatchError",
     "OUTPUT_FORMATS",
     # dng

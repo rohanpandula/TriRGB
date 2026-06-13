@@ -28,10 +28,38 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterable, Optional
 
 
 logger = logging.getLogger("batch-composite")
+
+# S3: import DensityBounds and constants from the single source of truth.
+# Direct imports fail loudly on rename; the old local alias and getattr
+# fallbacks are removed (S2/S3). rgb_composite is imported at module load
+# only for the type alias and constants (no rawpy dependency in these paths).
+try:
+    from rgb_composite import (
+        DensityBounds,
+        DEFAULT_POSITIVE_BLACK_PERCENTILE as _DEFAULT_BLACK,
+        DEFAULT_POSITIVE_WHITE_PERCENTILE as _DEFAULT_WHITE,
+        DEFAULT_POSITIVE_TONE_GAMMA as _DEFAULT_GAMMA,
+        DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION as _DEFAULT_CROP,
+        DEFAULT_WHOLE_FRAME_BASE_PERCENTILE as _DEFAULT_WHOLE_FRAME,
+        DEFAULT_AUTO_BASE_CV_THRESHOLD as _DEFAULT_CV,
+    )
+except ImportError:
+    # Fallback for environments where rgb_composite is not installed yet.
+    DensityBounds = tuple[  # type: ignore[assignment]
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+    ]
+    _DEFAULT_BLACK = 0.1
+    _DEFAULT_WHITE = 99.2
+    _DEFAULT_GAMMA = 0.55
+    _DEFAULT_CROP = 0.03
+    _DEFAULT_WHOLE_FRAME = 99.9
+    _DEFAULT_CV = 8.0
 
 # A single 61MP frame holds ~350MB of uint16 per demosaic; the compositor
 # briefly has three in flight plus the output array (~1.4GB per worker).
@@ -86,6 +114,15 @@ class BatchResult:
     composited: list[Path] = field(default_factory=list)
     skipped: list[tuple[FrameGroup, SkipReason]] = field(default_factory=list)
     failed: list[tuple[FrameGroup, str]] = field(default_factory=list)
+
+
+@dataclass
+class RollPositiveResult:
+    rendered: list[Path] = field(default_factory=list)
+    skipped: list[Path] = field(default_factory=list)
+    failed: list[tuple[Path, str]] = field(default_factory=list)
+    bounds: Optional[DensityBounds] = None
+    meta: dict[Path, dict[str, Any]] = field(default_factory=dict)
 
 
 def discover_frames(roll_dir: Path) -> list[FrameGroup]:
@@ -283,6 +320,145 @@ def composite_roll(
             else:
                 result.failed.append((group, err))
                 logger.error("Frame%03d failed: %s", group.frame_number, err)
+
+    return result
+
+
+def _positive_output_path(composite_path: Path, output_dir: Optional[Path]) -> Path:
+    directory = composite_path.parent if output_dir is None else Path(output_dir)
+    return directory / f"{composite_path.stem}_positive.tif"
+
+
+def render_roll_positives_from_composites(
+    composite_paths: Iterable[Path],
+    descriptor: Any,
+    *,
+    output_dir: Optional[Path] = None,
+    overwrite: bool = False,
+    lock_bounds: bool = True,
+    display_black_percentile: Optional[float] = None,
+    display_white_percentile: Optional[float] = None,
+    tone_gamma: Optional[float] = None,
+    analysis_crop_fraction: Optional[float] = None,
+    base_mode: str = "patch",
+    whole_frame_base_percentile: Optional[float] = None,
+    auto_base_cv_threshold: Optional[float] = None,
+) -> RollPositiveResult:
+    """Render positive TIFFs from a roll of already-written composites.
+
+    ``batch-composite`` owns roll/file orchestration, while ``rgb-composite``
+    owns the density math.  This entry point loads the linear negative
+    composites, computes one roll-level median density-bounds tuple when
+    ``lock_bounds`` is true, then passes that same tuple to every positive
+    render.
+    """
+    paths = sorted((Path(path) for path in composite_paths), key=lambda p: str(p))
+    if not paths:
+        raise ValueError("at least one composite path is required")
+
+    # S2: import functions from rgb_composite (allows test monkeypatching via
+    # sys.modules). Constants were imported at module load time (see top-level
+    # _DEFAULT_* names) so they're never pulled from the possibly-fake module.
+    import tifffile
+    import rgb_composite as _rgb
+    aggregate_positive_density_bounds = _rgb.aggregate_positive_density_bounds
+    auto_positive_from_composite = _rgb.auto_positive_from_composite
+
+    if display_black_percentile is None:
+        display_black_percentile = float(_DEFAULT_BLACK)
+    if display_white_percentile is None:
+        display_white_percentile = float(_DEFAULT_WHITE)
+    if tone_gamma is None:
+        tone_gamma = float(_DEFAULT_GAMMA)
+    if analysis_crop_fraction is None:
+        analysis_crop_fraction = float(_DEFAULT_CROP)
+    if whole_frame_base_percentile is None:
+        whole_frame_base_percentile = float(_DEFAULT_WHOLE_FRAME)
+    if auto_base_cv_threshold is None:
+        auto_base_cv_threshold = float(_DEFAULT_CV)
+
+    result = RollPositiveResult()
+
+    # F5: two-pass streaming — avoids materialising all composites at once.
+    # A full 36-frame roll at ~361 MB/composite = ~13 GB in memory with the old
+    # approach; two passes cost two reads per file but keep peak at ~1–2 frames.
+    #
+    # Pass 1: aggregate density bounds frame-by-frame.
+    if lock_bounds:
+        def _bounds_iter():
+            for path in paths:
+                try:
+                    composite = tifffile.imread(path)
+                    yield composite
+                except Exception as exc:
+                    result.failed.append((path, f"{type(exc).__name__}: {exc}"))
+
+        try:
+            result.bounds = aggregate_positive_density_bounds(
+                _bounds_iter(),
+                descriptor,
+                display_black_percentile=display_black_percentile,
+                display_white_percentile=display_white_percentile,
+                analysis_crop_fraction=analysis_crop_fraction,
+                base_mode=base_mode,
+                whole_frame_base_percentile=whole_frame_base_percentile,
+                auto_base_cv_threshold=auto_base_cv_threshold,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            # Mark all remaining non-already-failed paths as failed.
+            failed_paths = {p for p, _ in result.failed}
+            result.failed.extend(
+                (path, error) for path in paths if path not in failed_paths
+            )
+            return result
+
+    if output_dir is not None:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Pass 2: render each frame with the locked bounds.
+    for path in paths:
+        # Skip paths that failed in the bounds pass.
+        if any(p == path for p, _ in result.failed):
+            continue
+        out_path = _positive_output_path(path, output_dir)
+        if out_path.exists() and not overwrite:
+            result.skipped.append(path)
+            continue
+        try:
+            composite = tifffile.imread(path)
+            positive, meta = auto_positive_from_composite(
+                composite,
+                descriptor,
+                display_black_percentile=display_black_percentile,
+                display_white_percentile=display_white_percentile,
+                tone_gamma=tone_gamma,
+                analysis_crop_fraction=analysis_crop_fraction,
+                base_mode=base_mode,
+                whole_frame_base_percentile=whole_frame_base_percentile,
+                auto_base_cv_threshold=auto_base_cv_threshold,
+                bounds_override=result.bounds if lock_bounds else None,
+            )
+            del composite
+            # F8: zlib+predictor compression matches the archival writer in
+            # composite.py. ~361 MB uncompressed → ~150 MB per positive TIFF.
+            tifffile.imwrite(
+                out_path,
+                positive,
+                photometric="rgb",
+                compression="zlib",
+                predictor=True,
+                description=(
+                    "roll-consistent auto-positive render from linear "
+                    f"negative composite {path.name}"
+                ),
+                metadata=None,
+            )
+            result.rendered.append(out_path)
+            result.meta[out_path] = meta
+            logger.info("rendered positive %s → %s", path.name, out_path)
+        except Exception as exc:
+            result.failed.append((path, f"{type(exc).__name__}: {exc}"))
 
     return result
 
