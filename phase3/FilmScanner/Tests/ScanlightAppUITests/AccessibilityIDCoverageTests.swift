@@ -79,7 +79,7 @@ final class AccessibilityIDCoverageTests: XCTestCase {
     /// This test does NOT use XCUIApplication and always runs.
     func testSchemaVersionMatches() {
         XCTAssertEqual(
-            AccessibilityID.schemaVersion, "4",
+            AccessibilityID.schemaVersion, "5",
             "AccessibilityID.schemaVersion bumped without updating ScanlightAppUITests"
         )
     }

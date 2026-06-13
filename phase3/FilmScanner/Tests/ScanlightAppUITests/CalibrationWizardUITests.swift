@@ -58,9 +58,10 @@ final class CalibrationWizardUITests: XCTestCase {
             throw XCTSkip("App window did not appear — Accessibility permission may not be granted, or running headless.")
         }
 
-        // Navigate to the Calibrate tab.
-        let calibrateTab = app.tabs["Calibrate"]
-        if calibrateTab.exists { calibrateTab.click() }
+        // Navigate to the Calibrate pane via the workflow sidebar row.
+        let calibrateRow = app.descendants(matching: .any)
+            .matching(identifier: AccessibilityID.navCalibrate).firstMatch
+        if calibrateRow.waitForExistence(timeout: 2.0) { calibrateRow.click() }
 
         for id in alwaysPresentIDs {
             let matches = app.descendants(matching: .any).matching(identifier: id)
@@ -84,8 +85,9 @@ final class CalibrationWizardUITests: XCTestCase {
             throw XCTSkip("App window did not appear — Accessibility permission may not be granted, or running headless.")
         }
 
-        let calibrateTab = app.tabs["Calibrate"]
-        if calibrateTab.exists { calibrateTab.click() }
+        let calibrateRow = app.descendants(matching: .any)
+            .matching(identifier: AccessibilityID.navCalibrate).firstMatch
+        if calibrateRow.waitForExistence(timeout: 2.0) { calibrateRow.click() }
 
         // Step 1 circle should be "active" on initial load.
         let step1Circle = app.descendants(matching: .any)

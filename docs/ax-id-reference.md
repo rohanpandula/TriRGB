@@ -7,7 +7,23 @@ has exactly one row. For the GUI ↔ CLI mapping and the schema explanation, see
 `docs/automation.md`. A consistency-check script enforces that this file and
 the Swift enum agree.
 
-**Schema version:** 4
+**Schema version:** 5
+
+### Navigation
+
+The workflow sidebar that replaced the 5-tab TabView (2026-06 UX redesign).
+Click a row to switch panes — automation drives the app by these IDs instead of
+the old `app.tabs[...]` tab labels.
+
+| ID constant | Display label | Type/control |
+|---|---|---|
+| btn-nav-setup | Set up | sidebar row |
+| btn-nav-calibrate | Calibrate | sidebar row |
+| btn-nav-scan | Scan | sidebar row |
+| btn-nav-develop | Develop | sidebar row |
+| btn-nav-diagnostics | Diagnostics | sidebar row |
+| btn-nav-film-stocks | Film stocks | sidebar row |
+| lbl-readiness-strip | Readiness strip | status region |
 
 ### Connection
 

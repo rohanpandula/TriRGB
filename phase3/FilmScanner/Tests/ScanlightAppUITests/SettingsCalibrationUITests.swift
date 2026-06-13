@@ -62,8 +62,8 @@ final class SettingsCalibrationUITests: XCTestCase {
     /// Verify that every Phase 06 Settings AX-ID has at least one rendered SwiftUI element.
     ///
     /// Requires accessibility permissions and a window server. Skips gracefully
-    /// when neither is available (headless CI, SSH). Navigates to the Set Up tab
-    /// to cover the 16 Settings IDs.
+    /// when neither is available (headless CI, SSH). The redesigned shell opens on
+    /// the "Set up" pane by default, so the 16 Settings IDs are on screen at launch.
     ///
     /// Note: the 6 old Calibration-view IDs were removed in Phase 14.
     /// The new wizard IDs are covered by CalibrationWizardUITests.
@@ -76,10 +76,11 @@ final class SettingsCalibrationUITests: XCTestCase {
             throw XCTSkip("App window did not appear — Accessibility permission may not be granted, or running headless.")
         }
 
-        // Navigate to Set Up > Roll Setup and check the Settings AX-IDs.
-        let settingsTab = app.tabs["Set Up"]
-        if settingsTab.exists { settingsTab.click() }
-
+        // The 2026-06 UX redesign replaced the "Set Up" TabView tab with a
+        // workflow sidebar whose default selection is the "Set up" pane
+        // (ScanSettingsView). So the Settings AX-IDs render at launch with no
+        // navigation. If the default landing ever changes, click the sidebar row
+        // before this loop.
         for id in newAccessibilityIDs {
             let matches = app.descendants(matching: .any).matching(identifier: id)
             XCTAssertGreaterThanOrEqual(

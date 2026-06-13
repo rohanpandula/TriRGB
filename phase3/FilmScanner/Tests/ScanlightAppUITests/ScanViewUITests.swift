@@ -59,9 +59,10 @@ final class ScanViewUITests: XCTestCase {
             throw XCTSkip("App window did not appear — Accessibility permission may not be granted, or running headless.")
         }
 
-        // Navigate to the Scan tab.
-        let scanTab = app.tabs["Scan"]
-        if scanTab.exists { scanTab.click() }
+        // Navigate to the Scan pane via the workflow sidebar row.
+        let scanRow = app.descendants(matching: .any)
+            .matching(identifier: AccessibilityID.navScan).firstMatch
+        if scanRow.waitForExistence(timeout: 2.0) { scanRow.click() }
 
         // IDs that are always rendered in .idle state.
         let alwaysPresentIDs: [String] = [
