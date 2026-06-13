@@ -113,6 +113,7 @@ def settings(tmp_path):
         level_g=180,
         level_b=160,
         settle_ms=0,  # no sleep in tests
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
 
 
@@ -138,8 +139,16 @@ def test_settings_rejects_extended_low_iso(tmp_path):
     with pytest.raises(ValueError, match="sony_iso"):
         CaptureSettings(output_folder=tmp_path, sony_iso="50")
 
+@pytest.mark.parametrize("field", ["inbox_stable_for_s", "inbox_poll_interval_s"])
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0, float("nan"), float("inf")])
+def test_settings_rejects_nonpositive_or_nonfinite_inbox_timing(tmp_path, field, bad):
+    # <= 0 bypasses the stability window / makes sleep() spin or raise; NaN/inf
+    # makes the stability check never pass so wait_for_new_file hangs.
+    with pytest.raises(ValueError, match=field):
+        CaptureSettings(output_folder=tmp_path, trigger_mode="sdk", **{field: bad})
+
 def test_settings_maps_legacy_lowest_iso_to_scan_base(tmp_path):
-    settings = CaptureSettings(output_folder=tmp_path, sony_iso="lowest")
+    settings = CaptureSettings(output_folder=tmp_path, sony_iso="lowest", trigger_mode="sdk")
 
     assert settings.sony_iso == "100or125"
 
@@ -268,6 +277,8 @@ def test_sdk_runner_error_redacts_saved_auth(tmp_path, caplog):
         sony_capture_path=str(fake_capture),
         sony_user="USERSECRET",
         sony_password="PASSSECRET",
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
+        sdk_persistent=False,  # use one-shot runner so the shell script is invoked directly
     )
     orch = Orchestrator(FakeScanlight(), settings, sleep=_zero_sleep)
 
@@ -739,11 +750,348 @@ def test_manual_mode_selected_by_trigger_mode_setting(tmp_path):
     assert orch._runner.__func__ is Orchestrator._manual_runner
 
 
-def test_sdk_mode_remains_default(tmp_path):
-    s = CaptureSettings(output_folder=tmp_path)  # default trigger_mode="sdk"
+def test_sdk_mode_selectable(tmp_path):
+    # trigger_mode dataclass default was changed to "manual" to match the CLI
+    # default; now "sdk" must be passed explicitly.
+    # With sdk_persistent=True (new default) the persistent runner is selected;
+    # with sdk_persistent=False the one-shot _default_runner is selected.
+    s_persist = CaptureSettings(output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True)
     light = FakeScanlight()
+    orch_persist = Orchestrator(light, s_persist)
+    assert orch_persist._runner.__func__ is Orchestrator._persistent_runner
+
+    s_oneshot = CaptureSettings(output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=False)
+    orch_oneshot = Orchestrator(light, s_oneshot)
+    assert orch_oneshot._runner.__func__ is Orchestrator._default_runner
+
+
+def test_sdk_persistent_used_with_per_channel_shutter(tmp_path):
+    # Persist mode applies each channel's shutter per capture (via the persist
+    # `shutter` command), so DIFFERING per-channel shutters — the narrowband-RGB
+    # norm, blue far longer than red/green — still use the persistent runner.
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/100", shutter_g="1/100", shutter_b="1/4",
+    )
     orch = Orchestrator(light, s)
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
+
+
+def test_shutter_change_closes_persistent_session(tmp_path):
+    # codex#8: a shutter change (esp. CLEARING to None) must close the live
+    # persist session — None means "leave current shutter", so a reused session
+    # would keep capturing at the stale last-applied shutter. A fresh session
+    # starts at the camera default.
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/100", shutter_g="1/100", shutter_b="1/100",
+    )
+    orch = Orchestrator(light, s)
+
+    closed = {"n": 0}
+
+    class _FakeSession:
+        def close(self):
+            closed["n"] += 1
+
+    orch._persistent_session = _FakeSession()
+    orch.update_settings(shutter_r=None, shutter_g=None, shutter_b=None)  # clear all
+    assert closed["n"] == 1, "shutter change must close the live session"
+    assert orch._persistent_session is None
+
+
+def test_mixed_none_shutters_fall_back_to_oneshot(tmp_path):
+    # codex#6: a MIX of explicit and None shutters can't be honored by the
+    # persist session (None can't reset to the camera default after another
+    # channel changed it mid-session) → one-shot runner. All-set (even differing)
+    # and all-None keep the persistent session.
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/100", shutter_g=None, shutter_b="1/4",
+    )
+    orch = Orchestrator(light, s)
+    assert orch._channel_shutters_mixed() is True
     assert orch._runner.__func__ is Orchestrator._default_runner
+
+    # Fill the gap → all-set (differing) → persist again (re-picked on change).
+    orch.update_settings(shutter_g="1/200")
+    assert orch._channel_shutters_mixed() is False
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
+
+    # Clear all → all-None → persist (camera default for every channel).
+    orch.update_settings(shutter_r=None, shutter_g=None, shutter_b=None)
+    assert orch._channel_shutters_mixed() is False
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
+
+
+def test_persistent_session_extras_have_no_startup_shutter(tmp_path, monkeypatch):
+    # Shutter is per-capture now, NOT a startup arg — the session spawn must not
+    # carry --shutter-speed (that would pin all channels to one shutter).
+    import triplet_capture.orchestrator as orch_mod
+
+    captured = {}
+
+    class _RecordingPersist:
+        def __init__(self, binary, extras, env, **kwargs):
+            captured["extras"] = list(extras)
+
+        def capture(self, out_path, *, timeout_s, shutter=None):  # pragma: no cover
+            return 0
+
+        def close(self):  # pragma: no cover - unused
+            pass
+
+    monkeypatch.setattr(orch_mod, "PersistentSonyCapture", _RecordingPersist)
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/160", shutter_g="1/160", shutter_b="1/4",
+    )
+    orch = Orchestrator(light, s)
+    orch._get_or_create_persistent_session()
+    assert "--shutter-speed" not in captured["extras"]
+
+
+def test_persistent_runner_forwards_channel_shutter(tmp_path, monkeypatch):
+    # _persistent_runner must pass the per-channel shutter to session.capture.
+    import triplet_capture.orchestrator as orch_mod
+
+    calls = []
+
+    class _RecordingPersist:
+        def __init__(self, binary, extras, env, **kwargs):
+            pass
+
+        def capture(self, out_path, *, timeout_s, shutter=None):
+            calls.append((out_path.stem, shutter))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(b"\x00" * (70 * 1024 * 1024))
+            return 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(orch_mod, "PersistentSonyCapture", _RecordingPersist)
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/100", shutter_g="1/200", shutter_b="1/4",
+    )
+    orch = Orchestrator(light, s)
+    orch._persistent_runner("R", tmp_path / "f_R.ARW", 30)
+    orch._persistent_runner("B", tmp_path / "f_B.ARW", 30)
+    assert ("f_R", "1/100") in calls
+    assert ("f_B", "1/4") in calls
+
+
+# A real executable fake of `sony-capture --persist` — exercises the actual
+# subprocess line protocol (READY / shutter / capture / quit) end to end.
+_FAKE_PERSIST_SCRIPT = """#!/usr/bin/env python3
+import sys
+logp = None
+for i, a in enumerate(sys.argv):
+    if a == "--log":
+        logp = sys.argv[i + 1]
+logf = open(logp, "a") if logp else None
+print("READY", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if line == "quit":
+        break
+    if line.startswith("shutter "):
+        speed = line[len("shutter "):]
+        if logf:
+            logf.write("shutter %s\\n" % speed); logf.flush()
+        print("SHUTTER_OK %s" % speed, flush=True)
+    elif line.startswith("capture "):
+        path = line[len("capture "):]
+        if logf:
+            logf.write("capture %s\\n" % path); logf.flush()
+        try:
+            open(path, "wb").close()
+        except Exception:
+            pass
+        print("CAPTURE_OK %s" % path, flush=True)
+    else:
+        print("ERR unknown-command", flush=True)
+"""
+
+
+def test_persistent_capture_applies_per_channel_shutter_protocol(tmp_path):
+    import os
+    from triplet_capture.sony_persist import PersistentSonyCapture
+
+    script = tmp_path / "fake_persist.py"
+    script.write_text(_FAKE_PERSIST_SCRIPT)
+    script.chmod(0o755)
+    log = tmp_path / "cmds.log"
+
+    p = PersistentSonyCapture(str(script), ["--log", str(log)], env=dict(os.environ))
+    try:
+        assert p.capture(tmp_path / "R.ARW", timeout_s=5, shutter="1/100") == 0
+        # Same shutter as R → must NOT be re-sent.
+        assert p.capture(tmp_path / "G.ARW", timeout_s=5, shutter="1/100") == 0
+        # Different shutter → must be re-sent.
+        assert p.capture(tmp_path / "B.ARW", timeout_s=5, shutter="1/4") == 0
+    finally:
+        p.close()
+
+    cmds = log.read_text().splitlines()
+    shutters = [c for c in cmds if c.startswith("shutter ")]
+    captures = [c for c in cmds if c.startswith("capture ")]
+    # Shutter sent for R and B only (G reused R's), in order.
+    assert shutters == ["shutter 1/100", "shutter 1/4"]
+    assert len(captures) == 3
+
+
+# Fake whose FIRST spawn dies while processing the `shutter` command (reads the
+# line, then exits without responding) — exercises the respawn-during-shutter
+# path. A spawn-counter sidecar makes the second spawn behave normally.
+_FAKE_PERSIST_DIES_DURING_SHUTTER = """#!/usr/bin/env python3
+import sys
+cpath = None
+for i, a in enumerate(sys.argv):
+    if a == "--count":
+        cpath = sys.argv[i + 1]
+n = 0
+try:
+    n = int(open(cpath).read() or "0")
+except Exception:
+    n = 0
+n += 1
+open(cpath, "w").write(str(n))
+print("READY", flush=True)
+if n == 1:
+    sys.stdin.readline()   # consume the `shutter ...` line, then die unresponsive
+    sys.exit(1)
+for line in sys.stdin:
+    line = line.strip()
+    if line == "quit":
+        break
+    if line.startswith("shutter "):
+        print("SHUTTER_OK %s" % line[len("shutter "):], flush=True)
+    elif line.startswith("capture "):
+        p = line[len("capture "):]
+        try:
+            open(p, "wb").close()
+        except Exception:
+            pass
+        print("CAPTURE_OK %s" % p, flush=True)
+    else:
+        print("ERR unknown-command", flush=True)
+"""
+
+
+# Fake that dies AFTER receiving the capture command but BEFORE CAPTURE_OK —
+# i.e. the shutter "fired" (marker would have been emitted, LED turned off).
+_FAKE_PERSIST_DIES_MID_CAPTURE = """#!/usr/bin/env python3
+import sys
+cpath = None
+for i, a in enumerate(sys.argv):
+    if a == "--count":
+        cpath = sys.argv[i + 1]
+n = 0
+try:
+    n = int(open(cpath).read() or "0")
+except Exception:
+    n = 0
+open(cpath, "w").write(str(n + 1))
+print("READY", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if line == "quit":
+        break
+    if line.startswith("shutter "):
+        print("SHUTTER_OK %s" % line[len("shutter "):], flush=True)
+    elif line.startswith("capture "):
+        sys.exit(1)   # die mid-capture (after the command, before CAPTURE_OK)
+"""
+
+
+def test_persistent_capture_mid_capture_death_does_not_retry(tmp_path):
+    # codex#11: a death AFTER the capture command (shutter may have fired, LED
+    # turned off on the marker) must NOT respawn-retry — a blind retry would
+    # capture a dark frame. It must fail cleanly and spawn exactly once.
+    import os
+    from triplet_capture.sony_persist import PersistentSonyCapture
+
+    script = tmp_path / "fake_mid_death.py"
+    script.write_text(_FAKE_PERSIST_DIES_MID_CAPTURE)
+    script.chmod(0o755)
+    counter = tmp_path / "spawns.txt"
+
+    p = PersistentSonyCapture(
+        str(script), ["--count", str(counter)], env=dict(os.environ), ready_timeout_s=5,
+    )
+    try:
+        rc = p.capture(tmp_path / "R.ARW", timeout_s=5, shutter="1/100")
+        assert rc != 0, "mid-capture death must fail, not silently succeed"
+    finally:
+        p.close()
+    assert int(counter.read_text()) == 1, "mid-capture death must NOT respawn-retry"
+
+
+def test_persistent_capture_respawns_when_process_dies_during_shutter(tmp_path):
+    import os
+    from triplet_capture.sony_persist import PersistentSonyCapture
+
+    script = tmp_path / "fake_dies.py"
+    script.write_text(_FAKE_PERSIST_DIES_DURING_SHUTTER)
+    script.chmod(0o755)
+    counter = tmp_path / "spawns.txt"
+
+    p = PersistentSonyCapture(
+        str(script), ["--count", str(counter)], env=dict(os.environ),
+        ready_timeout_s=5,
+    )
+    try:
+        # First process dies mid-shutter; the helper must respawn and succeed.
+        rc = p.capture(tmp_path / "R.ARW", timeout_s=5, shutter="1/100")
+        assert rc == 0, f"expected respawn+success, got {rc}"
+    finally:
+        p.close()
+    # Two spawns: the one that died during shutter, and the healthy respawn.
+    assert int(counter.read_text()) == 2
+
+
+_FAKE_PERSIST_SLOW_SHUTTER = """#!/usr/bin/env python3
+import sys, time
+print("READY", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if line == "quit":
+        break
+    if line.startswith("shutter "):
+        time.sleep(2.0)                                  # exceed the test timeout
+        print("SHUTTER_OK %s" % line[len("shutter "):], flush=True)  # late reply
+"""
+
+
+def test_persistent_shutter_timeout_cleans_up_desynced_child(tmp_path):
+    # Audit #17: a shutter-apply TIMEOUT must tear down the child so a late
+    # SHUTTER_OK can't poison the next command's queue (mirrors the capture
+    # timeout path). _apply_shutter returns False AND clears _proc.
+    import os
+    from triplet_capture.sony_persist import PersistentSonyCapture
+
+    script = tmp_path / "fake_slow_shutter.py"
+    script.write_text(_FAKE_PERSIST_SLOW_SHUTTER)
+    script.chmod(0o755)
+
+    p = PersistentSonyCapture(str(script), [], env=dict(os.environ), ready_timeout_s=5)
+    try:
+        assert p._spawn() == 0, "fake process should reach READY"
+        proc = p._proc
+        assert proc is not None
+        # Short shutter timeout: the 2s-delayed SHUTTER_OK never arrives in time.
+        assert p._apply_shutter("1/100", timeout_s=0.5) is False, "slow shutter must time out"
+        assert p._proc is None, "timed-out shutter must tear down the desynced child"
+        assert proc.poll() is not None, "the desynced child must be terminated"
+    finally:
+        p.close()
 
 
 def test_sdk_runner_passes_sony_network_auth_args(tmp_path, monkeypatch):
@@ -762,6 +1110,7 @@ def test_sdk_runner_passes_sony_network_auth_args(tmp_path, monkeypatch):
         sony_mac_address="10:32:2C:26:1A:3F",
         sony_user="sdk-user",
         sony_password="sdk-password",
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(FakeScanlight(), s)
 
@@ -804,6 +1153,7 @@ def test_sdk_runner_passes_channel_shutter_speed(tmp_path, monkeypatch):
         shutter_r="1/8",
         shutter_g="1/4",
         shutter_b="1/2",
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(FakeScanlight(), s)
 
@@ -832,6 +1182,8 @@ def test_sdk_runner_failure_stderr_is_returned_in_triplet_error(tmp_path, monkey
         output_folder=tmp_path,
         sony_capture_path="/bin/sony-capture",
         settle_ms=0,
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
+        sdk_persistent=False,  # use one-shot runner to test stderr surfacing via _default_runner
     )
     orch = Orchestrator(FakeScanlight(), s, sleep=_zero_sleep)
 
@@ -855,7 +1207,7 @@ def test_sdk_runner_turns_scanlight_off_after_exposure_marker(tmp_path, monkeypa
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     light = FakeScanlight()
-    s = CaptureSettings(output_folder=tmp_path, sony_capture_path="/bin/sony-capture")
+    s = CaptureSettings(output_folder=tmp_path, sony_capture_path="/bin/sony-capture", trigger_mode="sdk")
     orch = Orchestrator(light, s)
 
     exit_code = orch._default_runner("R", tmp_path / "out.ARW", 30)
@@ -932,10 +1284,13 @@ def test_hw_mode_quarantines_late_files_after_timeout(tmp_path):
 def test_update_settings_repicks_runner_on_trigger_mode_change(tmp_path):
     """Per codex review: switching trigger_mode at runtime must repoint
     the orchestrator at the right internal runner."""
-    sdk_settings = CaptureSettings(output_folder=tmp_path)  # default sdk
+    # sdk_persistent=True → persistent_runner; sdk_persistent=False → default_runner.
+    sdk_settings = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True
+    )
     light = FakeScanlightWithPulse()
     orch = Orchestrator(light, sdk_settings)
-    assert orch._runner.__func__ is Orchestrator._default_runner
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
 
     # Switch to hw mode at runtime
     hw_inbox = tmp_path / "inbox"
@@ -949,8 +1304,12 @@ def test_update_settings_repicks_runner_on_trigger_mode_change(tmp_path):
     orch.update_settings(trigger_mode="manual", ied_inbox=manual_inbox)
     assert orch._runner.__func__ is Orchestrator._manual_runner
 
-    # Switch back to sdk
+    # Switch back to sdk (persistent)
     orch.update_settings(trigger_mode="sdk")
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
+
+    # Switch to sdk one-shot
+    orch.update_settings(sdk_persistent=False)
     assert orch._runner.__func__ is Orchestrator._default_runner
 
 
@@ -958,7 +1317,7 @@ def test_update_settings_does_not_override_explicit_runner(tmp_path):
     """When the caller injected an explicit runner (tests, custom
     deployments), update_settings must NOT clobber it on trigger_mode
     change. The injection is the operator's deliberate override."""
-    sdk_settings = CaptureSettings(output_folder=tmp_path)
+    sdk_settings = CaptureSettings(output_folder=tmp_path, trigger_mode="sdk")
     explicit = lambda *a, **kw: 0
     light = FakeScanlight()
     orch = Orchestrator(light, sdk_settings, sony_capture_runner=explicit)
@@ -975,7 +1334,7 @@ def test_capture_triplet_turns_scanlight_off_even_on_unexpected_exception(tmp_pa
     just in the success and TripletAbort branches. An uncaught OSError
     from the runner (e.g., disk full mid-move) must not leave the LEDs
     powered."""
-    s = CaptureSettings(output_folder=tmp_path, settle_ms=0)
+    s = CaptureSettings(output_folder=tmp_path, settle_ms=0, trigger_mode="sdk")
     light = FakeScanlight()
 
     # Runner that raises something unexpected (not TripletAbort).
@@ -1021,6 +1380,7 @@ def test_ephemeral_port_binds_and_writes_port_file(tmp_path):
         frame_number=1,
         output_folder=tmp_path,
         settle_ms=0,
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(light, settings, sony_capture_runner=lambda *a: 0, sleep=_zero_sleep)
     app = create_app(orch)
@@ -1107,6 +1467,7 @@ def test_signal_driven_shutdown_does_not_deadlock(tmp_path):
         frame_number=1,
         output_folder=tmp_path,
         settle_ms=0,
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(light, settings, sony_capture_runner=lambda *a: 0, sleep=_zero_sleep)
     app = create_app(orch)

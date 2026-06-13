@@ -30,6 +30,7 @@ final class SettingsStore: ObservableObject {
         outputFolder: "",
         triggerMode: "manual",
         iedInbox: nil,
+        sonyTransport: "wifi",
         sonyIpAddress: nil,
         sonyMacAddress: nil,
         sonyUser: nil,
@@ -158,14 +159,20 @@ final class SettingsStore: ObservableObject {
         }
 
         if settings.triggerMode == "sdk" {
-            if settings.sonyIpAddress?.isEmpty ?? true {
+            if !settings.usesSonyUSB && (settings.sonyIpAddress?.isEmpty ?? true) {
                 errors["sonyIpAddress"] = "Sony camera IP address is required for SDK mode."
             }
-            if settings.sonyUser?.isEmpty ?? true {
-                errors["sonyUser"] = "Sony Access Auth user is required for SDK mode."
-            }
-            if settings.sonyPassword?.isEmpty ?? true {
-                errors["sonyPassword"] = "Sony Access Auth password is required for SDK mode."
+            // Access Auth credentials are required for the Wi-Fi SDK path. The
+            // USB SDK path supports bodies without Access Auth (the C++ capture
+            // defaults the user and passes an empty password for USB), so creds
+            // are optional there — requiring them would block a supported setup.
+            if !settings.usesSonyUSB {
+                if settings.sonyUser?.isEmpty ?? true {
+                    errors["sonyUser"] = "Sony Access Auth user is required for Wi-Fi SDK mode."
+                }
+                if settings.sonyPassword?.isEmpty ?? true {
+                    errors["sonyPassword"] = "Sony Access Auth password is required for Wi-Fi SDK mode."
+                }
             }
         }
 

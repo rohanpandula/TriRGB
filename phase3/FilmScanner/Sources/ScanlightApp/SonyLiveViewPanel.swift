@@ -1,4 +1,4 @@
-// SonyLiveViewPanel — persistent SDK live-view preview for the Sony Wi-Fi path.
+// SonyLiveViewPanel — persistent SDK live-view preview for the Sony SDK path.
 //
 // The preview starts one `sony-capture --live-view-stream-out` process. That
 // process keeps a single SDK connection open, refreshes one JPEG file in the
@@ -21,7 +21,7 @@ private enum SonyLiveViewState: Equatable {
         case .idle:
             return "Preview stopped"
         case .starting:
-            return "Opening live view... this can take 10-30 seconds over Wi-Fi."
+            return "Opening live view... this can take 10-30 seconds."
         case .running(let message), .failed(let message):
             return message
         }
@@ -215,6 +215,9 @@ struct SonyLiveViewPanel: View {
             .accessibilityLabel(liveViewState.text)
         }
         .onChange(of: settings.triggerMode) { _ in
+            stopLiveView(clearImage: true, state: .idle)
+        }
+        .onChange(of: settings.sonyTransport ?? "") { _ in
             stopLiveView(clearImage: true, state: .idle)
         }
         .onChange(of: settings.sonyIpAddress ?? "") { _ in
@@ -428,7 +431,7 @@ struct SonyLiveViewPanel: View {
             let proc = Process()
             proc.executableURL = command.executableURL
             proc.arguments = command.arguments
-            proc.environment = ProcessInfo.processInfo.environment
+            proc.environment = command.environment
 
             let stdoutPipe = Pipe()
             let stderrPipe = Pipe()
@@ -517,6 +520,10 @@ struct SonyLiveViewPanel: View {
                         liveViewProcess = nil
                         liveViewTask = nil
                         isLiveViewActive = false
+                        // Live view turned the preview white light on; the
+                        // process is gone, so turn it back off here too — manual
+                        // stop isn't the only way out (idempotent: no-op if off).
+                        turnOffPreviewWhiteLightIfNeeded()
                     }
                     if !sawFrame {
                         liveViewState = .failed(stderr.isEmpty
@@ -538,8 +545,11 @@ struct SonyLiveViewPanel: View {
                         liveViewProcess = nil
                         liveViewTask = nil
                         isLiveViewActive = false
+                        // Same cleanup as the exit path / manual stop: don't
+                        // strand the preview white light when we time out.
+                        turnOffPreviewWhiteLightIfNeeded()
                     }
-                    liveViewState = .failed("Timed out opening Sony live view after 45 seconds. Check camera power, Wi-Fi PC Remote, and whether another Sony app is connected.")
+                    liveViewState = .failed("Timed out opening Sony live view after 45 seconds. Check camera power, SDK remote mode, and whether another Sony app is connected.")
                 }
                 return
             }
@@ -589,14 +599,17 @@ struct SonyLiveViewPanel: View {
     }
 
     private func sonyCredentialValidationError() -> String? {
-        if missing(settings.sonyIpAddress) {
-            return "Enter the Sony IP address first."
-        }
-        if missing(settings.sonyUser) {
-            return "Enter the Sony Access Auth user first."
-        }
-        if missing(settings.sonyPassword) {
-            return "Enter the Sony Access Auth password first."
+        // USB connects without IP / Access Auth; only gate those for Wi-Fi.
+        if !settings.usesSonyUSB {
+            if missing(settings.sonyIpAddress) {
+                return "Enter the Sony IP address first."
+            }
+            if missing(settings.sonyUser) {
+                return "Enter the Sony Access Auth user first."
+            }
+            if missing(settings.sonyPassword) {
+                return "Enter the Sony Access Auth password first."
+            }
         }
         return nil
     }

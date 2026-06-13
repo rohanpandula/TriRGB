@@ -193,6 +193,10 @@ public enum AccessibilityID {
     public static let scanSonyLiveViewZoomSlider = "slider-scan-sony-live-view-zoom"
     public static let scanSonyLiveViewWhiteLightToggle = "toggle-scan-sony-live-view-white"
 
+    /// Channel-prompt banner shown in manual/hw mode while the operator must
+    /// fire the IED for the named channel (F1). Value is "R", "G", or "B".
+    public static let scanChannelPromptBanner          = "lbl-scan-channel-prompt"
+
     // MARK: - Positive inversion view
 
     public static let invertPickFilesButton       = "btn-invert-pick-files"

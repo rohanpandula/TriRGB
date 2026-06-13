@@ -178,6 +178,15 @@ struct ScanView: View {
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
+
+                            // F1 — channel prompt banner for manual/hw trigger modes.
+                            // Displayed while the backend is waiting for the operator
+                            // to fire the IED for the named channel. Only shown when
+                            // trigger mode is manual or hw (sdk auto-fires the camera).
+                            if let channel = coordinator.waitingForChannel,
+                               ["manual", "hw"].contains(store.settings.triggerMode) {
+                                channelPromptBanner(channel: channel)
+                            }
                         }
                     }
                 }
@@ -423,5 +432,38 @@ struct ScanView: View {
         case "failed":      return Theme.State.danger
         default:            return Theme.State.idle
         }
+    }
+
+    /// F1 — channel-prompt banner shown during manual/hw capture.
+    ///
+    /// Accent color per channel mirrors the Scanlight LED color convention:
+    ///   R → red, G → green, B → blue.
+    @ViewBuilder
+    private func channelPromptBanner(channel: String) -> some View {
+        let tint: Color = switch channel {
+        case "R": .red
+        case "G": .green
+        case "B": .blue
+        default:  Theme.State.warning
+        }
+        HStack(spacing: Theme.Space.sm) {
+            Image(systemName: "bolt.fill")
+                .foregroundStyle(tint)
+                .accessibilityHidden(true)
+            Text("Fire \(channel) in IED now")
+                .font(.headline)
+                .foregroundStyle(tint)
+            Spacer(minLength: 0)
+        }
+        .accessibilityIdentifier(AccessibilityID.scanChannelPromptBanner)
+        .accessibilityValue(channel)
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.vertical, Theme.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                .fill(tint.opacity(0.12))
+        )
+        .animation(.easeOut(duration: 0.2), value: channel)
     }
 }

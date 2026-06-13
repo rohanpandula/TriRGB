@@ -262,24 +262,45 @@ struct ScanSettingsView: View {
                             Divider()
                                 .padding(.vertical, Theme.Space.xs)
 
-                            Text("Sony SDK uses Wi-Fi PC Remote and saves each ARW directly to the roll folder.")
+                            Text("Sony SDK fires the camera and saves each ARW directly to the roll folder. Use Wi-Fi for PC Remote, or USB when the camera enumerates through Sony's USB SDK path.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
 
-                            settingsTextFieldRow(
-                                label: "IP",
-                                placeholder: "Camera IP, e.g. 10.0.0.x",
-                                id: AccessibilityID.settingsSonyIpField,
-                                text: optionalStringBinding(\.sonyIpAddress)
-                            )
-                            validationError("sonyIpAddress")
+                            HStack(spacing: Theme.Space.md) {
+                                Text("Transport")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 96, alignment: .leading)
+                                Picker("Sony transport", selection: sonyTransportBinding) {
+                                    Text("Wi-Fi").tag("wifi")
+                                    Text("USB").tag("usb")
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                                .frame(maxWidth: 260)
+                                Spacer(minLength: 0)
+                            }
 
-                            settingsTextFieldRow(
-                                label: "MAC",
-                                placeholder: "Camera MAC from Access Auth screen",
-                                id: AccessibilityID.settingsSonyMacField,
-                                text: optionalStringBinding(\.sonyMacAddress)
-                            )
+                            if !store.settings.usesSonyUSB {
+                                settingsTextFieldRow(
+                                    label: "IP",
+                                    placeholder: "Camera IP, e.g. 10.0.0.x",
+                                    id: AccessibilityID.settingsSonyIpField,
+                                    text: optionalStringBinding(\.sonyIpAddress)
+                                )
+                                validationError("sonyIpAddress")
+
+                                settingsTextFieldRow(
+                                    label: "MAC",
+                                    placeholder: "Camera MAC from Access Auth screen",
+                                    id: AccessibilityID.settingsSonyMacField,
+                                    text: optionalStringBinding(\.sonyMacAddress)
+                                )
+                            } else {
+                                Text("USB mode uses Sony SDK USB enumeration. Leave the camera connected by USB; IP and MAC are ignored for capture, calibration, and live view.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
 
                             settingsTextFieldRow(
                                 label: "User",
@@ -392,8 +413,20 @@ struct ScanSettingsView: View {
         case "hw":
             return "Scanlight fires the shutter over the 3.5 mm jack; RAWs arrive in the IED inbox."
         default:
-            return "Sony SDK fires the camera over Wi-Fi and downloads each ARW directly."
+            return store.settings.usesSonyUSB
+                ? "Sony SDK fires the camera over USB and downloads each ARW directly."
+                : "Sony SDK fires the camera over Wi-Fi and downloads each ARW directly."
         }
+    }
+
+    private var sonyTransportBinding: Binding<String> {
+        Binding(
+            get: { store.settings.sonyTransportMode },
+            set: { newValue in
+                store.settings.sonyTransport = newValue == "usb" ? "usb" : "wifi"
+                refreshValidationIfNeeded()
+            }
+        )
     }
 
     private var calibrationTargetPercentBinding: Binding<Int> {

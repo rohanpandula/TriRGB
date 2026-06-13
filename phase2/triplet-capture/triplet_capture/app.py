@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,30 @@ from flask import Flask, jsonify, render_template, request
 from scanlight import Scanlight
 
 from .orchestrator import CaptureSettings, Orchestrator
+
+
+def _json_object_body() -> tuple[Optional[dict], Optional[tuple]]:
+    """Parse the request body as a JSON object.
+
+    Returns ``(data, None)`` on success. An ABSENT body maps to ``{}`` (a no-op
+    for routes that have defaults). Returns ``(None, (response, 400))`` when the
+    body is present but MALFORMED (invalid/truncated JSON — which would otherwise
+    run hardware ops with silent defaults and hide client corruption) or is a
+    non-object (JSON list / string / number / bool, including falsy `[]` /
+    `false` / `0` / `""`, which would crash on ``.get()`` / ``.items()``). One
+    helper so every route handles malformed top-level shapes the same way.
+    """
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        # get_json returns None for both an absent body AND invalid JSON. A
+        # non-empty raw body that failed to parse is malformed → 400; a truly
+        # empty body is absent → {} (no-op).
+        if request.get_data() and request.get_data().strip():
+            return None, (jsonify({"error": "request body is not valid JSON"}), 400)
+        return {}, None
+    if not isinstance(data, dict):
+        return None, (jsonify({"error": "request body must be a JSON object"}), 400)
+    return data, None
 
 
 def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: str = "") -> Flask:
@@ -36,6 +61,12 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     app.config["LAST_CAL_RESULT"] = None
     app.config["LAST_CAL_CALL_ID"] = None
     app.config["CURRENT_CAL_CALL_ID"] = None
+    # Warmup sleep for calibration routes. Production uses real time.sleep so the
+    # LED/sensor actually stabilizes before measuring (calibrate_exposure's 2s,
+    # capture_flats' 5s). Tests override this with a no-op so the suite stays
+    # fast — the routes must NOT hard-code the no-op (that skips the warmup in
+    # production and calibrates against an unstable LED).
+    app.config["CAL_WARMUP_SLEEP"] = time.sleep
 
     @app.get("/")
     def index():
@@ -48,17 +79,29 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
         # probe's TOCTOU window. Empty string when launched without --ready-nonce.
         state = _settings_dict(orchestrator.settings)
         state["ready_nonce"] = ready_nonce
+        # F1: which channel the operator should fire right now (null when idle).
+        state["waiting_for_channel"] = orchestrator.waiting_for_channel
         return jsonify(state)
 
     @app.post("/api/settings")
     def post_settings():
-        data = request.get_json(force=True, silent=True) or {}
+        data, _err = _json_object_body()
+        if _err is not None:
+            return _err
+        # Claim the activity slot for the (brief) update so it cannot interleave
+        # with a capture or a blocking calibration. Those hold the activity but
+        # release Orchestrator._lock between single-channel captures, so mutating
+        # levels/shutters/output mid-run could corrupt an exposure bisection or
+        # the roll. Same guard the capture/calibrate/preview-light routes use.
+        if not orchestrator.try_begin_activity("update_settings"):
+            return jsonify({"error": "A capture or calibration is in progress — wait for it to finish."}), 409
         try:
             # Whitelist fields so HTTP can't set arbitrary attrs.
             allowed = {
                 "roll_name", "frame_number", "output_folder",
                 "level_r", "level_g", "level_b", "settle_ms",
                 "shutter_r", "shutter_g", "shutter_b",
+                "inbox_stable_for_s",  # F3: expose stability window
             }
             updates = {k: v for k, v in data.items() if k in allowed}
             # Coerce ints
@@ -68,16 +111,37 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             for k in ("shutter_r", "shutter_g", "shutter_b"):
                 if k in updates:
                     updates[k] = str(updates[k]).strip() or None
+            # F3: inbox_stable_for_s is a float
+            if "inbox_stable_for_s" in updates:
+                updates["inbox_stable_for_s"] = float(updates["inbox_stable_for_s"])
             settings = orchestrator.update_settings(**updates)
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
+            # TypeError covers JSON null reaching int()/float() coercion — a
+            # client input error (400), not an internal server error (500).
             return jsonify({"error": str(e)}), 400
+        finally:
+            orchestrator.end_activity()
         return jsonify(_settings_dict(settings))
 
     @app.post("/api/capture")
     def post_capture():
         retake_str = request.args.get("retake", "")
         retake = retake_str.lower() in ("1", "true", "yes")
-        result = orchestrator.capture_triplet(retake=retake)
+        # Bug-2: claim the exclusive-activity slot. A calibration holding the
+        # slot will cause this to return 409 so camera commands don't interleave.
+        if not orchestrator.try_begin_activity("capture"):
+            return jsonify({
+                "success": False,
+                "frame_number": orchestrator.settings.frame_number,
+                "files": {},
+                "error": "a capture or calibration is already in progress",
+                "duration_s": 0.0,
+                "next_frame": orchestrator.settings.frame_number,
+            }), 409
+        try:
+            result = orchestrator.capture_triplet(retake=retake)
+        finally:
+            orchestrator.end_activity()
         return jsonify({
             "success": result.success,
             "frame_number": result.frame_number,
@@ -124,13 +188,24 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     @app.post("/api/calibrate/preview-light")
     def post_calibrate_preview_light():
         orch = app.config["ORCHESTRATOR"]
-        lock_acquired = orch._lock.acquire(blocking=False)
-        if not lock_acquired:
-            return jsonify({"error": "A capture is in progress — wait for it to finish."}), 409
+        # Claim the single activity slot for the whole operation. This is
+        # atomically mutually exclusive with capture and the blocking calibrate
+        # routes (they claim the same slot), closing the check-then-lock TOCTOU
+        # a separate current_activity probe + _lock.acquire would leave open.
+        if not orch.try_begin_activity("preview_light"):
+            return jsonify({"error": "A capture or calibration is in progress — wait for it to finish."}), 409
 
         try:
-            data = request.get_json(force=True, silent=True) or {}
-            enabled = bool(data.get("enabled", False))
+            data, _err = _json_object_body()
+            if _err is not None:
+                return _err
+            # Strict bool: this route drives the preview WHITE LED, and
+            # bool("false") is True — a loose cast would turn the light ON for any
+            # truthy non-bool. JSON booleans decode to Python bool; reject anything
+            # else (isinstance(1, bool) is False, so ints are rejected too).
+            enabled = data.get("enabled", False)
+            if not isinstance(enabled, bool):
+                return jsonify({"error": "enabled must be a boolean"}), 400
             try:
                 level = int(data.get("level", 200))
             except (TypeError, ValueError) as e:
@@ -147,343 +222,371 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
         except Exception as e:  # noqa: BLE001 - surface hardware errors as JSON
             return jsonify({"error": str(e)}), 500
         finally:
-            orch._lock.release()
+            orch.end_activity()
 
     @app.post("/api/calibrate/exposure")
     def post_calibrate_exposure():
         orch = app.config["ORCHESTRATOR"]
-        # Best-effort concurrent-scan check (409). Not a hard barrier — capture_triplet's
-        # internal _lock is the true serializer. This probe is a UX convenience only.
-        lock_acquired = orch._lock.acquire(blocking=False)
-        if not lock_acquired:
+        # Bug-2: claim the exclusive-activity slot so concurrent captures
+        # are rejected (409) for the entire calibration duration, not just
+        # the brief TOCTOU window of the old check-then-unlock pattern.
+        if not orch.try_begin_activity("calibrate_exposure"):
             return jsonify({
-                "error": "A scan is in progress — wait for it to finish.",
+                "error": "A scan or calibration is in progress — wait for it to finish.",
                 "call_id": app.config.get("CURRENT_CAL_CALL_ID"),
             }), 409
-        orch._lock.release()
-
-        data = request.get_json(force=True, silent=True) or {}
-
-        # Parse + validate optional rebate coordinates (T-14-01)
-        try:
-            rebate_col = int(data["rebate_col"]) if "rebate_col" in data else None
-            rebate_row = int(data["rebate_row"]) if "rebate_row" in data else None
-            rebate_w = int(data.get("rebate_w", 100))
-            rebate_h = int(data.get("rebate_h", 20))
-        except (ValueError, TypeError) as e:
-            return jsonify({"error": f"rebate parameter must be an integer: {e}"}), 400
-
-        if rebate_col is not None and rebate_col < 0:
-            return jsonify({"error": f"rebate_col must be >= 0, got {rebate_col}"}), 400
-        if rebate_row is not None and rebate_row < 0:
-            return jsonify({"error": f"rebate_row must be >= 0, got {rebate_row}"}), 400
-        if rebate_w <= 0:
-            return jsonify({"error": f"rebate_w must be > 0, got {rebate_w}"}), 400
-        if rebate_h <= 0:
-            return jsonify({"error": f"rebate_h must be > 0, got {rebate_h}"}), 400
 
         try:
-            target_fraction = float(data.get("target_fraction", 0.85))
-        except (ValueError, TypeError) as e:
-            return jsonify({"error": f"target_fraction must be numeric: {e}"}), 400
-        if not 0.5 <= target_fraction <= 0.9:
-            return jsonify({
-                "error": (
-                    "target_fraction must be between 0.50 and 0.90 "
-                    f"(got {target_fraction:.3f})"
+            data, _err = _json_object_body()
+            if _err is not None:
+                return _err
+
+            # Parse + validate optional rebate coordinates (T-14-01)
+            try:
+                rebate_col = int(data["rebate_col"]) if "rebate_col" in data else None
+                rebate_row = int(data["rebate_row"]) if "rebate_row" in data else None
+                rebate_w = int(data.get("rebate_w", 100))
+                rebate_h = int(data.get("rebate_h", 20))
+            except (ValueError, TypeError) as e:
+                return jsonify({"error": f"rebate parameter must be an integer: {e}"}), 400
+
+            if rebate_col is not None and rebate_col < 0:
+                return jsonify({"error": f"rebate_col must be >= 0, got {rebate_col}"}), 400
+            if rebate_row is not None and rebate_row < 0:
+                return jsonify({"error": f"rebate_row must be >= 0, got {rebate_row}"}), 400
+            if rebate_w <= 0:
+                return jsonify({"error": f"rebate_w must be > 0, got {rebate_w}"}), 400
+            if rebate_h <= 0:
+                return jsonify({"error": f"rebate_h must be > 0, got {rebate_h}"}), 400
+
+            try:
+                target_fraction = float(data.get("target_fraction", 0.85))
+            except (ValueError, TypeError) as e:
+                return jsonify({"error": f"target_fraction must be numeric: {e}"}), 400
+            if not 0.5 <= target_fraction <= 0.9:
+                return jsonify({
+                    "error": (
+                        "target_fraction must be between 0.50 and 0.90 "
+                        f"(got {target_fraction:.3f})"
+                    )
+                }), 400
+
+            try:
+                seed_recipe = _parse_exposure_seed_recipe(data)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 400
+
+            call_id = str(data.get("call_id") or uuid.uuid4())
+            app.config["CURRENT_CAL_CALL_ID"] = call_id
+            app.config["LAST_CAL_RESULT"] = None
+            app.config["LAST_CAL_CALL_ID"] = None
+
+            from c41_core.contracts import BaseRegionDescriptor
+            if rebate_col is not None and rebate_row is not None:
+                base_region = BaseRegionDescriptor(
+                    x=rebate_col, y=rebate_row, w=rebate_w, h=rebate_h,
+                    base_rgb=(8930.0, 12097.0, 2952.0),
+                    uniformity_cv=1.5,
+                    source="manual",
                 )
-            }), 400
+            else:
+                # Default centre strip
+                base_region = BaseRegionDescriptor(
+                    x=4, y=4, w=100, h=20,
+                    base_rgb=(8930.0, 12097.0, 2952.0),
+                    uniformity_cv=1.5,
+                    source="auto",
+                )
 
-        try:
-            seed_recipe = _parse_exposure_seed_recipe(data)
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 400
+            demosaic_factory = app.config.get("DEMOSAIC_FACTORY", None)
 
-        call_id = str(data.get("call_id") or uuid.uuid4())
-        app.config["CURRENT_CAL_CALL_ID"] = call_id
-        app.config["LAST_CAL_RESULT"] = None
-        app.config["LAST_CAL_CALL_ID"] = None
-
-        from c41_core.contracts import BaseRegionDescriptor
-        if rebate_col is not None and rebate_row is not None:
-            base_region = BaseRegionDescriptor(
-                x=rebate_col, y=rebate_row, w=rebate_w, h=rebate_h,
-                base_rgb=(8930.0, 12097.0, 2952.0),
-                uniformity_cv=1.5,
-                source="manual",
-            )
-        else:
-            # Default centre strip
-            base_region = BaseRegionDescriptor(
-                x=4, y=4, w=100, h=20,
-                base_rgb=(8930.0, 12097.0, 2952.0),
-                uniformity_cv=1.5,
-                source="auto",
-            )
-
-        demosaic_factory = app.config.get("DEMOSAIC_FACTORY", None)
-
-        try:
-            import json as _json
-            from triplet_capture.calibrate_exposure import calibrate_exposure
-            _append_calibration_log(
-                orch,
-                "calibration_started",
-                call_id=call_id,
-                rebate_region={
-                    "x": base_region.x,
-                    "y": base_region.y,
-                    "w": base_region.w,
-                    "h": base_region.h,
-                    "source": base_region.source,
-                },
-                has_seed=seed_recipe is not None,
-                target_fraction=target_fraction,
-            )
-            result = calibrate_exposure(
-                orch._scanlight,
-                orch.settings,
-                base_region,
-                orchestrator=orch,
-                sleep=lambda _: None,
-                demosaic_factory=demosaic_factory,
-                seed_recipe=seed_recipe,
-                call_id=call_id,
-                target_fraction=target_fraction,
-            )
-            app.config["LAST_CAL_RESULT"] = result
-            app.config["LAST_CAL_CALL_ID"] = call_id
-            body = _json.loads(result.to_json())
-            body["call_id"] = call_id
-            return jsonify(body)
-        except (RuntimeError, ValueError) as e:
-            return jsonify({"error": str(e)}), 500
+            try:
+                import json as _json
+                from triplet_capture.calibrate_exposure import calibrate_exposure
+                _append_calibration_log(
+                    orch,
+                    "calibration_started",
+                    call_id=call_id,
+                    rebate_region={
+                        "x": base_region.x,
+                        "y": base_region.y,
+                        "w": base_region.w,
+                        "h": base_region.h,
+                        "source": base_region.source,
+                    },
+                    has_seed=seed_recipe is not None,
+                    target_fraction=target_fraction,
+                )
+                result = calibrate_exposure(
+                    orch._scanlight,
+                    orch.settings,
+                    base_region,
+                    orchestrator=orch,
+                    sleep=app.config["CAL_WARMUP_SLEEP"],
+                    demosaic_factory=demosaic_factory,
+                    seed_recipe=seed_recipe,
+                    call_id=call_id,
+                    target_fraction=target_fraction,
+                )
+                app.config["LAST_CAL_RESULT"] = result
+                app.config["LAST_CAL_CALL_ID"] = call_id
+                body = _json.loads(result.to_json())
+                body["call_id"] = call_id
+                return jsonify(body)
+            except (RuntimeError, ValueError) as e:
+                return jsonify({"error": str(e)}), 500
+            finally:
+                if app.config.get("CURRENT_CAL_CALL_ID") == call_id:
+                    app.config["CURRENT_CAL_CALL_ID"] = None
         finally:
-            if app.config.get("CURRENT_CAL_CALL_ID") == call_id:
-                app.config["CURRENT_CAL_CALL_ID"] = None
+            orch.end_activity()
 
     @app.post("/api/calibrate/ffc")
     def post_calibrate_ffc():
         orch = app.config["ORCHESTRATOR"]
-        # Best-effort concurrent-scan check (409). Not a hard barrier — capture_triplet's
-        # internal _lock is the true serializer. This probe is a UX convenience only.
-        lock_acquired = orch._lock.acquire(blocking=False)
-        if not lock_acquired:
-            return jsonify({"error": "A scan is in progress — wait for it to finish."}), 409
-        orch._lock.release()
+        # Bug-2: use the activity guard for the full FFC duration.
+        if not orch.try_begin_activity("calibrate_ffc"):
+            return jsonify({"error": "A scan or calibration is in progress — wait for it to finish."}), 409
 
-        data = request.get_json(force=True, silent=True) or {}
         try:
-            n_frames = int(data.get("n_frames", 8))
-        except (ValueError, TypeError):
-            return jsonify({"error": "n_frames must be an integer"}), 400
-
-        # Get black levels from last calibration or defaults
-        last_cal = app.config.get("LAST_CAL_RESULT", None)
-        if last_cal is not None:
-            black_levels = (last_cal.r, last_cal.g, last_cal.b)
-            # FIX-C: restore the orchestrator to calibrated per-channel LED levels before
-            # capturing flats. calibrate_exposure leaves the orchestrator at its last
-            # single-channel probe state (only one channel lit at a time), so flats would
-            # be captured at wrong/dark levels on hardware without this restore.
-            # Pre-hardware tests use an injected FLAT_DEMOSAIC_FN so levels don't affect them.
-            orch.update_settings(
-                level_r=last_cal.r.led_level,
-                level_g=last_cal.g.led_level,
-                level_b=last_cal.b.led_level,
-                shutter_r=last_cal.r.shutter_speed or None,
-                shutter_g=last_cal.g.shutter_speed or None,
-                shutter_b=last_cal.b.shutter_speed or None,
-            )
-        elif all(k in data for k in (
-            "led_level_r", "led_level_g", "led_level_b",
-            "black_level_r", "black_level_g", "black_level_b",
-        )):
-            from c41_core import ChannelCalibration
+            data, _err = _json_object_body()
+            if _err is not None:
+                return _err
             try:
-                black_levels = (
-                    ChannelCalibration(
-                        channel="R",
-                        led_level=int(data["led_level_r"]),
-                        black_level=float(data["black_level_r"]),
-                        gain=1.0,
-                        clip_fraction=0.0,
-                        shutter_speed=str(data.get("shutter_r", "") or ""),
-                    ),
-                    ChannelCalibration(
-                        channel="G",
-                        led_level=int(data["led_level_g"]),
-                        black_level=float(data["black_level_g"]),
-                        gain=1.0,
-                        clip_fraction=0.0,
-                        shutter_speed=str(data.get("shutter_g", "") or ""),
-                    ),
-                    ChannelCalibration(
-                        channel="B",
-                        led_level=int(data["led_level_b"]),
-                        black_level=float(data["black_level_b"]),
-                        gain=1.0,
-                        clip_fraction=0.0,
-                        shutter_speed=str(data.get("shutter_b", "") or ""),
-                    ),
+                n_frames = int(data.get("n_frames", 8))
+            except (ValueError, TypeError):
+                return jsonify({"error": "n_frames must be an integer"}), 400
+            if n_frames < 1:
+                # capture_flats() raises ValueError for n_frames < 1; reject it
+                # here as a client error (400), not an unhandled 500.
+                return jsonify({"error": "n_frames must be >= 1"}), 400
+
+            # Get black levels from last calibration or defaults
+            last_cal = app.config.get("LAST_CAL_RESULT", None)
+            if last_cal is not None:
+                black_levels = (last_cal.r, last_cal.g, last_cal.b)
+                # FIX-C: restore the orchestrator to calibrated per-channel LED levels before
+                # capturing flats. calibrate_exposure leaves the orchestrator at its last
+                # single-channel probe state (only one channel lit at a time), so flats would
+                # be captured at wrong/dark levels on hardware without this restore.
+                # Pre-hardware tests use an injected FLAT_DEMOSAIC_FN so levels don't affect them.
+                orch.update_settings(
+                    level_r=last_cal.r.led_level,
+                    level_g=last_cal.g.led_level,
+                    level_b=last_cal.b.led_level,
+                    shutter_r=last_cal.r.shutter_speed or None,
+                    shutter_g=last_cal.g.shutter_speed or None,
+                    shutter_b=last_cal.b.shutter_speed or None,
                 )
-            except (ValueError, TypeError) as e:
-                return jsonify({"error": f"calibration levels must be numeric: {e}"}), 400
-            orch.update_settings(
-                level_r=black_levels[0].led_level,
-                level_g=black_levels[1].led_level,
-                level_b=black_levels[2].led_level,
-                shutter_r=black_levels[0].shutter_speed or None,
-                shutter_g=black_levels[1].shutter_speed or None,
-                shutter_b=black_levels[2].shutter_speed or None,
-            )
-        else:
-            from c41_core import ChannelCalibration
-            black_levels = (
-                ChannelCalibration(channel="R", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
-                ChannelCalibration(channel="G", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
-                ChannelCalibration(channel="B", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
-            )
+            elif all(k in data for k in (
+                "led_level_r", "led_level_g", "led_level_b",
+                "black_level_r", "black_level_g", "black_level_b",
+            )):
+                from c41_core import ChannelCalibration
+                try:
+                    black_levels = (
+                        ChannelCalibration(
+                            channel="R",
+                            led_level=int(data["led_level_r"]),
+                            black_level=float(data["black_level_r"]),
+                            gain=1.0,
+                            clip_fraction=0.0,
+                            shutter_speed=str(data.get("shutter_r", "") or ""),
+                        ),
+                        ChannelCalibration(
+                            channel="G",
+                            led_level=int(data["led_level_g"]),
+                            black_level=float(data["black_level_g"]),
+                            gain=1.0,
+                            clip_fraction=0.0,
+                            shutter_speed=str(data.get("shutter_g", "") or ""),
+                        ),
+                        ChannelCalibration(
+                            channel="B",
+                            led_level=int(data["led_level_b"]),
+                            black_level=float(data["black_level_b"]),
+                            gain=1.0,
+                            clip_fraction=0.0,
+                            shutter_speed=str(data.get("shutter_b", "") or ""),
+                        ),
+                    )
+                except (ValueError, TypeError) as e:
+                    return jsonify({"error": f"calibration levels must be numeric: {e}"}), 400
+                try:
+                    orch.update_settings(
+                        level_r=black_levels[0].led_level,
+                        level_g=black_levels[1].led_level,
+                        level_b=black_levels[2].led_level,
+                        shutter_r=black_levels[0].shutter_speed or None,
+                        shutter_g=black_levels[1].shutter_speed or None,
+                        shutter_b=black_levels[2].shutter_speed or None,
+                    )
+                except ValueError as e:
+                    # Out-of-range levels (numeric but invalid) raise from
+                    # __post_init__ — a 400, not an unhandled 500.
+                    return jsonify({"error": f"calibration levels out of range: {e}"}), 400
+            else:
+                from c41_core import ChannelCalibration
+                black_levels = (
+                    ChannelCalibration(channel="R", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
+                    ChannelCalibration(channel="G", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
+                    ChannelCalibration(channel="B", led_level=128, black_level=256.0, gain=1.0, clip_fraction=0.0),
+                )
 
-        flat_demosaic_fn = app.config.get("FLAT_DEMOSAIC_FN", None)
+            flat_demosaic_fn = app.config.get("FLAT_DEMOSAIC_FN", None)
 
-        try:
-            import json as _json
-            import importlib.util as _util
-            from pathlib import Path as _Path
-            from triplet_capture.capture_flats import capture_flats
+            try:
+                import json as _json
+                import importlib.util as _util
+                from pathlib import Path as _Path
+                from triplet_capture.capture_flats import capture_flats
 
-            _phase2_rgb = _Path(__file__).resolve().parent.parent.parent.parent / "phase2" / "rgb-composite"
-            _script_path = _Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "inspect-calibration.py"
+                _phase2_rgb = _Path(__file__).resolve().parent.parent.parent.parent / "phase2" / "rgb-composite"
+                _script_path = _Path(__file__).resolve().parent.parent.parent.parent / "scripts" / "inspect-calibration.py"
 
-            # Pre-load rgb_composite.ffc directly (bypassing rgb_composite/__init__.py which
-            # eagerly imports composite.py → rawpy via its __all__ re-exports).
-            # Must happen BEFORE calling capture_flats, which lazily imports
-            # `from rgb_composite.ffc import _box_filter_2d` inside _cv().
-            # Once "rgb_composite.ffc" is in sys.modules Python finds the cached
-            # module without executing __init__.py.
-            #
-            # WR-02 note: this bypass keeps the route hardware-free for TESTS (via the
-            # injected FLAT_DEMOSAIC_FN). The PRODUCTION real-demosaic path calls
-            # _demosaic_cal_frame → `from .composite import demosaic_linear` (relative
-            # import inside ffc.py), which requires rawpy at runtime. rawpy IS present on
-            # real hardware (M2). Do NOT pre-load rgb_composite.composite here — composite.py
-            # imports rawpy at module level, which would break the hardware-free invariant.
-            if "rgb_composite.ffc" not in sys.modules:
-                _ffc_path = _phase2_rgb / "rgb_composite" / "ffc.py"
-                _ffc_spec = _util.spec_from_file_location("rgb_composite.ffc", str(_ffc_path))
-                _ffc_mod = _util.module_from_spec(_ffc_spec)
-                sys.modules["rgb_composite.ffc"] = _ffc_mod
-                _ffc_spec.loader.exec_module(_ffc_mod)
+                # Pre-load rgb_composite.ffc directly (bypassing rgb_composite/__init__.py which
+                # eagerly imports composite.py → rawpy via its __all__ re-exports).
+                # Must happen BEFORE calling capture_flats, which lazily imports
+                # `from rgb_composite.ffc import _box_filter_2d` inside _cv().
+                # Once "rgb_composite.ffc" is in sys.modules Python finds the cached
+                # module without executing __init__.py.
+                #
+                # WR-02 note: this bypass keeps the route hardware-free for TESTS (via the
+                # injected FLAT_DEMOSAIC_FN). The PRODUCTION real-demosaic path calls
+                # _demosaic_cal_frame → `from .composite import demosaic_linear` (relative
+                # import inside ffc.py), which requires rawpy at runtime. rawpy IS present on
+                # real hardware (M2). Do NOT pre-load rgb_composite.composite here — composite.py
+                # imports rawpy at module level, which would break the hardware-free invariant.
+                if "rgb_composite.ffc" not in sys.modules:
+                    _ffc_path = _phase2_rgb / "rgb_composite" / "ffc.py"
+                    _ffc_spec = _util.spec_from_file_location("rgb_composite.ffc", str(_ffc_path))
+                    _ffc_mod = _util.module_from_spec(_ffc_spec)
+                    sys.modules["rgb_composite.ffc"] = _ffc_mod
+                    _ffc_spec.loader.exec_module(_ffc_mod)
 
-            flat_stack, meta = capture_flats(
-                orch._scanlight,
-                orch.settings,
-                black_levels,
-                n_frames=n_frames,
-                sleep=lambda _: None,
-                sony_capture_runner=orch._explicit_runner,
-                demosaic_fn=flat_demosaic_fn,
-            )
+                flat_stack, meta = capture_flats(
+                    orch._scanlight,
+                    orch.settings,
+                    black_levels,
+                    n_frames=n_frames,
+                    sleep=app.config["CAL_WARMUP_SLEEP"],
+                    # Reuse the MAIN orchestrator's runner (orch._runner), not
+                    # orch._explicit_runner (None in production). In SDK mode that
+                    # runner owns the live `sony-capture --persist` session, so
+                    # capture_flats shares it instead of spawning a SECOND persist
+                    # process that would fight the first for the camera and leak.
+                    sony_capture_runner=orch._runner,
+                    demosaic_fn=flat_demosaic_fn,
+                )
 
-            # Build inspection dict matching inspect-calibration.py --json output
-            # Import measure_channel + _channel_verdict + classify from the script.
-            # Use importlib.util with a sanitised module name to avoid the hyphen.
-            _ic = sys.modules.get("_inspect_calibration_mod")
-            if _ic is None:
-                _spec = _util.spec_from_file_location("_inspect_calibration_mod", str(_script_path))
-                _ic = _util.module_from_spec(_spec)
-                # Register before exec so nested imports can resolve cls.__module__
-                sys.modules["_inspect_calibration_mod"] = _ic
-                _spec.loader.exec_module(_ic)
+                # Build inspection dict matching inspect-calibration.py --json output
+                # Import measure_channel + _channel_verdict + classify from the script.
+                # Use importlib.util with a sanitised module name to avoid the hyphen.
+                _ic = sys.modules.get("_inspect_calibration_mod")
+                if _ic is None:
+                    _spec = _util.spec_from_file_location("_inspect_calibration_mod", str(_script_path))
+                    _ic = _util.module_from_spec(_spec)
+                    # Register before exec so nested imports can resolve cls.__module__
+                    sys.modules["_inspect_calibration_mod"] = _ic
+                    _spec.loader.exec_module(_ic)
 
-            # flat_stack is NxHxWx3; average to get HxWx3
-            flat_avg = flat_stack.mean(axis=0).astype(flat_stack.dtype)
-            ch_stats = {}
-            for ch, ch_idx in (("R", 0), ("G", 1), ("B", 2)):
-                stats = _ic.measure_channel(flat_avg[:, :, ch_idx].astype("uint16"), ch)
-                verdict = _ic._channel_verdict(stats)
-                ch_stats[ch] = {
-                    "falloff_pct": round(stats.falloff_pct, 2),
-                    "uniformity_pct": round(stats.uniformity_pct, 2),
-                    "verdict": verdict,
-                }
-            all_stats = (
-                _ic.measure_channel(flat_avg[:, :, 0].astype("uint16"), "R"),
-                _ic.measure_channel(flat_avg[:, :, 1].astype("uint16"), "G"),
-                _ic.measure_channel(flat_avg[:, :, 2].astype("uint16"), "B"),
-            )
-            overall_msg, _ = _ic.classify(all_stats)
-            # Extract the leading word (CLEAN / FAIL / OK-with-FFC)
-            overall = overall_msg.split("—")[0].strip() if "—" in overall_msg else overall_msg.strip()
+                # flat_stack is NxHxWx3; average to get HxWx3
+                flat_avg = flat_stack.mean(axis=0).astype(flat_stack.dtype)
+                ch_stats = {}
+                for ch, ch_idx in (("R", 0), ("G", 1), ("B", 2)):
+                    stats = _ic.measure_channel(flat_avg[:, :, ch_idx].astype("uint16"), ch)
+                    verdict = _ic._channel_verdict(stats)
+                    ch_stats[ch] = {
+                        "falloff_pct": round(stats.falloff_pct, 2),
+                        "uniformity_pct": round(stats.uniformity_pct, 2),
+                        "verdict": verdict,
+                    }
+                all_stats = (
+                    _ic.measure_channel(flat_avg[:, :, 0].astype("uint16"), "R"),
+                    _ic.measure_channel(flat_avg[:, :, 1].astype("uint16"), "G"),
+                    _ic.measure_channel(flat_avg[:, :, 2].astype("uint16"), "B"),
+                )
+                overall_msg, _ = _ic.classify(all_stats)
+                # Extract the leading word (CLEAN / FAIL / OK-with-FFC)
+                overall = overall_msg.split("—")[0].strip() if "—" in overall_msg else overall_msg.strip()
 
-            inspection = {"channels": ch_stats, "overall": overall}
-            return jsonify({
-                "flat_field": _json.loads(meta.to_json()),
-                "inspection": inspection,
-            })
-        except (RuntimeError, ValueError) as e:
-            return jsonify({"error": str(e)}), 500
+                inspection = {"channels": ch_stats, "overall": overall}
+                return jsonify({
+                    "flat_field": _json.loads(meta.to_json()),
+                    "inspection": inspection,
+                })
+            except (RuntimeError, ValueError) as e:
+                return jsonify({"error": str(e)}), 500
+        finally:
+            orch.end_activity()
 
     @app.post("/api/calibrate/checks")
     def post_calibrate_checks():
         orch = app.config["ORCHESTRATOR"]
-        last_cal = app.config.get("LAST_CAL_RESULT", None)
-        if last_cal is None:
-            # fail-closed: return a well-formed CheckResult indicating "no calibration"
-            from c41_core.contracts import CheckResult
-            import json as _json
-            no_cal = CheckResult(
-                name="base_neutrality",
-                passed=False,
-                deltas={"base_r": 0.0, "base_g": 0.0, "base_b": 0.0},
-            )
-            return jsonify([_json.loads(no_cal.to_json())]), 409
+        # Bug-2: guard against running checks while a capture is in progress
+        # (checks reads LAST_CAL_FRAME which may be updating concurrently).
+        if not orch.try_begin_activity("calibrate_checks"):
+            return jsonify({"error": "A scan or calibration is in progress — wait for it to finish."}), 409
 
         try:
-            import json as _json
-            import importlib.util as _util
-            from pathlib import Path as _Path
-            from c41_core.contracts import CheckResult
+            last_cal = app.config.get("LAST_CAL_RESULT", None)
+            if last_cal is None:
+                # fail-closed: return a well-formed CheckResult indicating "no calibration"
+                from c41_core.contracts import CheckResult
+                import json as _json
+                no_cal = CheckResult(
+                    name="base_neutrality",
+                    passed=False,
+                    deltas={"base_r": 0.0, "base_g": 0.0, "base_b": 0.0},
+                )
+                return jsonify([_json.loads(no_cal.to_json())]), 409
 
-            # Import checks.py directly (bypassing rgb_composite/__init__.py which
-            # eagerly imports rawpy via composite.py — breaking the hardware-free invariant).
-            _checks_path = _Path(__file__).resolve().parent.parent.parent.parent / "phase2" / "rgb-composite" / "rgb_composite" / "checks.py"
-            _checks_mod = sys.modules.get("_rgb_composite_checks")
-            if _checks_mod is None:
-                _cspec = _util.spec_from_file_location("_rgb_composite_checks", str(_checks_path))
-                _checks_mod = _util.module_from_spec(_cspec)
-                sys.modules["_rgb_composite_checks"] = _checks_mod
-                try:
-                    _cspec.loader.exec_module(_checks_mod)
-                except ImportError as _ie:
-                    # cv2 (or another checks.py dependency) is missing; return a clean error
-                    # rather than an opaque traceback. cv2 is present via rgb-composite on real
-                    # hardware, so this is a defensive guard for non-standard environments.
-                    del sys.modules["_rgb_composite_checks"]
-                    return jsonify({"error": f"checks module missing dependency: {_ie}"}), 500
-            check_base_neutrality = _checks_mod.check_base_neutrality
-            check_registration = _checks_mod.check_registration
-            # frame_anomaly (per-frame vs roll baseline) is a roll-level check — deferred
-            # to Phase 15; no roll baseline exists during single-calibration.
+            try:
+                import json as _json
+                import importlib.util as _util
+                from pathlib import Path as _Path
+                from c41_core.contracts import CheckResult
 
-            checks: list = []
+                # Import checks.py directly (bypassing rgb_composite/__init__.py which
+                # eagerly imports rawpy via composite.py — breaking the hardware-free invariant).
+                _checks_path = _Path(__file__).resolve().parent.parent.parent.parent / "phase2" / "rgb-composite" / "rgb_composite" / "checks.py"
+                _checks_mod = sys.modules.get("_rgb_composite_checks")
+                if _checks_mod is None:
+                    _cspec = _util.spec_from_file_location("_rgb_composite_checks", str(_checks_path))
+                    _checks_mod = _util.module_from_spec(_cspec)
+                    sys.modules["_rgb_composite_checks"] = _checks_mod
+                    try:
+                        _cspec.loader.exec_module(_checks_mod)
+                    except ImportError as _ie:
+                        # cv2 (or another checks.py dependency) is missing; return a clean error
+                        # rather than an opaque traceback. cv2 is present via rgb-composite on real
+                        # hardware, so this is a defensive guard for non-standard environments.
+                        del sys.modules["_rgb_composite_checks"]
+                        return jsonify({"error": f"checks module missing dependency: {_ie}"}), 500
+                check_base_neutrality = _checks_mod.check_base_neutrality
+                check_registration = _checks_mod.check_registration
+                # frame_anomaly (per-frame vs roll baseline) is a roll-level check — deferred
+                # to Phase 15; no roll baseline exists during single-calibration.
 
-            # check_registration requires a HxWx3 float array (LAST_CAL_FRAME)
-            last_frame = app.config.get("LAST_CAL_FRAME", None)
-            if last_frame is not None:
-                reg = check_registration(last_frame)
-                checks.append(reg)
-            else:
-                # fail-closed but well-formed — registration not available pre-roll
-                checks.append(CheckResult(name="registration", passed=False, deltas={}))
+                checks: list = []
 
-            bn = check_base_neutrality(last_cal.base_region)
-            checks.append(bn)
+                # check_registration requires a HxWx3 float array (LAST_CAL_FRAME)
+                last_frame = app.config.get("LAST_CAL_FRAME", None)
+                if last_frame is not None:
+                    reg = check_registration(last_frame)
+                    checks.append(reg)
+                else:
+                    # fail-closed but well-formed — registration not available pre-roll
+                    checks.append(CheckResult(name="registration", passed=False, deltas={}))
 
-            return jsonify([_json.loads(c.to_json()) for c in checks])
-        except (RuntimeError, ValueError) as e:
-            return jsonify({"error": str(e)}), 500
+                bn = check_base_neutrality(last_cal.base_region)
+                checks.append(bn)
+
+                return jsonify([_json.loads(c.to_json()) for c in checks])
+            except (RuntimeError, ValueError) as e:
+                return jsonify({"error": str(e)}), 500
+        finally:
+            orch.end_activity()
 
     @app.get("/api/composite-status")
     def get_composite_status():
@@ -524,6 +627,11 @@ def _settings_dict(s: CaptureSettings) -> dict:
         "shutter_r": s.shutter_r,
         "shutter_g": s.shutter_g,
         "shutter_b": s.shutter_b,
+        # F3: inbox stability window, surfaced so the Swift app can display
+        # and configure it.  Default 3.0s; lower on fast 5GHz Wi-Fi.
+        "inbox_stable_for_s": s.inbox_stable_for_s,
+        # Trigger mode is read-only via state; write via POST /api/settings.
+        "trigger_mode": s.trigger_mode,
     }
 
 
@@ -1055,6 +1163,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
 
+    orch = None
     try:
         orch = Orchestrator(scanlight, settings, on_triplet_complete=on_triplet_complete)
         app = create_app(orch, composite_worker=composite_worker, ready_nonce=args.ready_nonce)
@@ -1138,6 +1247,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                     logging.warning("background composite frame %d failed: %s",
                                     cr.frame_number, cr.error)
             composite_worker.shutdown(wait=True)
+        # Deterministically close the persistent sony-capture session (if any) so
+        # the camera SDK session is released before this process exits — otherwise
+        # a Swift-restarted backend can race a lingering --persist child for the
+        # camera. No-op when no session was opened.
+        if orch is not None:
+            orch.close()
         scanlight.close()
 
 

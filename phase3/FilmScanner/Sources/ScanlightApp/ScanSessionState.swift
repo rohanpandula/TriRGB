@@ -39,6 +39,7 @@
 //   @MainActor final class ... : ObservableObject + @Published + Combine.
 //   NOT the Observable macro.
 
+import AppKit
 import Combine
 import Foundation
 
@@ -89,6 +90,8 @@ protocol OrchestratorClientProtocol: AnyObject {
     func stop() async
     func captureFrame(retake: Bool) async throws -> TripletOutcome
     func compositeStatus() async throws -> CompositeStatus
+    /// Fetch the current orchestrator state for channel-prompt polling (F1).
+    func fetchState() async throws -> OrchestratorState
 }
 
 // MARK: OrchestratorClient conformance
@@ -164,6 +167,12 @@ final class ScanCoordinator: ObservableObject {
     /// Next frame number the backend will shoot. Updated from capture outcomes.
     @Published private(set) var nextFrameNumber: Int = 1
 
+    /// The channel the operator must fire next in manual/hw mode (F1).
+    /// "R" | "G" | "B" while a triplet capture awaits the IED shot; nil when idle.
+    /// Sourced from GET /api/state `waiting_for_channel` and polled concurrently
+    /// with the captureFrame HTTP call so the UI updates during the blocking wait.
+    @Published private(set) var waitingForChannel: String? = nil
+
     // MARK: - Dependencies (injected via protocol)
 
     private let client: any OrchestratorClientProtocol
@@ -179,6 +188,22 @@ final class ScanCoordinator: ObservableObject {
     private var isRunningCancellable: AnyCancellable?
     /// Task for the 1s composite-status polling loop (non-nil while .scanning).
     private var compositePollingTask: Task<Void, Never>?
+    /// Task for the 1s channel-prompt polling loop (non-nil during captureInFlight).
+    /// Polls GET /api/state for `waiting_for_channel` so the banner updates while
+    /// the captureFrame HTTP call is blocked waiting for the operator (F1).
+    private var channelPromptTask: Task<Void, Never>?
+
+    /// Monotonic token identifying the current captureFrame call. A crash / stop
+    /// bumps it so a stale in-flight capture (Swift tasks are reentrant across
+    /// `await`) can't apply its result or tear-down to a superseded context.
+    private var captureGeneration: Int = 0
+
+    /// The settings the running backend was last started with (port-normalized).
+    /// Used by the calibration→scan fast path to decide whether the backend can
+    /// be reused as-is or must be restarted to pick up changed scan settings /
+    /// stock profile (`positiveProfileJSON` is spawn-only, so a stale reuse would
+    /// silently scan with the wrong exposure recipe or omit auto-positive output).
+    private var backendSettings: ScanSettings?
 
     // MARK: - Init
 
@@ -216,6 +241,9 @@ final class ScanCoordinator: ObservableObject {
     deinit {
         isRunningCancellable?.cancel()
         compositePollingTask?.cancel()
+        // Normal stop paths cancel this, but a deinit while a capture is in
+        // flight would otherwise leave the 1s prompt poll waking until exit.
+        channelPromptTask?.cancel()
     }
 
     // MARK: - Public transitions
@@ -231,6 +259,10 @@ final class ScanCoordinator: ObservableObject {
     /// On failure at step 2, reconnect the light panel before re-throwing.
     func startScan(settings: ScanSettings) async {
         if phase == .calibrating, !transitionInFlight, client.isRunning {
+            guard !captureInFlight else {
+                lastError = "Cannot start scan: capture in progress"
+                return
+            }
             transitionInFlight = true
             defer { transitionInFlight = false }
             lastError = ""
@@ -238,7 +270,37 @@ final class ScanCoordinator: ObservableObject {
             frameStatuses = []
             compositePending = 0
             nextFrameNumber = 1
+
+            let wanted = settings.withScanlightPort(lightPanel.scanlightPort)
+            // Reuse the running backend ONLY when it was started with exactly
+            // these settings. Otherwise restart it: scan settings / stock profile
+            // may have changed since calibration, and `positiveProfileJSON`,
+            // `ffcCalibration`, `cameraModel` are spawn-only args — a settings
+            // push (POST /api/settings) cannot carry them, so a stale reuse would
+            // scan with the wrong exposure recipe or silently skip auto-positive.
+            if backendSettings == wanted {
+                lightPanel.portOwner = .scanning
+                phase = .scanning
+                startCompositePolling()
+                return
+            }
+
+            // Restart the backend with the scan settings. Keep the port claimed
+            // (.scanning) across the restart so a manual Connect / calibration
+            // can't grab the serial port during the respawn window.
             lightPanel.portOwner = .scanning
+            await client.stop()
+            do {
+                try await client.start(settings: wanted)
+            } catch {
+                backendSettings = nil
+                lightPanel.portOwner = .idle
+                lightPanel.connect()
+                phase = .idle
+                lastError = "Failed to switch to scan: \(error.localizedDescription)"
+                return
+            }
+            backendSettings = wanted
             phase = .scanning
             startCompositePolling()
             return
@@ -271,15 +333,18 @@ final class ScanCoordinator: ObservableObject {
         lightPanel.disconnect()
 
         // Step 2: Spawn the orchestrator (it grabs the serial port).
+        let wanted = settings.withScanlightPort(lightPanel.scanlightPort)
         do {
-            try await client.start(settings: settings.withScanlightPort(lightPanel.scanlightPort))
+            try await client.start(settings: wanted)
         } catch {
             // Orchestrator failed to start — release ownership and reclaim the port.
+            backendSettings = nil
             lightPanel.portOwner = .idle
             lightPanel.connect()
             lastError = "Failed to start scan: \(error.localizedDescription)"
             return
         }
+        backendSettings = wanted
 
         // Step 3: Mark as scanning (portOwner already claimed in Step 1).
         phase = .scanning
@@ -303,14 +368,18 @@ final class ScanCoordinator: ObservableObject {
         transitionInFlight = true
         defer { transitionInFlight = false }
 
-        // Step 1: Cancel the composite polling loop.
+        // Step 1: Cancel the composite poll and invalidate any in-flight capture
+        // (bumps the generation so a stale capture resuming after client.stop()
+        // can't clobber the now-idle state).
         stopCompositePolling()
+        invalidateInFlightCapture()
 
         // Step 2: Stop the orchestrator (releases the serial port on the Python side).
         await client.stop()
 
         // Step 3: Unlock the light panel (phase must be .idle before connect()).
         phase = .idle
+        backendSettings = nil
         lightPanel.portOwner = .idle
 
         // Step 4: Reclaim the serial port.
@@ -341,7 +410,31 @@ final class ScanCoordinator: ObservableObject {
             lastError = ""
             reconnectNeeded = false
             compositePending = 0
+
+            let wanted = settings.withScanlightPort(lightPanel.scanlightPort)
+            // Reuse the running backend only if it was started with exactly these
+            // settings. Otherwise restart: settings may have changed since the
+            // scan started (trigger mode, Sony transport/path, output folder,
+            // inbox), several of which are spawn-only and a POST cannot carry, so
+            // a stale reuse would calibrate against the wrong path/camera/output.
+            if backendSettings == wanted {
+                lightPanel.portOwner = .calibrating
+                phase = .calibrating
+                return
+            }
             lightPanel.portOwner = .calibrating
+            await client.stop()
+            do {
+                try await client.start(settings: wanted)
+            } catch {
+                backendSettings = nil
+                lightPanel.portOwner = .idle
+                lightPanel.connect()
+                phase = .idle
+                lastError = "Failed to switch to calibration: \(error.localizedDescription)"
+                return
+            }
+            backendSettings = wanted
             phase = .calibrating
             return
         }
@@ -364,14 +457,17 @@ final class ScanCoordinator: ObservableObject {
         lightPanel.portOwner = .calibrating
         lightPanel.disconnect()
 
+        let wanted = settings.withScanlightPort(lightPanel.scanlightPort)
         do {
-            try await client.start(settings: settings.withScanlightPort(lightPanel.scanlightPort))
+            try await client.start(settings: wanted)
         } catch {
+            backendSettings = nil
             lightPanel.portOwner = .idle
             lightPanel.connect()
             lastError = "Failed to start calibration: \(error.localizedDescription)"
             return
         }
+        backendSettings = wanted
 
         phase = .calibrating
     }
@@ -385,6 +481,7 @@ final class ScanCoordinator: ObservableObject {
         await client.stop()
 
         phase = .idle
+        backendSettings = nil
         lightPanel.portOwner = .idle
         lightPanel.connect()
         if !lightPanel.isConnected {
@@ -410,13 +507,36 @@ final class ScanCoordinator: ObservableObject {
     ///
     /// Updates frameStatuses with "captured" on success so the list shows
     /// immediate feedback before the composite-status poll catches up.
+    ///
+    /// Concurrently polls GET /api/state at 1s intervals while the capture HTTP
+    /// call is in flight, so `waitingForChannel` updates reach the UI during the
+    /// blocking wait for the operator to fire the IED (F1).
     func captureFrame(retake: Bool) async {
         guard phase == .scanning, !captureInFlight else { return }
+        captureGeneration &+= 1
+        let myGen = captureGeneration
         captureInFlight = true
-        defer { captureInFlight = false }
+        waitingForChannel = nil
+
+        // Start concurrent channel-prompt polling while the HTTP call blocks.
+        startChannelPromptPolling()
+        defer {
+            // Only tear down shared capture state if THIS capture is still
+            // current. A crash / stop bumps captureGeneration and tears the
+            // state down itself; without this guard a stale capture's defer
+            // (resuming after `await`) would clobber a new scan. (codex#10)
+            if captureGeneration == myGen {
+                captureInFlight = false
+                stopChannelPromptPolling()
+                waitingForChannel = nil
+            }
+        }
 
         do {
             let outcome = try await client.captureFrame(retake: retake)
+            // Superseded by a crash/stop/new scan while suspended → don't apply
+            // this (stale) result to the current context.
+            guard captureGeneration == myGen else { return }
             let frameNum = outcome.frameNumber
             nextFrameNumber = outcome.nextFrame
             if outcome.success {
@@ -429,6 +549,7 @@ final class ScanCoordinator: ObservableObject {
                 lastError = outcome.error ?? "Capture failed"
             }
         } catch {
+            guard captureGeneration == myGen else { return }
             lastError = "Capture error: \(error.localizedDescription)"
         }
     }
@@ -442,7 +563,12 @@ final class ScanCoordinator: ObservableObject {
         let crashedPhase = phase
         // The orchestrator has already exited — no need to call client.stop().
         stopCompositePolling()
+        // Invalidate any in-flight capture: bump the generation so its delayed
+        // resume no-ops, and tear down its UI state now (otherwise captureInFlight
+        // stays true and the stale prompt/poll could bleed into a new scan).
+        invalidateInFlightCapture()
         phase = .idle
+        backendSettings = nil
         lightPanel.portOwner = .idle
         let noun = crashedPhase == .calibrating ? "calibration" : "scan"
         lastError = "Orchestrator crashed — \(noun) stopped. "
@@ -487,6 +613,51 @@ final class ScanCoordinator: ObservableObject {
         } catch {
             // Polling failure is non-fatal — we'll retry next second.
             // Don't overwrite lastError with transient network noise.
+        }
+    }
+
+    // MARK: - Private: channel-prompt polling (F1)
+
+    private func startChannelPromptPolling() {
+        channelPromptTask?.cancel()
+        channelPromptTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.pollWaitingForChannel()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1s
+            }
+        }
+    }
+
+    private func stopChannelPromptPolling() {
+        channelPromptTask?.cancel()
+        channelPromptTask = nil
+    }
+
+    /// Invalidate any in-flight captureFrame and tear down its UI state. Bumping
+    /// captureGeneration makes the stale capture's delayed resume (Swift tasks
+    /// resume across `await`) no-op, so it can't clobber a superseded context.
+    private func invalidateInFlightCapture() {
+        captureGeneration &+= 1
+        captureInFlight = false
+        stopChannelPromptPolling()
+        waitingForChannel = nil
+    }
+
+    /// Poll GET /api/state and update `waitingForChannel`.
+    /// Internal so tests can drive it directly.
+    @MainActor
+    internal func pollWaitingForChannel() async {
+        guard captureInFlight else { return }
+        do {
+            let state = try await client.fetchState()
+            let newChannel = state.waitingForChannel
+            // Sound on channel change (F1 optional: always-on for v1).
+            if newChannel != waitingForChannel, newChannel != nil {
+                NSSound.beep()
+            }
+            waitingForChannel = newChannel
+        } catch {
+            // Non-fatal — the poll loop retries next second.
         }
     }
 

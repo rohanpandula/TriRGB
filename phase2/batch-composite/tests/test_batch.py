@@ -11,10 +11,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
+import tifffile
 
 import batch_composite.batch as bm
-from batch_composite import FrameGroup, SkipReason, composite_roll, discover_frames
+from batch_composite import (
+    FrameGroup,
+    SkipReason,
+    composite_roll,
+    discover_frames,
+    render_roll_positives_from_composites,
+)
 
 
 def touch(p: Path, content: bytes = b"") -> Path:
@@ -196,6 +204,56 @@ def test_composite_roll_rejects_non_directory(tmp_path):
     p.write_text("nope")
     with pytest.raises(NotADirectoryError):
         composite_roll(p)
+
+
+# ---------- roll positives ----------
+
+def test_render_roll_positives_from_composites_computes_and_locks_bounds(
+    monkeypatch,
+    tmp_path,
+):
+    first = tmp_path / "composites" / "Roll001_Frame001.tif"
+    second = tmp_path / "composites" / "Roll001_Frame002.tif"
+    touch(first)
+    touch(second)
+    tifffile.imwrite(first, np.full((3, 3, 3), 1000, dtype=np.uint16))
+    tifffile.imwrite(second, np.full((3, 3, 3), 2000, dtype=np.uint16))
+
+    bounds = ((0.0, 1.0), (0.1, 1.1), (0.2, 1.2))
+    calls: dict[str, list] = {"aggregate": [], "render_bounds": []}
+
+    def fake_aggregate(composites, descriptor, **kwargs):
+        loaded = list(composites)
+        calls["aggregate"].append((loaded, descriptor, kwargs))
+        assert len(loaded) == 2
+        return bounds
+
+    def fake_auto_positive(composite, descriptor, **kwargs):
+        calls["render_bounds"].append(kwargs["bounds_override"])
+        return np.zeros_like(composite, dtype=np.uint16), {
+            "bounds_override_used": kwargs["bounds_override"] is not None
+        }
+
+    import sys, types
+    fake_mod = types.ModuleType("rgb_composite")
+    fake_mod.aggregate_positive_density_bounds = fake_aggregate
+    fake_mod.auto_positive_from_composite = fake_auto_positive
+    monkeypatch.setitem(sys.modules, "rgb_composite", fake_mod)
+
+    descriptor = object()
+    result = render_roll_positives_from_composites(
+        [first, second],
+        descriptor,
+        output_dir=tmp_path / "positives",
+    )
+
+    assert result.bounds == bounds
+    assert len(calls["aggregate"]) == 1
+    assert calls["render_bounds"] == [bounds, bounds]
+    assert len(result.rendered) == 2
+    assert len(result.failed) == 0
+    assert all(path.exists() for path in result.rendered)
+    assert all(meta["bounds_override_used"] for meta in result.meta.values())
 
 
 # ---------- CLI ----------

@@ -4,7 +4,9 @@ from .batch import (
     composite_roll,
     FrameGroup,
     BatchResult,
+    RollPositiveResult,
     SkipReason,
+    render_roll_positives_from_composites,
 )
 
 __all__ = [
@@ -12,6 +14,8 @@ __all__ = [
     "composite_roll",
     "FrameGroup",
     "BatchResult",
+    "RollPositiveResult",
     "SkipReason",
+    "render_roll_positives_from_composites",
 ]
 __version__ = "0.1.0"

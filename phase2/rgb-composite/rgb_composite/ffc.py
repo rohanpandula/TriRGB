@@ -299,7 +299,8 @@ def apply_ffc_to_channel(channel_data: np.ndarray, ffc_map: np.ndarray) -> np.nd
         )
     corrected = channel_data.astype(np.float32) * ffc_map
     np.clip(corrected, 0.0, 65535.0, out=corrected)
-    return corrected.astype(np.uint16)
+    # Round before cast to avoid truncation bias (matches invert_composite convention).
+    return np.rint(corrected).astype(np.uint16)
 
 
 def clear_cache() -> None:
@@ -424,6 +425,7 @@ def apply_ffc_radiometric(
         # Single clip covers sub-zero (negative clamp) AND overflow (mirror
         # apply_ffc_to_channel lines 298-300 — no separate np.maximum needed).
         np.clip(corrected, 0.0, 65535.0, out=corrected)
-        out[..., ch_idx] = corrected.astype(np.uint16)
+        # Round before cast to avoid truncation bias (matches invert_composite convention).
+        out[..., ch_idx] = np.rint(corrected).astype(np.uint16)
 
     return out

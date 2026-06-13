@@ -153,6 +153,28 @@ def test_apply_ffc_shape_mismatch_raises():
         apply_ffc_to_channel(data, fmap)
 
 
+def test_apply_ffc_to_channel_rounds_not_truncates():
+    """Bug 6 fix: apply_ffc_to_channel must round, not truncate, before uint16 cast.
+
+    A value like 99.7 should produce 100 (round) not 99 (truncate).
+    The test uses a multiplier that produces a fractional result
+    (30001 * 1.0 = 30001.0 — not interesting; use a value that would differ).
+    Here: data=20001, fmap=1.499950 → 20001 * 1.499950 ≈ 29999.0 before rint,
+    but pick a case where truncation and rounding give different answers:
+    data=3, fmap such that data*fmap = 99.7 → fmap = 99.7/3 ≈ 33.233333.
+    With truncation: int(99.7) = 99. With rounding: round(99.7) = 100.
+    """
+    data = np.full((H, W), 3, dtype=np.uint16)
+    # 3 * (99.7 / 3) = 99.7 exactly; truncation gives 99, rounding gives 100.
+    multiplier = np.float32(99.7 / 3.0)
+    fmap = np.full((H, W), multiplier, dtype=np.float32)
+    out = apply_ffc_to_channel(data, fmap)
+    # Rounding: np.rint(99.7) = 100.0 → 100.
+    assert out[0, 0] == 100, (
+        f"expected rounding: 3 * {multiplier} ≈ 99.7 → 100, got {out[0, 0]}"
+    )
+
+
 # ---------- load_ffc_maps ----------
 
 @pytest.fixture

@@ -116,6 +116,7 @@ def settings(tmp_path):
         level_g=128,
         level_b=128,
         settle_ms=0,
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
 
 
@@ -129,6 +130,9 @@ def app_and_orch(settings):
     application = create_app(orch)
     application.config["DEMOSAIC_FACTORY"] = make_calibration_demosaic
     application.config["FLAT_DEMOSAIC_FN"] = make_flat_demosaic()
+    # Skip the real warmup so the route tests don't sleep 2s/5s each. Production
+    # keeps the time.sleep default (see create_app).
+    application.config["CAL_WARMUP_SLEEP"] = _zero_sleep
     return application, orch
 
 
@@ -379,6 +383,21 @@ def test_calibrate_preview_light_route_controls_white_light(app_and_orch):
     assert orch._scanlight.calls[-1] == ("off",)
 
 
+def test_preview_light_rejects_non_boolean_enabled(app_and_orch):
+    """Audit #17: this route drives the white preview LED; bool("false") is True,
+    so a loose cast would turn the light ON for any truthy non-bool. Require a
+    real JSON boolean and 400 anything else."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    for bad in ("false", "true", 1, 0, "on"):
+        r = client.post("/api/calibrate/preview-light", json={"enabled": bad, "level": 200})
+        assert r.status_code == 400, f"enabled={bad!r} should be rejected, got {r.status_code}"
+        assert "boolean" in (r.get_json() or {}).get("error", "")
+    # Real booleans still work (and the activity slot is released between calls).
+    assert client.post("/api/calibrate/preview-light", json={"enabled": True, "level": 100}).status_code == 200
+    assert client.post("/api/calibrate/preview-light", json={"enabled": False}).status_code == 200
+
+
 def test_calibrate_exposure_route_rebate_bounds(app_and_orch):
     """Out-of-range rebate params are rejected/clamped; non-int body returns 400 or is coerced (no 500 crash)."""
     app, _ = app_and_orch
@@ -458,6 +477,34 @@ def test_calibrate_ffc_route_uses_posted_exposure_without_last_cal(app_and_orch)
     assert orch.settings.shutter_b == "1/2"
 
 
+def test_calibrate_ffc_out_of_range_level_returns_400(app_and_orch):
+    """codex#4: a numeric-but-out-of-range led_level passes the numeric parse but
+    raises ValueError from update_settings/__post_init__; the route must return a
+    controlled 400, not surface an unhandled 500."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    r = client.post("/api/calibrate/ffc", json={
+        "led_level_r": 300,   # numeric but out of the 0-255 range
+        "led_level_g": 130,
+        "led_level_b": 140,
+        "black_level_r": 256.0,
+        "black_level_g": 256.0,
+        "black_level_b": 256.0,
+    })
+    assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.data}"
+    assert "error" in r.get_json()
+
+
+def test_calibrate_ffc_n_frames_below_one_returns_400(app_and_orch):
+    """codex#6: n_frames < 1 (valid int, but capture_flats raises ValueError)
+    must be a 400 client error, not an unhandled 500."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    r = client.post("/api/calibrate/ffc", json={"n_frames": 0})
+    assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.data}"
+    assert "error" in r.get_json()
+
+
 def test_calibrate_ffc_n_frames_bad_input_returns_400(app_and_orch):
     """FIX-D: non-integer n_frames must return 400, not 500."""
     app, _ = app_and_orch
@@ -499,22 +546,127 @@ def test_calibrate_checks_route(app_and_orch):
 
 
 def test_calibrate_route_locked_returns_409(app_and_orch):
-    """When orch._lock is already held, the exposure route returns 409."""
+    """When the activity guard is held (capture or calibration in progress),
+    the exposure route returns 409. Bug-2: the guard must cover the whole
+    calibration duration, not just a TOCTOU check-then-unlock window."""
     app, orch = app_and_orch
     client = app.test_client()
 
-    # Acquire the lock to simulate a capture in progress
+    # Simulate a capture in progress by claiming the activity slot.
     app.config["CURRENT_CAL_CALL_ID"] = "active-run"
-    acquired = orch._lock.acquire(blocking=False)
-    assert acquired, "could not acquire lock for test setup"
+    claimed = orch.try_begin_activity("capture")
+    assert claimed, "could not claim activity slot for test setup"
     try:
         r = client.post("/api/calibrate/exposure", json={})
         assert r.status_code == 409, (
-            f"expected 409 when lock is held, got {r.status_code}: {r.data}"
+            f"expected 409 when activity guard is held, got {r.status_code}: {r.data}"
         )
         assert r.get_json()["call_id"] == "active-run"
     finally:
-        orch._lock.release()
+        orch.end_activity()
+
+
+@pytest.mark.parametrize("route", [
+    "/api/settings",
+    "/api/calibrate/preview-light",
+    "/api/calibrate/exposure",
+    "/api/calibrate/ffc",
+])
+@pytest.mark.parametrize("raw", ["[1, 2, 3]", "\"hello\"", "42", "false", "[]"])
+def test_routes_reject_non_object_json_body(app_and_orch, route, raw):
+    """codex#9: every POST route must reject a non-object JSON body (including
+    falsy [] / false / 0) with a 400, not crash to 500 or silently no-op."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    r = client.post(route, data=raw, content_type="application/json")
+    assert r.status_code == 400, (
+        f"{route} with body {raw!r}: expected 400, got {r.status_code}: {r.data}"
+    )
+
+
+def test_routes_reject_malformed_json_body(app_and_orch):
+    """codex#12: a non-empty but INVALID/truncated JSON body must be 400, not
+    silently treated as {} (which would run hardware ops with defaults and hide
+    client/request corruption). A truly absent body stays a 200 no-op."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    for route in ("/api/settings", "/api/calibrate/preview-light",
+                  "/api/calibrate/exposure", "/api/calibrate/ffc"):
+        r = client.post(route, data='{"level_r": 12', content_type="application/json")  # truncated
+        assert r.status_code == 400, (
+            f"{route}: expected 400 for malformed JSON, got {r.status_code}: {r.data}"
+        )
+    # An absent body is still accepted as an empty no-op on /api/settings.
+    r2 = client.post("/api/settings", data="", content_type="application/json")
+    assert r2.status_code == 200, f"empty body should be a 200 no-op, got {r2.status_code}: {r2.data}"
+
+
+def test_settings_post_non_object_body_returns_400(app_and_orch):
+    """codex#7: a valid JSON list/string body has no .items(); the route must
+    return 400, not let an AttributeError surface as 500."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    for raw in ("[1, 2, 3]", "\"hello\"", "42"):
+        r = client.post("/api/settings", data=raw, content_type="application/json")
+        assert r.status_code == 400, f"expected 400 for body {raw!r}, got {r.status_code}: {r.data}"
+        assert "error" in r.get_json()
+
+
+def test_settings_post_null_value_returns_400_not_500(app_and_orch):
+    """codex#2: JSON null reaching int()/float() coercion is a client error (400),
+    not an unhandled TypeError surfacing as a 500."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    for body in ({"inbox_stable_for_s": None}, {"level_r": None}):
+        r = client.post("/api/settings", json=body)
+        assert r.status_code == 400, f"expected 400 for {body}, got {r.status_code}: {r.data}"
+        assert "error" in r.get_json()
+
+
+def test_settings_post_rejected_while_activity_held(app_and_orch):
+    """F1: /api/settings must not mutate levels/output/shutters while a capture
+    or calibration owns the rig (they release _lock between channel captures, so
+    a mid-run mutation could corrupt an exposure bisection). It claims the same
+    activity slot and 409s while one is held; works once released."""
+    app, orch = app_and_orch
+    client = app.test_client()
+
+    assert orch.try_begin_activity("calibrate_exposure"), "could not claim slot for setup"
+    try:
+        r = client.post("/api/settings", json={"level_r": 111})
+        assert r.status_code == 409, f"expected 409 while activity held, got {r.status_code}: {r.data}"
+        assert orch.settings.level_r != 111, "settings must not change while rejected"
+    finally:
+        orch.end_activity()
+
+    r2 = client.post("/api/settings", json={"level_r": 111})
+    assert r2.status_code == 200, f"expected 200 after release, got {r2.status_code}: {r2.data}"
+    assert orch.settings.level_r == 111
+
+
+def test_preview_light_rejected_while_activity_held(app_and_orch):
+    """HIGH#2 (Codex): preview-light must not re-colour the Scanlight while a
+    capture or calibration owns the rig — those activities release _lock
+    between internal captures, so the activity guard is what protects the gap."""
+    app, orch = app_and_orch
+    client = app.test_client()
+
+    claimed = orch.try_begin_activity("calibrate_exposure")
+    assert claimed, "could not claim activity slot for test setup"
+    calls_before = len(orch._scanlight.calls)
+    try:
+        r = client.post("/api/calibrate/preview-light", json={"enabled": True, "level": 200})
+        assert r.status_code == 409, (
+            f"expected 409 while activity held, got {r.status_code}: {r.data}"
+        )
+        # The rejected request must not have touched the Scanlight at all.
+        assert len(orch._scanlight.calls) == calls_before
+    finally:
+        orch.end_activity()
+
+    # Once the activity is released, preview-light works again.
+    r2 = client.post("/api/calibrate/preview-light", json={"enabled": True, "level": 200})
+    assert r2.status_code == 200, f"expected 200 after release, got {r2.status_code}: {r2.data}"
 
 
 def test_calibrate_route_failclosed_500(settings, tmp_path):
@@ -528,6 +680,7 @@ def test_calibrate_route_failclosed_500(settings, tmp_path):
     orch = Orchestrator(light, settings, sony_capture_runner=failing_runner, sleep=_zero_sleep)
     app = create_app(orch)
     app.config["DEMOSAIC_FACTORY"] = make_calibration_demosaic
+    app.config["CAL_WARMUP_SLEEP"] = _zero_sleep
     client = app.test_client()
 
     r = client.post("/api/calibrate/exposure", json={})

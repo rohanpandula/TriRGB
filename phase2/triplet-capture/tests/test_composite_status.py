@@ -58,6 +58,7 @@ def settings(tmp_path):
         level_g=180,
         level_b=160,
         settle_ms=0,  # no sleep in tests
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
 
 

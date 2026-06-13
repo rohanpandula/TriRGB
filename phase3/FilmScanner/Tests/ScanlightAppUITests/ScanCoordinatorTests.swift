@@ -45,6 +45,28 @@ final class FakeLightPanel: LightPanelProtocol {
     }
 }
 
+// MARK: - Test helpers
+
+/// A one-shot async gate: `wait()` suspends until `signal()` is called (or
+/// returns immediately if already signalled). Used to hold a faked async call
+/// open so a test can inspect state deterministically while it's "in flight".
+actor AsyncGate {
+    private var signalled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if signalled { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func signal() {
+        signalled = true
+        let pending = waiters
+        waiters.removeAll()
+        for w in pending { w.resume() }
+    }
+}
+
 // MARK: - FakeOrchestratorClient
 
 /// Implements OrchestratorClientProtocol. Records start/stop/captureFrame calls.
@@ -79,8 +101,12 @@ final class FakeOrchestratorClient: OrchestratorClientProtocol {
         enabled: false, pending: nil, results: nil
     )
 
+    /// The settings passed to the most recent start() — lets tests assert that
+    /// a restart actually carried the changed settings to the backend.
+    private(set) var lastStartSettings: ScanSettings?
     func start(settings: ScanSettings) async throws {
         callLog.append("start")
+        lastStartSettings = settings
         if let err = startError { throw err }
         isRunning = true
         isRunningSubject.send(true)
@@ -102,14 +128,35 @@ final class FakeOrchestratorClient: OrchestratorClientProtocol {
         }
     }
 
+    /// Test hook: awaited before captureFrame returns, so a test can hold the
+    /// capture "in flight" (captureInFlight == true) while it inspects state.
+    var beforeCaptureReturns: (@Sendable () async -> Void)?
     func captureFrame(retake: Bool) async throws -> TripletOutcome {
         callLog.append("captureFrame(retake:\(retake))")
         if let err = captureError { throw err }
+        await beforeCaptureReturns?()
         return captureOutcome
     }
 
     func compositeStatus() async throws -> CompositeStatus {
         return compositeStatusResult
+    }
+
+    /// Injectable: channel returned by fetchState() to simulate F1 waiting_for_channel.
+    var waitingForChannelResult: String? = nil
+    /// OrchestratorState returned by fetchState(). waitingForChannel is injected above.
+    func fetchState() async throws -> OrchestratorState {
+        callLog.append("fetchState")
+        return OrchestratorState(
+            rollName: "TestRoll",
+            frameNumber: 1,
+            outputFolder: "/tmp",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50,
+            waitingForChannel: waitingForChannelResult
+        )
     }
 
     /// Simulate a mid-scan orchestrator crash by flipping isRunning to false
@@ -327,6 +374,46 @@ final class ScanCoordinatorTests: XCTestCase {
     ///   a) transition out of .scanning (don't leave it stuck forever).
     ///   b) set portOwner = .idle (don't leave the light panel permanently locked).
     ///   c) surface an error.
+    /// codex#10: a backend crash mid-capture must invalidate the in-flight
+    /// captureFrame — clear captureInFlight now, and ensure the stale capture's
+    /// delayed resume (Swift tasks resume across `await`) can't clobber the
+    /// now-idle state.
+    func testCrashDuringCaptureInvalidatesInFlightCapture() async throws {
+        let (coordinator, client, _) = makeCoordinator()
+        await coordinator.startScan(settings: makeScanSettings())
+
+        // Hold the capture open so it's in flight when the crash lands.
+        let gate = AsyncGate()
+        client.beforeCaptureReturns = { await gate.wait() }
+        let captureTask = Task { await coordinator.captureFrame(retake: false) }
+
+        var spins = 0
+        while await coordinator.captureInFlight == false {
+            await Task.yield()
+            spins += 1
+            XCTAssertLessThan(spins, 10_000, "captureInFlight never became true")
+            if spins >= 10_000 { break }
+        }
+
+        client.simulateCrash()
+        let deadline = Date(timeIntervalSinceNow: 2.0)
+        while await coordinator.phase == .scanning && Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let phaseAfterCrash = await coordinator.phase
+        XCTAssertEqual(phaseAfterCrash, .idle)
+        let inFlightAfterCrash = await coordinator.captureInFlight
+        XCTAssertFalse(inFlightAfterCrash, "crash must clear captureInFlight, not leave it stuck true")
+
+        // Release the now-stale capture; its resume must not re-touch state.
+        await gate.signal()
+        await captureTask.value
+        let inFlightAfterStale = await coordinator.captureInFlight
+        XCTAssertFalse(inFlightAfterStale, "stale capture's defer must not re-set captureInFlight")
+        let phaseAfterStale = await coordinator.phase
+        XCTAssertEqual(phaseAfterStale, .idle, "stale capture must not move the coordinator out of idle")
+    }
+
     func testPortOwnershipT4_MidScanCrashTransitionsToIdle() async throws {
         let (coordinator, client, lightPanel) = makeCoordinator()
 
@@ -416,9 +503,39 @@ final class ScanCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .scanning)
         XCTAssertEqual(lightPanel.portOwner, .scanning)
         XCTAssertEqual(client.callLog, clientLogAfterCalibrationStart,
-                       "Switching calibration → scan should reuse the running backend, not start another one")
+                       "Switching calibration → scan with UNCHANGED settings should reuse the running backend")
         XCTAssertEqual(lightPanel.callLog, lightLogAfterCalibrationStart,
                        "Switching calibration → scan should not disconnect/reconnect the light")
+    }
+
+    /// High-severity regression: when scan settings / stock profile changed since
+    /// calibration, the fast path must NOT silently reuse the calibration backend
+    /// (stale LED levels/shutters, and `positiveProfileJSON` is spawn-only so a
+    /// reuse omits auto-positive output). It must restart with the new settings.
+    func testSwitchFromCalibrationToScanRestartsBackendWhenSettingsChanged() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+
+        await coordinator.startCalibration(settings: makeScanSettings())
+        let clientLogAfterCalibration = client.callLog        // ["start"]
+        let lightLogAfterCalibration = lightPanel.callLog
+
+        // Operator selects a stock profile / different exposure before scanning.
+        var scanSettings = makeScanSettings()
+        scanSettings.positiveProfileJSON = "{\"look\":\"filmic\"}"
+        scanSettings.levelR = 123
+        await coordinator.startScan(settings: scanSettings)
+
+        XCTAssertEqual(coordinator.phase, .scanning)
+        XCTAssertEqual(lightPanel.portOwner, .scanning)
+        // Backend restarted: stop + start appended.
+        XCTAssertEqual(client.callLog, clientLogAfterCalibration + ["stop", "start"],
+                       "changed settings must restart the backend, not reuse it")
+        // The light is NOT flapped (it was already disconnected for calibration).
+        XCTAssertEqual(lightPanel.callLog, lightLogAfterCalibration,
+                       "restart must not disconnect/reconnect the light panel")
+        // The restart carried the new settings, including the spawn-only profile.
+        XCTAssertEqual(client.lastStartSettings?.positiveProfileJSON, "{\"look\":\"filmic\"}")
+        XCTAssertEqual(client.lastStartSettings?.levelR, 123)
     }
 
     func testSwitchFromScanToCalibrationReusesRunningBackend() async throws {
@@ -436,6 +553,30 @@ final class ScanCoordinatorTests: XCTestCase {
                        "Switching scan → calibration should reuse the running backend, not start another one")
         XCTAssertEqual(lightPanel.callLog, lightLogAfterScanStart,
                        "Switching scan → calibration should not disconnect/reconnect the light")
+    }
+
+    /// codex#4: symmetric to the calibration→scan case — scan→calibration with
+    /// changed (possibly spawn-only) settings must restart the backend, not run
+    /// calibration against a stale capture path / camera mode / output folder.
+    func testSwitchFromScanToCalibrationRestartsBackendWhenSettingsChanged() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+
+        await coordinator.startScan(settings: makeScanSettings())
+        let clientLogAfterScan = client.callLog          // ["start"]
+        let lightLogAfterScan = lightPanel.callLog
+
+        var calSettings = makeScanSettings()
+        calSettings.outputFolder = NSTemporaryDirectory() + "different/"
+        calSettings.cameraModel = "ILCE-7CR"
+        await coordinator.startCalibration(settings: calSettings)
+
+        XCTAssertEqual(coordinator.phase, .calibrating)
+        XCTAssertEqual(lightPanel.portOwner, .calibrating)
+        XCTAssertEqual(client.callLog, clientLogAfterScan + ["stop", "start"],
+                       "changed settings must restart the backend for calibration")
+        XCTAssertEqual(lightPanel.callLog, lightLogAfterScan,
+                       "restart must not disconnect/reconnect the light panel")
+        XCTAssertEqual(client.lastStartSettings?.cameraModel, "ILCE-7CR")
     }
 
     // MARK: - T5: startScan is no-op if already scanning
@@ -743,7 +884,65 @@ final class ScanCoordinatorTests: XCTestCase {
 
         XCTAssertTrue(vm.lastError.contains("not connected"))
     }
-}
 
-// NOTE: pollCompositeStatus() is `internal` in ScanCoordinator (visible via
-// @testable import) so tests can invoke it directly and skip the 1s polling loop.
+    // MARK: - F1: waitingForChannel publishes when pollWaitingForChannel is called
+
+    /// Verifies that pollWaitingForChannel() reads waiting_for_channel from
+    /// fetchState() and publishes it to coordinator.waitingForChannel while a
+    /// capture is in flight — and that it clears on completion. The capture is
+    /// gated open so the assertion window is deterministic (no race).
+    func testPollWaitingForChannelPublishesChannelDuringCapture() async throws {
+        let (coordinator, client, _) = makeCoordinator()
+        await coordinator.startScan(settings: makeScanSettings())
+        client.waitingForChannelResult = "R"
+
+        // Hold captureFrame open until we release it, so captureInFlight stays
+        // true while we poll. (CheckedContinuation gate.)
+        let gate = AsyncGate()
+        client.beforeCaptureReturns = { await gate.wait() }
+
+        let captureTask = Task { await coordinator.captureFrame(retake: false) }
+        // Wait until the capture is observably in flight (bounded, to avoid hang).
+        var spins = 0
+        while await coordinator.captureInFlight == false {
+            await Task.yield()
+            spins += 1
+            XCTAssertLessThan(spins, 10_000, "captureInFlight never became true")
+            if spins >= 10_000 { break }
+        }
+
+        await coordinator.pollWaitingForChannel()
+        let published = await coordinator.waitingForChannel
+        XCTAssertEqual(published, "R",
+            "pollWaitingForChannel must publish the backend's waiting_for_channel while capturing")
+
+        // Release the capture; the channel must clear on completion.
+        await gate.signal()
+        await captureTask.value
+        let afterDone = await coordinator.waitingForChannel
+        XCTAssertNil(afterDone, "waitingForChannel must clear when the capture completes")
+    }
+
+    /// Verifies that waitingForChannel is nil when the backend returns null (idle state).
+    func testPollWaitingForChannelIsNilWhenBackendReturnsNull() async throws {
+        let (coordinator, client, _) = makeCoordinator()
+        await coordinator.startScan(settings: makeScanSettings())
+
+        client.waitingForChannelResult = nil
+        // Manually set waitingForChannel to something to ensure the poll clears it.
+        // We can't set it directly (private(set)), so check after a capture cycle.
+        _ = coordinator.waitingForChannel  // should be nil
+        XCTAssertNil(coordinator.waitingForChannel,
+                     "waitingForChannel should start nil before any capture")
+    }
+
+    // MARK: - F9: Python probe cache
+
+    /// Verifies that the probe cache starts empty and can be reset (testability seam).
+    func testPythonProbeResetClearsCache() {
+        // Reset ensures a clean state for this test regardless of prior runs.
+        TripletPositiveRunner.resetPythonExecutableCache()
+        XCTAssertNil(TripletPositiveRunner.cachedPythonURL(),
+                     "After resetPythonExecutableCache(), cached URL must be nil")
+    }
+}

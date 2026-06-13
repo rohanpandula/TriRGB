@@ -16,7 +16,32 @@ import numpy as np
 import pytest
 
 from c41_core import BaseRegionDescriptor, InversionParams, make_c41_negative
-from rgb_composite.composite import auto_positive_from_composite, invert_composite
+from rgb_composite.composite import (
+    _frame_base_rgb,
+    aggregate_positive_density_bounds,
+    auto_positive_from_composite,
+    invert_composite,
+    positive_density_bounds_from_composite,
+)
+
+
+def test_frame_base_rgb_honors_dmin_percentile():
+    """codex#13: dmin_percentile must actually change the measured d-min base —
+    it was accepted/reported by auto_positive_from_composite but _frame_base_rgb
+    hardcoded the default constant, so the parameter was a silent no-op."""
+    h, w = 64, 64
+    ramp = np.linspace(1000.0, 12000.0, h * w).reshape(h, w)
+    triplet = np.stack([ramp, ramp, ramp], axis=-1).astype(np.uint16)
+    desc = BaseRegionDescriptor(
+        x=0, y=0, w=w, h=h,
+        base_rgb=(5000.0, 5000.0, 5000.0),
+        uniformity_cv=0.0, source="manual",
+    )
+    base_low = _frame_base_rgb(triplet, desc, dmin_percentile=20.0)
+    base_high = _frame_base_rgb(triplet, desc, dmin_percentile=98.0)
+    assert base_high[0] > base_low[0] + 100.0, (
+        f"dmin_percentile must change the base: p20={base_low[0]}, p98={base_high[0]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +267,41 @@ def test_invert_composite_unknown_tone_curve_raises():
 
     with pytest.raises(NotImplementedError, match="s-curve"):
         invert_composite(img, descriptor, params_bad)
+
+
+def test_invert_composite_filmic_tone_curve_preserves_invariants_and_differs_from_linear():
+    """The opt-in filmic curve preserves inversion contracts and changes tone."""
+    img, descriptor, params = _make_fixture(seed=42)
+    rebate_h = max(1, int(H * 0.1))
+
+    linear = invert_composite(img, descriptor, params)
+    filmic_params = InversionParams(
+        base_target=params.base_target,
+        black_point_r=params.black_point_r,
+        black_point_g=params.black_point_g,
+        black_point_b=params.black_point_b,
+        white_point_r=params.white_point_r,
+        white_point_g=params.white_point_g,
+        white_point_b=params.white_point_b,
+        tone_curve_id="filmic",
+        tone_curve_params=(5.0, 0.5),
+        gamma=params.gamma,
+    )
+
+    filmic1 = invert_composite(img, descriptor, filmic_params)
+    filmic2 = invert_composite(img, descriptor, filmic_params)
+
+    np.testing.assert_array_equal(filmic1, filmic2)
+    assert filmic1.dtype == np.uint16
+    assert filmic1.shape == img.shape
+    assert int(filmic1.min()) >= 0
+    assert int(filmic1.max()) <= 65535
+    assert not np.array_equal(filmic1, linear)
+
+    for ch in range(3):
+        body_mean = float(filmic1[rebate_h:, :, ch].mean())
+        rebate_mean = float(filmic1[:rebate_h, :, ch].mean())
+        assert body_mean > rebate_mean
 
 
 # ---------------------------------------------------------------------------
@@ -532,3 +592,252 @@ def test_auto_positive_uses_base_balance_and_inverts_polarity():
     rebate_mean = float(positive[:rebate_h, :, :].mean())
     body_mean = float(positive[rebate_h:, :, :].mean())
     assert body_mean > rebate_mean + 1000
+
+
+# ---------------------------------------------------------------------------
+# auto_positive base_mode: whole-frame fallback for rebate-less (full-bleed) scans
+# ---------------------------------------------------------------------------
+
+def _auto_positive_fixture():
+    """Synthetic narrowband composite + clean (low-CV) descriptor."""
+    triplet = np.zeros((H, W, 3), dtype=np.uint16)
+    rebate_h = max(1, int(H * 0.1))
+    base_rgb = (9000.0, 12000.0, 3000.0)
+    triplet[:, :, 0] = 8200
+    triplet[:, :, 1] = 10400
+    triplet[:, :, 2] = 2300
+    triplet[:rebate_h, :, 0] = int(base_rgb[0])
+    triplet[:rebate_h, :, 1] = int(base_rgb[1])
+    triplet[:rebate_h, :, 2] = int(base_rgb[2])
+    descriptor = BaseRegionDescriptor(
+        x=0, y=0, w=W, h=rebate_h, base_rgb=base_rgb,
+        uniformity_cv=1.0, source="manual",
+    )
+    return triplet, descriptor
+
+
+def _composite_from_density_levels(
+    lows: tuple[float, float, float],
+    highs: tuple[float, float, float],
+) -> tuple[np.ndarray, BaseRegionDescriptor]:
+    """Small frame with a fixed base patch and known central density range."""
+    base_rgb = (30000.0, 32000.0, 34000.0)
+    triplet = np.zeros((6, 6, 3), dtype=np.uint16)
+    for ch, base in enumerate(base_rgb):
+        triplet[..., ch] = int(base)
+        triplet[1:3, 1:5, ch] = int(round(base * np.exp(-lows[ch])))
+        triplet[3:5, 1:5, ch] = int(round(base * np.exp(-highs[ch])))
+    descriptor = BaseRegionDescriptor(
+        x=0,
+        y=0,
+        w=1,
+        h=1,
+        base_rgb=base_rgb,
+        uniformity_cv=1.0,
+        source="manual",
+    )
+    return triplet, descriptor
+
+
+def test_auto_positive_default_base_mode_is_patch():
+    """Default base_mode must stay 'patch' so existing behavior is unchanged."""
+    triplet, descriptor = _auto_positive_fixture()
+    _pos, meta = auto_positive_from_composite(triplet, descriptor)
+    assert meta["base_mode"] == "patch"
+    assert meta["base_source"] == "patch"
+
+
+def test_auto_positive_whole_frame_base_mode_is_valid_deterministic_and_recorded():
+    triplet, descriptor = _auto_positive_fixture()
+    pos, meta = auto_positive_from_composite(triplet, descriptor, base_mode="whole_frame")
+    assert meta["base_mode"] == "whole_frame"
+    assert meta["base_source"] == "whole_frame"
+    assert pos.dtype == np.uint16 and pos.shape == triplet.shape
+    assert int(pos.min()) >= 0 and int(pos.max()) <= 65535
+    pos2, _ = auto_positive_from_composite(triplet, descriptor, base_mode="whole_frame")
+    np.testing.assert_array_equal(pos, pos2)
+
+
+def test_auto_positive_auto_mode_falls_back_only_on_high_cv():
+    """'auto' honors a clean patch but falls back to whole-frame on a noisy one."""
+    triplet, clean = _auto_positive_fixture()  # uniformity_cv = 1.0
+    _p, meta_clean = auto_positive_from_composite(triplet, clean, base_mode="auto")
+    assert meta_clean["base_source"] == "patch"
+
+    dirty = BaseRegionDescriptor(
+        x=clean.x, y=clean.y, w=clean.w, h=clean.h, base_rgb=clean.base_rgb,
+        uniformity_cv=20.0, source="auto",
+    )
+    _p2, meta_dirty = auto_positive_from_composite(triplet, dirty, base_mode="auto")
+    assert meta_dirty["base_source"] == "whole_frame"
+
+
+def test_auto_positive_invalid_base_mode_raises():
+    triplet, descriptor = _auto_positive_fixture()
+    with pytest.raises(ValueError, match="base_mode"):
+        auto_positive_from_composite(triplet, descriptor, base_mode="bogus")
+
+
+def test_whole_frame_base_rgb_is_per_channel_high_percentile():
+    from rgb_composite.composite import _whole_frame_base_rgb, _MIN_BASE_CHANNEL
+
+    triplet, _ = _auto_positive_fixture()
+    base = _whole_frame_base_rgb(triplet)
+    assert len(base) == 3
+    assert all(v >= _MIN_BASE_CHANNEL for v in base)
+    # Mirrors the fixture's brightest (rebate) values: G > R > B.
+    assert base[1] > base[0] > base[2]
+
+
+def test_auto_positive_auto_mode_honors_manual_descriptor_even_if_noisy():
+    """A hand-picked (manual) base is trusted under 'auto' regardless of its CV."""
+    triplet, clean = _auto_positive_fixture()
+    manual_noisy = BaseRegionDescriptor(
+        x=clean.x, y=clean.y, w=clean.w, h=clean.h, base_rgb=clean.base_rgb,
+        uniformity_cv=25.0, source="manual",
+    )
+    _p, meta = auto_positive_from_composite(triplet, manual_noisy, base_mode="auto")
+    assert meta["base_source"] == "patch"
+
+
+def test_auto_positive_auto_threshold_is_exclusive():
+    """cv exactly equal to the threshold stays on patch (fallback is strictly >)."""
+    triplet, clean = _auto_positive_fixture()
+    at_threshold = BaseRegionDescriptor(
+        x=clean.x, y=clean.y, w=clean.w, h=clean.h, base_rgb=clean.base_rgb,
+        uniformity_cv=8.0, source="auto",
+    )
+    _p, meta = auto_positive_from_composite(
+        triplet, at_threshold, base_mode="auto", auto_base_cv_threshold=8.0
+    )
+    assert meta["base_source"] == "patch"
+
+
+def test_auto_positive_explicit_patch_ignores_high_cv():
+    """Explicit base_mode='patch' never falls back, even with a noisy patch."""
+    triplet, clean = _auto_positive_fixture()
+    noisy = BaseRegionDescriptor(
+        x=clean.x, y=clean.y, w=clean.w, h=clean.h, base_rgb=clean.base_rgb,
+        uniformity_cv=50.0, source="auto",
+    )
+    _p, meta = auto_positive_from_composite(triplet, noisy, base_mode="patch")
+    assert meta["base_source"] == "patch"
+
+
+def test_auto_positive_bounds_override_is_locked_and_deterministic():
+    triplet, descriptor = _auto_positive_fixture()
+    bounds = ((0.0, 0.25), (0.0, 0.3), (0.0, 0.4))
+
+    pos1, meta1 = auto_positive_from_composite(
+        triplet,
+        descriptor,
+        bounds_override=bounds,
+    )
+    pos2, meta2 = auto_positive_from_composite(
+        triplet,
+        descriptor,
+        bounds_override=bounds,
+    )
+
+    np.testing.assert_array_equal(pos1, pos2)
+    assert meta1 == meta2
+    assert meta1["bounds_override_used"] is True
+    assert meta1["locked_bounds_used"] is True
+    assert meta1["display_bounds_source"] == "locked"
+    assert meta1["display_levels"] == bounds
+
+
+def test_auto_positive_bounds_override_none_matches_default_path():
+    triplet, descriptor = _auto_positive_fixture()
+
+    default_pos, default_meta = auto_positive_from_composite(triplet, descriptor)
+    none_pos, none_meta = auto_positive_from_composite(
+        triplet,
+        descriptor,
+        bounds_override=None,
+    )
+
+    np.testing.assert_array_equal(default_pos, none_pos)
+    assert default_meta == none_meta
+
+
+def test_aggregate_positive_density_bounds_uses_median_across_frames():
+    frame_specs = [
+        ((0.10, 0.20, 0.30), (0.70, 0.80, 0.90)),
+        ((0.20, 0.30, 0.40), (0.80, 0.90, 1.00)),
+        ((0.30, 0.40, 0.50), (0.90, 1.00, 1.10)),
+    ]
+    frames = [_composite_from_density_levels(*spec)[0] for spec in frame_specs]
+    _first, descriptor = _composite_from_density_levels(*frame_specs[0])
+    per_frame = [
+        positive_density_bounds_from_composite(
+            frame,
+            descriptor,
+            display_black_percentile=0.0,
+            display_white_percentile=100.0,
+            analysis_crop_fraction=0.25,
+        )
+        for frame in frames
+    ]
+
+    aggregate = aggregate_positive_density_bounds(
+        frames,
+        descriptor,
+        display_black_percentile=0.0,
+        display_white_percentile=100.0,
+        analysis_crop_fraction=0.25,
+    )
+
+    expected = np.median(np.asarray(per_frame, dtype=np.float64), axis=0)
+    np.testing.assert_allclose(np.asarray(aggregate), expected)
+    aggregate2 = aggregate_positive_density_bounds(
+        frames,
+        descriptor,
+        display_black_percentile=0.0,
+        display_white_percentile=100.0,
+        analysis_crop_fraction=0.25,
+    )
+    assert aggregate == aggregate2
+
+
+def test_locked_bounds_map_equal_density_to_equal_output_across_frames():
+    frame_a, descriptor = _composite_from_density_levels(
+        (0.05, 0.10, 0.15),
+        (0.80, 0.85, 0.90),
+    )
+    frame_b, _ = _composite_from_density_levels(
+        (0.20, 0.25, 0.30),
+        (1.05, 1.10, 1.15),
+    )
+    equal_density = (0.45, 0.50, 0.55)
+    for ch, base in enumerate(descriptor.base_rgb):
+        value = int(round(base * np.exp(-equal_density[ch])))
+        frame_a[2, 2, ch] = value
+        frame_b[2, 2, ch] = value
+    assert not np.array_equal(frame_a, frame_b)
+
+    locked_bounds = aggregate_positive_density_bounds(
+        [frame_a, frame_b],
+        descriptor,
+        display_black_percentile=0.0,
+        display_white_percentile=100.0,
+        analysis_crop_fraction=0.25,
+    )
+    positive_a, meta_a = auto_positive_from_composite(
+        frame_a,
+        descriptor,
+        tone_gamma=1.0,
+        analysis_crop_fraction=0.25,
+        bounds_override=locked_bounds,
+    )
+    positive_b, meta_b = auto_positive_from_composite(
+        frame_b,
+        descriptor,
+        tone_gamma=1.0,
+        analysis_crop_fraction=0.25,
+        bounds_override=locked_bounds,
+    )
+
+    np.testing.assert_array_equal(positive_a[2, 2, :], positive_b[2, 2, :])
+    assert meta_a["display_levels"] == locked_bounds
+    assert meta_b["display_levels"] == locked_bounds

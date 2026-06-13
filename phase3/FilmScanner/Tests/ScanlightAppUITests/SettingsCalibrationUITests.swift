@@ -165,6 +165,23 @@ final class SettingsCalibrationUITests: XCTestCase {
         XCTAssertNotNil(errors["sonyPassword"])
     }
 
+    func testSDKUSBTriggerDoesNotRequireSonyIP() {
+        let store = SettingsStore(persistenceEnabled: false)
+        store.settings.triggerMode = "sdk"
+        store.settings.sonyTransport = "usb"
+        store.settings.rollName = "Roll001"
+        store.settings.outputFolder = "/tmp/out"
+        store.settings.sonyIpAddress = nil
+        store.settings.sonyUser = "user"
+        store.settings.sonyPassword = "password"
+
+        let errors = store.validate()
+
+        XCTAssertNil(errors["sonyIpAddress"])
+        XCTAssertNil(errors["sonyUser"])
+        XCTAssertNil(errors["sonyPassword"])
+    }
+
     // MARK: - Test 5b: picking folders clears stale validation errors
 
     /// Unit test — no app launch.

@@ -155,7 +155,11 @@ The short version of a session:
    clipping (this is what neutralizes the orange mask), then captures a
    flat-field reference.
 3. **Scan** — advance the film by hand; one button captures each R/G/B triplet.
-   RAWs auto-download and are named by roll/frame.
+   In manual (Imaging Edge) mode the app shows a per-channel prompt — "Fire R
+   now", then G, then B — so there is no guesswork about which exposure to
+   trigger. In Sony-SDK mode the capture path holds **one camera session open
+   for the whole roll** (no per-frame reconnect). RAWs auto-download and are
+   named by roll/frame.
 4. **Composite** — the backend merges each triplet into a 16-bit linear
    TIFF/DNG.
 5. **Invert** — import to Negative Lab Pro / FilmLab and apply a linear

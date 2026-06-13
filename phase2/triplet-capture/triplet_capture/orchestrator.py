@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -52,6 +53,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import inbox as inbox_mod
+from .sony_persist import PersistentSonyCapture
 
 logger = logging.getLogger("triplet-capture")
 
@@ -109,8 +111,13 @@ class CaptureSettings:
     shutter_g: Optional[str] = None
     shutter_b: Optional[str] = None
 
-    # Hardware-trigger mode fields. Default values keep "sdk" mode working
-    # unchanged for existing callers.
+    # Hardware-trigger mode fields.
+    # Dataclass default is "sdk" ON PURPOSE: it is the only mode that needs no
+    # extra required field, so `CaptureSettings()` stays constructible for
+    # library/test use. The USER-FACING default is "manual" and is set
+    # explicitly at the CLI (app.py) and by the Swift app — do NOT "align" this
+    # to "manual" here, or the no-arg constructor raises (manual requires
+    # ied_inbox, validated in __post_init__).
     trigger_mode: str = "sdk"
     ied_inbox: Optional[Path] = None
     shutter_pulse_ms: int = 100  # matches the canonical app_bsl default
@@ -121,6 +128,11 @@ class CaptureSettings:
     # Inbox polling cadence. 200 ms is plenty for files arriving every
     # several seconds; raise if filesystem ops are hurting you.
     inbox_poll_interval_s: float = 0.2
+    # F2: use the persistent sony-capture session (--persist mode) instead of
+    # spawning one process per capture.  Defaults True because that's the
+    # intended production path; set False to fall back to one-shot spawns while
+    # the persistent binary is still being hardware-validated.
+    sdk_persistent: bool = True
 
     def __post_init__(self):
         # Coerce in case caller passes a string from the web UI
@@ -178,6 +190,15 @@ class CaptureSettings:
                 raise ValueError(
                     f"shutter_pulse_ms must be a multiple of 10 in [10, 2550], "
                     f"got {self.shutter_pulse_ms}"
+                )
+        # Inbox timing must be finite and strictly positive: <= 0 bypasses the
+        # stability window (or makes sleep() spin/raise), and NaN/inf makes the
+        # stability check never pass so wait_for_new_file hangs until timeout.
+        for _name in ("inbox_stable_for_s", "inbox_poll_interval_s"):
+            _val = getattr(self, _name)
+            if not (isinstance(_val, (int, float)) and math.isfinite(_val) and _val > 0):
+                raise ValueError(
+                    f"{_name} must be a finite number > 0, got {_val!r}"
                 )
 
 
@@ -249,6 +270,20 @@ class Orchestrator:
         self._explicit_runner = sony_capture_runner
         self._last_runner_detail = ""
         self._runner = self._pick_runner()
+        # F1: channel currently being waited on ("R", "G", "B", or None).
+        # Written under _wfc_lock so the Flask thread can poll safely.
+        self._wfc_lock = threading.Lock()
+        self._waiting_for_channel: Optional[str] = None
+        # Bug-2 activity guard: prevents capture and calibration from
+        # interleaving serial/camera commands. Uses its own lock so the
+        # Flask thread can poll current_activity without blocking on the
+        # capture _lock, and so that try_begin_activity never deadlocks
+        # with the capture path.
+        self._activity_lock = threading.Lock()
+        self._current_activity: Optional[str] = None
+        # F2: persistent sony-capture session (created lazily when sdk mode
+        # first runs; closed on shutdown or settings change).
+        self._persistent_session: Optional["_PersistentSessionRef"] = None
 
     def _pick_runner(self) -> Callable[[str, Path, int], int]:
         """Choose the capture runner.
@@ -257,7 +292,9 @@ class Orchestrator:
           1. Caller-provided `sony_capture_runner` from __init__ (tests).
           2. trigger_mode=hw → internal HW pulse + IED inbox runner.
           3. trigger_mode=manual → internal IED inbox-only runner.
-          4. trigger_mode=sdk → internal SDK runner (sony-capture subprocess).
+          4. trigger_mode=sdk + sdk_persistent=True → persistent SDK runner
+             (reuses one sony-capture session across the whole triplet/roll).
+          5. trigger_mode=sdk + sdk_persistent=False → one-shot SDK runner.
         """
         if self._explicit_runner is not None:
             return self._explicit_runner
@@ -265,13 +302,89 @@ class Orchestrator:
             return self._hw_runner
         if self._settings.trigger_mode == "manual":
             return self._manual_runner
+        # sdk mode. The persistent runner applies each channel's shutter per
+        # capture via the persist `shutter <speed>` command, so per-channel
+        # DIFFERING shutters (the narrowband-RGB norm) are fully supported.
+        # The ONE case persist can't represent is a MIX of explicit shutters and
+        # None: None means "use the camera's own shutter", but once another
+        # channel changed the shutter mid-session there's no reset-to-default
+        # command, so the None channel would inherit the prior channel's shutter.
+        # Fall back to the one-shot runner only for that mix (each fresh process
+        # simply omits --shutter-speed → camera default). All-None and all-set
+        # (even all-different) keep the persistent session. (NOT the rejected
+        # uniform-shutter gate — differing explicit shutters still use persist.)
+        if self._settings.sdk_persistent and not self._channel_shutters_mixed():
+            return self._persistent_runner
         return self._default_runner
+
+    def _channel_shutters_mixed(self) -> bool:
+        """True when the three channel shutters mix explicit value(s) with None.
+
+        (Empty string is treated as None.) All-None and all-set return False.
+        """
+        vals = (self._settings.shutter_r, self._settings.shutter_g, self._settings.shutter_b)
+        has_none = any(v is None or v == "" for v in vals)
+        has_set = any(v is not None and v != "" for v in vals)
+        return has_none and has_set
+
+    def close(self) -> None:
+        """Close any persistent session.  Call on orchestrator shutdown."""
+        self._close_persistent_session()
 
     # ---------------- public API ----------------
 
     @property
     def settings(self) -> CaptureSettings:
         return self._settings
+
+    @property
+    def waiting_for_channel(self) -> Optional[str]:
+        """F1: channel the orchestrator is currently waiting on.
+
+        Returns "R", "G", or "B" while the operator should fire that channel
+        (set after the LED is on + settled, cleared when the file lands or the
+        triplet finishes). Returns None when idle or between channels.
+
+        Thread-safe: guarded by _wfc_lock, separate from _lock so the Flask
+        thread can poll without blocking or being blocked by the capture thread.
+        """
+        with self._wfc_lock:
+            return self._waiting_for_channel
+
+    def _set_waiting_for_channel(self, channel: Optional[str]) -> None:
+        with self._wfc_lock:
+            self._waiting_for_channel = channel
+
+    # Bug-2: exclusive-activity guard ----------------------------------------
+    # A dedicated lock (separate from _lock) lets try_begin_activity be
+    # atomic without holding the capture lock, and lets the Flask thread
+    # poll current_activity without blocking on an in-progress capture.
+
+    def try_begin_activity(self, name: str) -> bool:
+        """Attempt to claim the exclusive-activity slot.
+
+        Returns True and claims the slot when no other activity is running.
+        Returns False (slot already taken — a capture or calibration is in
+        flight) so the caller can return 409.
+
+        Must be paired with end_activity() in a finally block.
+        """
+        with self._activity_lock:
+            if self._current_activity is not None:
+                return False
+            self._current_activity = name
+            return True
+
+    def end_activity(self) -> None:
+        """Release the exclusive-activity slot."""
+        with self._activity_lock:
+            self._current_activity = None
+
+    @property
+    def current_activity(self) -> Optional[str]:
+        """Name of the running exclusive activity or None when idle."""
+        with self._activity_lock:
+            return self._current_activity
 
     def update_settings(self, **kwargs) -> CaptureSettings:
         """Replace zero or more fields. Resets `frame_number` to 1 if
@@ -281,7 +394,20 @@ class Orchestrator:
         changed and no explicit runner override was provided at init —
         otherwise a runtime switch from sdk→hw (or vice versa) would
         keep firing through the old runner.
+
+        Closes any persistent sony-capture session when sdk-connection
+        params (binary path, IP, MAC, credentials) or sdk_persistent change,
+        so the next capture spawns a fresh session with the new config.
         """
+        _PERSIST_AFFECTING_KEYS = frozenset({
+            "sony_capture_path", "sony_ip_address", "sony_mac_address",
+            "sony_user", "sony_password", "sdk_persistent", "trigger_mode",
+            # Settings baked into the persist startup args must invalidate the
+            # session on change. Shutter is NOT here — it is applied per capture
+            # over the `shutter` command, so changing shutter_r/g/b only affects
+            # the next capture, no session rebuild needed.
+            "sony_iso", "sony_capture_timeout_s",
+        })
         with self._lock:
             if "roll_name" in kwargs and "frame_number" not in kwargs:
                 if kwargs["roll_name"] != self._settings.roll_name:
@@ -292,6 +418,25 @@ class Orchestrator:
             self._settings.__post_init__()
             if self._settings.trigger_mode != old_trigger_mode:
                 self._runner = self._pick_runner()
+            # F2: close the persistent session when its config changes.
+            if kwargs.keys() & _PERSIST_AFFECTING_KEYS:
+                self._close_persistent_session()
+                # Re-pick runner in case sdk_persistent toggled.
+                if self._explicit_runner is None:
+                    self._runner = self._pick_runner()
+            elif kwargs.keys() & {"shutter_r", "shutter_g", "shutter_b"}:
+                # Close the live session on ANY shutter change. CLEARING a channel
+                # (value → None) is the trap: `None` means "leave the current
+                # shutter", so a session that earlier applied an explicit shutter
+                # would keep capturing at that stale value instead of the camera
+                # default. A fresh session always starts at the camera default and
+                # re-applies per channel, so closing here is correct for clear, set,
+                # and set→different transitions. (Shutter changes happen at
+                # calibration/setup, not per frame, so the rebuild cost is trivial.)
+                # Then re-pick the runner — the change can also flip mixed↔uniform.
+                self._close_persistent_session()
+                if self._explicit_runner is None:
+                    self._runner = self._pick_runner()
             return self._settings
 
     def capture_triplet(self, *, retake: bool = False) -> TripletResult:
@@ -306,6 +451,10 @@ class Orchestrator:
         serial writes and race the frame counter. A capture that arrives while
         another is in flight is rejected (success=False) rather than queued —
         queuing would silently shoot a second frame with no film advance.
+
+        Does NOT check the activity guard — callers (Flask routes) are
+        responsible for claiming the activity slot before calling this method.
+        See `post_capture` in app.py which uses `try_begin_activity("capture")`.
         """
         if not self._lock.acquire(blocking=False):
             return TripletResult(
@@ -334,6 +483,10 @@ class Orchestrator:
         probe. Reusing capture_triplet() for those jobs fired two extra dark
         captures every time, making real SDK calibration slow enough for the
         Swift HTTP request to time out.
+
+        Does NOT check the activity guard — callers (Flask routes and
+        calibrate_exposure) are responsible for holding the guard while calling
+        this method. The _lock still serializes concurrent camera commands.
         """
         channel = channel.upper()
         if channel not in {"R", "G", "B"}:
@@ -534,6 +687,15 @@ class Orchestrator:
         if s.settle_ms > 0:
             self._sleep(s.settle_ms / 1000.0)
 
+        # F1: signal to the operator (and the state API) which channel we are
+        # now waiting on.  In manual/hw modes the operator must fire the
+        # camera; in sdk mode we fire it ourselves but the UI still shows the
+        # active channel.  Set AFTER settle so the LED is stable when the
+        # operator reads the banner.  Log a breadcrumb in manual mode.
+        self._set_waiting_for_channel(channel)
+        if s.trigger_mode == "manual":
+            log("waiting_for_channel", channel=channel)
+
         # 3. Run sony-capture. exit_code != 0 → abort with a clear error.
         log(
             "sony_capture_start",
@@ -542,8 +704,14 @@ class Orchestrator:
             shutter_speed=shutter_speed,
             **({"label": label} if label else {}),
         )
-        self._last_runner_detail = ""
-        exit_code = self._runner(channel, out_path, s.sony_capture_timeout_s)
+        try:
+            self._last_runner_detail = ""
+            exit_code = self._runner(channel, out_path, s.sony_capture_timeout_s)
+        finally:
+            # Clear waiting_for_channel as soon as the runner returns (file
+            # landed, timed out, or aborted) so the UI doesn't show a stale
+            # channel name between triplets.
+            self._set_waiting_for_channel(None)
         if exit_code != 0:
             log("sony_capture_fail", channel=channel, exit_code=exit_code)
             raise TripletAbort(self._capture_failure_message(channel, exit_code))
@@ -838,6 +1006,82 @@ class Orchestrator:
                     self._redact_runner_detail(stderr_text),
                 )
         return returncode
+
+    # -------- F2: persistent sony-capture session --------
+
+    def _close_persistent_session(self) -> None:
+        """Close and discard the current persistent session, if any."""
+        session = self._persistent_session
+        if session is not None:
+            self._persistent_session = None
+            try:
+                session.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("error closing persistent sony-capture session: %s", exc)
+
+    def _get_or_create_persistent_session(self) -> PersistentSonyCapture:
+        """Return the existing session or create a new one."""
+        if self._persistent_session is not None:
+            return self._persistent_session
+
+        s = self._settings
+        import shutil as _shutil
+        binary = _shutil.which(s.sony_capture_path) or s.sony_capture_path
+        extras: list[str] = ["--timeout", str(s.sony_capture_timeout_s)]
+        if s.sony_ip_address:
+            extras += ["--ip-address", s.sony_ip_address]
+        if s.sony_mac_address:
+            extras += ["--mac-address", s.sony_mac_address]
+        if s.sony_iso:
+            extras += ["--iso", s.sony_iso]
+        # NOTE: shutter is intentionally NOT a startup arg. It is applied per
+        # capture over the persist `shutter <speed>` command (see
+        # _persistent_runner / PersistentSonyCapture.capture), because
+        # narrowband RGB uses a different shutter per channel.
+
+        def on_exposure_complete() -> None:
+            try:
+                self._scanlight.off()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("could not turn Scanlight off after exposure marker: %s", exc)
+
+        session = PersistentSonyCapture(
+            binary,
+            extras,
+            self._sony_capture_env(),
+            on_exposure_complete=on_exposure_complete,
+        )
+        self._persistent_session = session
+        return session
+
+    def _persistent_runner(self, channel: str, out_path: Path, timeout_s: int) -> int:
+        """F2: SDK runner that reuses a persistent sony-capture session.
+
+        The session is reused across the whole roll. The per-channel shutter is
+        applied per capture via the persist `shutter <speed>` command —
+        narrowband RGB needs a DIFFERENT shutter per channel (blue far longer
+        than red/green), so this is required, not optional. Falls through to
+        _default_runner semantics on unexpected failure so existing error-path
+        tests remain valid.
+        """
+        session = self._get_or_create_persistent_session()
+        exit_code = session.capture(
+            out_path,
+            timeout_s=timeout_s,
+            shutter=self._shutter_for_channel(channel),
+        )
+        if exit_code == 127:
+            # Binary not found — replicate _default_runner's detail message.
+            s = self._settings
+            import shutil as _shutil
+            binary = _shutil.which(s.sony_capture_path) or s.sony_capture_path
+            self._last_runner_detail = f"binary not found at {binary}"
+            # Kill the dead session so the next attempt re-evaluates.
+            self._close_persistent_session()
+        elif exit_code != 0:
+            # Session may be in bad state; close so next capture gets a fresh one.
+            self._close_persistent_session()
+        return exit_code
 
     def sdk_shutter_control_preflight(self) -> tuple[bool, str]:
         """Return whether sony-capture can write shutter speed in SDK mode.

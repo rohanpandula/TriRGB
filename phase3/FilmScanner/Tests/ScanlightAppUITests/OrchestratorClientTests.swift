@@ -419,6 +419,64 @@ final class OrchestratorClientTests: XCTestCase {
         ))
     }
 
+    func testStaleTripletCleanupIgnoresWeakRootCwd() {
+        // Audit #15: a Finder/packaged launch with cwd "/" must NOT match unrelated
+        // backends — "/" is a substring of every absolute command line. repoHints
+        // is empty (the "/" cwd is dropped by isSpecificRepoHint at the builder),
+        // and the cwd comparison is skipped because "/" isn't specific — even when
+        // the orphan's real cwd is also "/".
+        let unrelated = RunningTripletProcess(
+            pid: 444,
+            parentPID: 1,
+            command: "/opt/homebrew/bin/python3 -m triplet_capture.app --sony-capture /other/phase1/sony-capture/build/sony-capture"
+        )
+        XCTAssertFalse(OrchestratorClient.shouldCleanupStaleTripletProcess(
+            unrelated,
+            repoHints: [],
+            currentWorkingDirectory: "/",
+            cwdLookup: { _ in "/" }
+        ))
+    }
+
+    func testIsSpecificRepoHintRejectsWeakPaths() {
+        XCTAssertFalse(OrchestratorClient.isSpecificRepoHint(""))
+        XCTAssertFalse(OrchestratorClient.isSpecificRepoHint("/"))
+        XCTAssertFalse(OrchestratorClient.isSpecificRepoHint(
+            FileManager.default.homeDirectoryForCurrentUser.path))
+        XCTAssertTrue(OrchestratorClient.isSpecificRepoHint("/Users/x/Projects/TriRGB"))
+        XCTAssertTrue(OrchestratorClient.isSpecificRepoHint(
+            "/repo/phase1/sony-capture/build/sony-capture"))
+    }
+
+    func testScanlightOffCandidatesIncludePortBeforeSubcommand() {
+        // Audit #15: the emergency light-off must pass the explicit --port (a GLOBAL
+        // scanlightctl arg, BEFORE the `off` subcommand) so it still targets the
+        // right device when multiple Pico CDC ports are present.
+        let withPort = OrchestratorClient.scanlightOffCandidates(port: "/dev/cu.usbmodem1234")
+        XCTAssertFalse(withPort.isEmpty)
+        for candidate in withPort {
+            let args = candidate.arguments
+            guard let portIdx = args.firstIndex(of: "--port"),
+                  let offIdx = args.firstIndex(of: "off") else {
+                XCTFail("candidate \(args) missing --port or off")
+                continue
+            }
+            XCTAssertEqual(args[portIdx + 1], "/dev/cu.usbmodem1234",
+                           "--port must be followed by the port path")
+            XCTAssertLessThan(portIdx, offIdx, "--port must precede the off subcommand")
+        }
+
+        // No port (auto-discovery, single-device case) → no --port arg.
+        for candidate in OrchestratorClient.scanlightOffCandidates(port: nil) {
+            XCTAssertFalse(candidate.arguments.contains("--port"))
+            XCTAssertTrue(candidate.arguments.contains("off"))
+        }
+        // Empty string is treated as "no port".
+        for candidate in OrchestratorClient.scanlightOffCandidates(port: "") {
+            XCTAssertFalse(candidate.arguments.contains("--port"))
+        }
+    }
+
     func testProcessOutputDrainsLargeStdoutBeforeWaiting() {
         let output = OrchestratorClient.processOutput(
             executable: "/bin/zsh",
@@ -729,6 +787,39 @@ final class OrchestratorClientTests: XCTestCase {
         XCTAssertTrue(containsAdjacent(args, ["--capture-timeout-s", "60"]))
     }
 
+    func testBuildArgsOmitsNetworkAddressForSDKUSBMode() {
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            scanlightPort: "/dev/cu.usbmodem1234",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyTransport: "usb",
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let args = client.buildArgs(settings: settings, portFile: "/tmp/port", readyNonce: "nonce")
+
+        XCTAssertTrue(containsAdjacent(args, ["--sony-capture", "/tmp/sony-capture"]))
+        XCTAssertFalse(args.contains("--sony-ip-address"))
+        XCTAssertFalse(args.contains("--sony-mac-address"))
+        XCTAssertTrue(containsAdjacent(args, ["--sony-user", "sdk-user"]))
+        XCTAssertTrue(containsAdjacent(args, ["--sony-password", "sdk-password"]))
+    }
+
     func testSettingsWithResolvedSonyIPUsesARPEntryForSavedMAC() {
         let oldProvider = OrchestratorClient.sonyARPTableProvider
         OrchestratorClient.sonyARPTableProvider = {
@@ -766,6 +857,41 @@ final class OrchestratorClientTests: XCTestCase {
         XCTAssertEqual(resolved.sonyMacAddress, "10:32:2C:26:1A:3F")
     }
 
+    func testSettingsWithResolvedSonyIPDoesNotResolveUSBTransport() {
+        let oldProvider = OrchestratorClient.sonyARPTableProvider
+        OrchestratorClient.sonyARPTableProvider = {
+            "? (10.0.0.244) at 10:32:2c:26:1a:3f on en0 ifscope [ethernet]"
+        }
+        defer { OrchestratorClient.sonyARPTableProvider = oldProvider }
+
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyTransport: "usb",
+            sonyIpAddress: nil,
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let resolved = client.settingsWithResolvedSonyIP(settings)
+
+        XCTAssertNil(resolved.sonyIpAddress)
+        XCTAssertEqual(resolved.sonyMacAddress, "10:32:2C:26:1A:3F")
+    }
+
     func testBuildSonyConnectionProbeUsesConnectOnly() throws {
         let client = OrchestratorClient()
         let settings = ScanSettings(
@@ -796,8 +922,104 @@ final class OrchestratorClientTests: XCTestCase {
         XCTAssertTrue(containsAdjacent(command.arguments, ["--timeout", "10"]))
         XCTAssertTrue(containsAdjacent(command.arguments, ["--ip-address", "10.0.0.247"]))
         XCTAssertTrue(containsAdjacent(command.arguments, ["--mac-address", "10:32:2C:26:1A:3F"]))
-        XCTAssertTrue(containsAdjacent(command.arguments, ["--user", "sdk-user"]))
-        XCTAssertTrue(containsAdjacent(command.arguments, ["--password", "sdk-password"]))
+        XCTAssertFalse(command.arguments.contains("--user"))
+        XCTAssertFalse(command.arguments.contains("--password"))
+        XCTAssertEqual(command.environment["SONY_USERNAME"], "sdk-user")
+        XCTAssertEqual(command.environment["SONY_USER"], "sdk-user")
+        XCTAssertEqual(command.environment["SONY_PW"], "sdk-password")
+    }
+
+    func testBuildSonyConnectionProbeUsesUSBEnumerationWhenTransportIsUSB() throws {
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyTransport: "usb",
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let command = try client.buildSonyConnectionProbeCommand(settings: settings, timeoutSeconds: 10)
+
+        XCTAssertTrue(command.arguments.contains("--connect-only"))
+        XCTAssertFalse(command.arguments.contains("--ip-address"))
+        XCTAssertFalse(command.arguments.contains("--mac-address"))
+        XCTAssertEqual(command.environment["SONY_USERNAME"], "sdk-user")
+        XCTAssertEqual(command.environment["SONY_PW"], "sdk-password")
+    }
+
+    func testSonyConnectionProbeRetriesTransientRouteFailure() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sony-retry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let counterURL = directory.appendingPathComponent("counter.txt")
+        let scriptURL = directory.appendingPathComponent("sony-capture")
+        let script = """
+        #!/bin/zsh
+        counter="\(counterURL.path)"
+        count=$(cat "$counter" 2>/dev/null || echo 0)
+        count=$((count + 1))
+        echo "$count" > "$counter"
+        if [[ "$count" -eq 1 ]]; then
+          echo "sony-capture: camera is not reachable over SDK SSH at 10.0.0.247:22 (connect(10.0.0.247:22) failed: No route to host)" >&2
+          exit 1
+        fi
+        echo connected
+        exit 0
+        """
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: scriptURL.path
+        )
+
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: scriptURL.path,
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let result = await client.checkSonyConnection(settings: settings)
+
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.message, "Connected to Sony camera.")
+        XCTAssertEqual(
+            try String(contentsOf: counterURL).trimmingCharacters(in: .whitespacesAndNewlines),
+            "2"
+        )
     }
 
     func testBuildSonyLiveViewFrameUsesLiveViewOut() throws {
@@ -836,8 +1058,11 @@ final class OrchestratorClientTests: XCTestCase {
         XCTAssertTrue(containsAdjacent(command.arguments, ["--timeout", "8"]))
         XCTAssertTrue(containsAdjacent(command.arguments, ["--ip-address", "10.0.0.247"]))
         XCTAssertTrue(containsAdjacent(command.arguments, ["--mac-address", "10:32:2C:26:1A:3F"]))
-        XCTAssertTrue(containsAdjacent(command.arguments, ["--user", "sdk-user"]))
-        XCTAssertTrue(containsAdjacent(command.arguments, ["--password", "sdk-password"]))
+        XCTAssertFalse(command.arguments.contains("--user"))
+        XCTAssertFalse(command.arguments.contains("--password"))
+        XCTAssertEqual(command.environment["SONY_USERNAME"], "sdk-user")
+        XCTAssertEqual(command.environment["SONY_USER"], "sdk-user")
+        XCTAssertEqual(command.environment["SONY_PW"], "sdk-password")
     }
 
     func testBuildSonyLiveViewStreamUsesPersistentLiveViewOut() throws {
@@ -878,8 +1103,49 @@ final class OrchestratorClientTests: XCTestCase {
         XCTAssertTrue(containsAdjacent(command.arguments, ["--timeout", "8"]))
         XCTAssertTrue(containsAdjacent(command.arguments, ["--ip-address", "10.0.0.247"]))
         XCTAssertTrue(containsAdjacent(command.arguments, ["--mac-address", "10:32:2C:26:1A:3F"]))
-        XCTAssertTrue(containsAdjacent(command.arguments, ["--user", "sdk-user"]))
-        XCTAssertTrue(containsAdjacent(command.arguments, ["--password", "sdk-password"]))
+        XCTAssertFalse(command.arguments.contains("--user"))
+        XCTAssertFalse(command.arguments.contains("--password"))
+        XCTAssertEqual(command.environment["SONY_USERNAME"], "sdk-user")
+        XCTAssertEqual(command.environment["SONY_USER"], "sdk-user")
+        XCTAssertEqual(command.environment["SONY_PW"], "sdk-password")
+    }
+
+    func testBuildSonyLiveViewStreamUsesUSBEnumerationWhenTransportIsUSB() throws {
+        let client = OrchestratorClient()
+        let settings = ScanSettings(
+            rollName: "RollSDK",
+            outputFolder: "/Volumes/Scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyTransport: "usb",
+            sonyIpAddress: "10.0.0.247",
+            sonyMacAddress: "10:32:2C:26:1A:3F",
+            sonyUser: "sdk-user",
+            sonyPassword: "sdk-password",
+            sonyCapturePath: "/tmp/sony-capture",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: "Sony ILCE-7CR",
+            compositeFormat: "dng",
+            levelR: 200,
+            levelG: 200,
+            levelB: 200,
+            settleMs: 50
+        )
+
+        let outputURL = URL(fileURLWithPath: "/tmp/sony-live-view-stream.jpg")
+        let command = try client.buildSonyLiveViewStreamCommand(
+            settings: settings,
+            outputURL: outputURL,
+            intervalMs: 250,
+            timeoutSeconds: 8
+        )
+
+        XCTAssertTrue(containsAdjacent(command.arguments, ["--live-view-stream-out", "/tmp/sony-live-view-stream.jpg"]))
+        XCTAssertFalse(command.arguments.contains("--ip-address"))
+        XCTAssertFalse(command.arguments.contains("--mac-address"))
+        XCTAssertEqual(command.environment["SONY_USERNAME"], "sdk-user")
+        XCTAssertEqual(command.environment["SONY_PW"], "sdk-password")
     }
 
     func testSonyConnectionProbeTimeoutDoesNotReadStatusWhileProcessRuns() async throws {
@@ -1155,5 +1421,134 @@ final class OrchestratorClientTests: XCTestCase {
         } catch {
             XCTFail("Wrong error type thrown: \(error)")
         }
+    }
+
+    // MARK: - F0: captureFrame sets explicit request timeout > 60s
+
+    /// Regression for F0: captureFrame must set an explicit timeoutInterval so a
+    /// manual triplet (3 × 30s channels + margin) doesn't hit the URLSession 60s
+    /// default and time out before the operator finishes all three IED fires.
+    func testCaptureFrameSetsExplicitTimeoutAbove60s() async throws {
+        StubURLProtocol.routes["/api/capture"] = (makeTripletJSON(), 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        _ = try await client.captureFrame(retake: false)
+
+        let timeout = StubURLProtocol.lastRequest?.timeoutInterval ?? 0
+        XCTAssertGreaterThan(
+            timeout, 60.0,
+            "captureFrame must set timeoutInterval > 60s (URLSession default) to survive a manual triplet; got \(timeout)s"
+        )
+        // Sanity check: must be at least 3 × default capture_timeout_s + margin
+        // (30 × 3 + 15 = 105s). Use 90 as the lower bound to allow for different
+        // per-channel timeout defaults without being brittle.
+        XCTAssertGreaterThanOrEqual(
+            timeout, 90.0,
+            "captureFrame timeout must cover at least 3 channels × 30s; got \(timeout)s"
+        )
+    }
+
+    // MARK: - F0: captureFrame without retake also sets timeout
+
+    func testCaptureFrameWithRetakeFalsoSetsExplicitTimeout() async throws {
+        StubURLProtocol.routes["/api/capture"] = (makeTripletJSON(), 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        _ = try await client.captureFrame(retake: true)
+
+        let timeout = StubURLProtocol.lastRequest?.timeoutInterval ?? 0
+        XCTAssertGreaterThan(
+            timeout, 60.0,
+            "captureFrame (retake=true) must also set timeoutInterval > 60s; got \(timeout)s"
+        )
+    }
+
+    // MARK: - P1: SDK mode uses 60s/channel, so the client timeout must cover 3×60s
+
+    /// Regression: SDK mode launches the backend with `--capture-timeout-s 60`,
+    /// so a three-channel SDK triplet can run ~180s. The client timeout must be
+    /// derived from that per-channel value (not the 30s manual default), or the
+    /// app aborts while the backend is still capturing.
+    func testCaptureFrameSdkModeTimeoutCovers3x60s() async throws {
+        StubURLProtocol.routes["/api/capture"] = (makeTripletJSON(), 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        // Simulate a launched SDK session (start() sets this from triggerMode).
+        client.activePerChannelCaptureTimeoutS = OrchestratorClient.sdkBackendCaptureTimeoutS
+
+        _ = try await client.captureFrame(retake: false)
+
+        let timeout = StubURLProtocol.lastRequest?.timeoutInterval ?? 0
+        XCTAssertGreaterThanOrEqual(
+            timeout, 195.0,
+            "SDK captureFrame timeout must cover 3 × 60s backend per-channel + margin; got \(timeout)s"
+        )
+    }
+
+    // MARK: - F1: OrchestratorState decodes waiting_for_channel
+
+    func testFetchStateDecodesWaitingForChannelWhenPresent() async throws {
+        let json = """
+        {
+            "roll_name": "Roll001",
+            "frame_number": 1,
+            "output_folder": "/tmp/scans/Roll001",
+            "level_r": 200,
+            "level_g": 200,
+            "level_b": 200,
+            "settle_ms": 50,
+            "waiting_for_channel": "G"
+        }
+        """.data(using: .utf8)!
+        StubURLProtocol.routes["/api/state"] = (json, 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        let state = try await client.fetchState()
+
+        XCTAssertEqual(state.waitingForChannel, "G",
+                       "Expected waitingForChannel = 'G', got: \(state.waitingForChannel ?? "nil")")
+    }
+
+    func testFetchStateDecodesWaitingForChannelWhenAbsent() async throws {
+        StubURLProtocol.routes["/api/state"] = (makeStateJSON(), 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        let state = try await client.fetchState()
+
+        XCTAssertNil(state.waitingForChannel,
+                     "waitingForChannel should be nil when key is absent from JSON")
+    }
+
+    func testFetchStateDecodesWaitingForChannelNull() async throws {
+        let json = """
+        {
+            "roll_name": "Roll001",
+            "frame_number": 1,
+            "output_folder": "/tmp/scans/Roll001",
+            "level_r": 200,
+            "level_g": 200,
+            "level_b": 200,
+            "settle_ms": 50,
+            "waiting_for_channel": null
+        }
+        """.data(using: .utf8)!
+        StubURLProtocol.routes["/api/state"] = (json, 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+
+        let state = try await client.fetchState()
+
+        XCTAssertNil(state.waitingForChannel,
+                     "waitingForChannel should be nil when JSON value is null")
     }
 }

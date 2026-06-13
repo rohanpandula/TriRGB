@@ -89,11 +89,15 @@ private enum ScanlightRuntimeRegistry {
 /// SwiftUI processes @StateObject declarations top-to-bottom within a single
 /// view initializer, and our custom init creates the coordinator last.
 struct ScanHubRootView: View {
-    @StateObject private var settingsStore              = SettingsStore()
-    @StateObject private var orchestratorClient         = OrchestratorClient()
-    @StateObject private var scanlightViewModel         = ScanlightViewModel(
-        transportFactory: FakeBridge.makeTransport
-    )
+    // Double-allocation fix: @StateObject properties that have inline defaults
+    // AND are overwritten in init() allocate two objects (the default is
+    // constructed first, then immediately discarded). Remove inline initializers
+    // for the five properties that init() rewrites so only one instance is ever
+    // created. Properties that init() does NOT touch (positiveInversionViewModel,
+    // sonyCameraConnection, selectedTab) keep their inline defaults.
+    @StateObject private var settingsStore: SettingsStore
+    @StateObject private var orchestratorClient: OrchestratorClient
+    @StateObject private var scanlightViewModel: ScanlightViewModel
     // ScanCoordinator and CalibrationWizardViewModel must be constructed AFTER
     // the two objects they depend on (client, lightVM). We use explicit init()
     // to guarantee the construction order.
@@ -167,6 +171,9 @@ struct ScanHubRootView: View {
             sonyCameraConnection.update(for: settingsStore.settings)
         }
         .onChange(of: settingsStore.settings.triggerMode) { _ in
+            sonyCameraConnection.update(for: settingsStore.settings)
+        }
+        .onChange(of: settingsStore.settings.sonyTransport) { _ in
             sonyCameraConnection.update(for: settingsStore.settings)
         }
         .onChange(of: settingsStore.settings.sonyIpAddress) { _ in

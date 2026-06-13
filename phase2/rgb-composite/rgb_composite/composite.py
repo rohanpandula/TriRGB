@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Mapping, Optional, Union
+from typing import Any, Iterable, Mapping, Optional, Union
 
 import numpy as np
 import rawpy
@@ -65,6 +65,20 @@ DEFAULT_POSITIVE_BLACK_PERCENTILE = 0.1
 DEFAULT_POSITIVE_WHITE_PERCENTILE = 99.2
 DEFAULT_POSITIVE_TONE_GAMMA = 0.55
 DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION = 0.03
+# Whole-frame base fallback for full-bleed scans with no clean film rebate.
+# When the picked rebate patch is non-uniform (no true clear base in frame),
+# estimating the base from the whole frame's per-channel high percentile is a
+# more robust orange-mask neutralizer than trusting a colored content patch.
+DEFAULT_WHOLE_FRAME_BASE_PERCENTILE = 99.9
+# uniformity_cv above this (a clean rebate is typically < 5) means the patch is
+# not clean film base — the "auto" base mode falls back to the whole-frame proxy.
+DEFAULT_AUTO_BASE_CV_THRESHOLD = 8.0
+
+DensityBounds = tuple[
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+]
 
 
 class DimensionMismatchError(ValueError):
@@ -265,6 +279,8 @@ def _analysis_sample(
 def _frame_base_rgb(
     triplet: np.ndarray,
     descriptor: BaseRegionDescriptor,
+    *,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
 ) -> tuple[float, float, float]:
     """Measure d-min color from the selected box in this specific frame.
 
@@ -285,10 +301,265 @@ def _frame_base_rgb(
     if patch.size == 0:
         return tuple(float(v) for v in descriptor.base_rgb)
 
-    base = tuple(float(v) for v in np.percentile(patch, DEFAULT_POSITIVE_DMIN_PERCENTILE, axis=0))
+    base = tuple(float(v) for v in np.percentile(patch, dmin_percentile, axis=0))
     if any(v < _MIN_BASE_CHANNEL for v in base):
         return tuple(float(v) for v in descriptor.base_rgb)
     return base
+
+
+def _whole_frame_base_rgb(
+    triplet: np.ndarray,
+    *,
+    percentile: float = DEFAULT_WHOLE_FRAME_BASE_PERCENTILE,
+    analysis_crop_fraction: float = DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION,
+) -> tuple[float, float, float]:
+    """Estimate clear-film base from the whole frame's per-channel high percentile.
+
+    Fallback for full-bleed scans where no clean film rebate was captured. Instead
+    of trusting one (possibly colored) edge patch, take each channel's high
+    percentile across the analysis-cropped frame as the clear-film proxy — the
+    brightest near-clear value per channel. This is the gray-world / independent
+    per-channel neutralization that lab scanners use, and it removes the shadow
+    color cast a non-representative patch would otherwise inject.
+
+    Per-channel and purely numeric — no color-vision decision (NFR-11).
+    """
+    sample = _analysis_sample(triplet, analysis_crop_fraction).reshape(-1, 3).astype(np.float32)
+    pct = max(0.0, min(float(percentile), 100.0))
+    base = tuple(float(v) for v in np.percentile(sample, pct, axis=0))
+    # Clamp to the minimum usable base; the brightest per-channel percentile of a
+    # real scan is well above this, but guard against degenerate all-dark inputs.
+    return tuple(max(v, _MIN_BASE_CHANNEL) for v in base)
+
+
+def _normalize_base_mode(base_mode: str) -> str:
+    mode = str(base_mode).lower()
+    if mode not in ("patch", "whole_frame", "auto"):
+        raise ValueError(
+            f"base_mode must be 'patch', 'whole_frame', or 'auto', got {base_mode!r}"
+        )
+    return mode
+
+
+def _validate_auto_positive_inputs(
+    triplet: np.ndarray,
+    descriptor: BaseRegionDescriptor,
+) -> None:
+    if triplet.ndim != 3 or triplet.shape[2] != 3:
+        raise ValueError(f"triplet must be HxWx3, got shape {triplet.shape}")
+    if triplet.dtype != np.uint16:
+        raise ValueError(f"triplet dtype must be uint16, got {triplet.dtype}")
+    if any(b < _MIN_BASE_CHANNEL for b in descriptor.base_rgb):
+        raise ValueError(
+            f"base_rgb {descriptor.base_rgb} has a channel below {_MIN_BASE_CHANNEL}; "
+            "recapture or reselect the film-base calibration patch"
+        )
+
+
+def _resolve_positive_base_rgb(
+    triplet: np.ndarray,
+    descriptor: BaseRegionDescriptor,
+    *,
+    mode: str,
+    whole_frame_base_percentile: float,
+    auto_base_cv_threshold: float,
+    analysis_crop_fraction: float,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
+) -> tuple[tuple[float, float, float], str]:
+    # "auto" falls back to the whole-frame proxy only when the rebate patch is
+    # non-uniform AND the base was not hand-picked. Manual boxes are trusted.
+    use_whole_frame = mode == "whole_frame" or (
+        mode == "auto"
+        and descriptor.source != "manual"
+        and float(descriptor.uniformity_cv) > float(auto_base_cv_threshold)
+    )
+    if use_whole_frame:
+        return (
+            _whole_frame_base_rgb(
+                triplet,
+                percentile=whole_frame_base_percentile,
+                analysis_crop_fraction=analysis_crop_fraction,
+            ),
+            "whole_frame",
+        )
+    return _frame_base_rgb(triplet, descriptor, dmin_percentile=dmin_percentile), "patch"
+
+
+def _density_from_composite(
+    triplet: np.ndarray,
+    frame_base_rgb: tuple[float, float, float],
+) -> np.ndarray:
+    work = triplet.astype(np.float32)
+    base = np.maximum(np.asarray(frame_base_rgb, dtype=np.float32), _MIN_BASE_CHANNEL)
+
+    # Normalize to clear film/base, then convert transmittance to density:
+    # high negative density becomes high positive brightness.
+    transmission = work / base.reshape(1, 1, 3)
+    np.clip(transmission, 1e-5, 1.0, out=transmission)
+    return -np.log(transmission, dtype=np.float32)
+
+
+def _coerce_density_bounds(
+    bounds: Any,
+    *,
+    label: str,
+    repair_degenerate: bool,
+) -> DensityBounds:
+    arr = np.asarray(bounds, dtype=np.float64)
+    if arr.shape != (3, 2):
+        raise ValueError(f"{label} must contain three per-channel (lo, hi) pairs")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite numeric bounds")
+
+    coerced: list[tuple[float, float]] = []
+    for ch in range(3):
+        lo = float(arr[ch, 0])
+        hi = float(arr[ch, 1])
+        if hi - lo <= 1e-6:
+            if not repair_degenerate:
+                raise ValueError(
+                    f"{label} channel {ch} must have hi > lo by more than 1e-6"
+                )
+            hi = lo + 1e-6
+        coerced.append((lo, hi))
+    return (coerced[0], coerced[1], coerced[2])
+
+
+def _density_bounds_from_density(
+    density: np.ndarray,
+    *,
+    display_black_percentile: float,
+    display_white_percentile: float,
+    analysis_crop_fraction: float,
+) -> DensityBounds:
+    sample = _analysis_sample(density, analysis_crop_fraction)
+    display_levels: list[tuple[float, float]] = []
+
+    for ch in range(3):
+        values = sample[..., ch].reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            raise ValueError("positive render analysis sample contains no finite pixels")
+
+        # F7: stride-8 subsample for percentile computation when the sample is
+        # large (> 4_000_000 elements). ~8.9 MP per channel → ~140k elements —
+        # statistically identical at p0.1/p99.2/p99.9 and ~64× faster. Fixed
+        # stride is deterministic (NFR-11). Small fixtures (tests) fall through
+        # unchanged so existing test assertions remain valid.
+        if values.size > 4_000_000:
+            values = values[::8]
+
+        lo = float(np.percentile(values, display_black_percentile))
+        hi = float(np.percentile(values, display_white_percentile))
+        display_levels.append((lo, hi))
+
+    return _coerce_density_bounds(
+        display_levels,
+        label="display density bounds",
+        repair_degenerate=True,
+    )
+
+
+def _prepare_density(
+    triplet: np.ndarray,
+    descriptor: BaseRegionDescriptor,
+    *,
+    base_mode: str,
+    whole_frame_base_percentile: float,
+    auto_base_cv_threshold: float,
+    analysis_crop_fraction: float,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
+) -> tuple[np.ndarray, tuple[float, float, float], str, str]:
+    """Shared density-pass helper for bounds and positive rendering (S1).
+
+    Validates inputs, resolves the base RGB, and computes the density array.
+    Returns ``(density, frame_base_rgb, base_source, normalized_mode)`` so
+    callers needing both bounds and the positive render can avoid computing the
+    density pass twice without losing the normalized mode string.
+    """
+    _validate_auto_positive_inputs(triplet, descriptor)
+    mode = _normalize_base_mode(base_mode)
+    frame_base_rgb, base_source = _resolve_positive_base_rgb(
+        triplet,
+        descriptor,
+        mode=mode,
+        whole_frame_base_percentile=whole_frame_base_percentile,
+        auto_base_cv_threshold=auto_base_cv_threshold,
+        analysis_crop_fraction=analysis_crop_fraction,
+        dmin_percentile=dmin_percentile,
+    )
+    density = _density_from_composite(triplet, frame_base_rgb)
+    return density, frame_base_rgb, base_source, mode
+
+
+def positive_density_bounds_from_composite(
+    triplet: np.ndarray,
+    descriptor: BaseRegionDescriptor,
+    *,
+    display_black_percentile: float = DEFAULT_POSITIVE_BLACK_PERCENTILE,
+    display_white_percentile: float = DEFAULT_POSITIVE_WHITE_PERCENTILE,
+    analysis_crop_fraction: float = DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION,
+    base_mode: str = "patch",
+    whole_frame_base_percentile: float = DEFAULT_WHOLE_FRAME_BASE_PERCENTILE,
+    auto_base_cv_threshold: float = DEFAULT_AUTO_BASE_CV_THRESHOLD,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
+) -> DensityBounds:
+    """Compute per-channel density display bounds for one composite frame."""
+    density, _frame_base_rgb, _base_source, _mode = _prepare_density(
+        triplet,
+        descriptor,
+        base_mode=base_mode,
+        whole_frame_base_percentile=whole_frame_base_percentile,
+        auto_base_cv_threshold=auto_base_cv_threshold,
+        analysis_crop_fraction=analysis_crop_fraction,
+        dmin_percentile=dmin_percentile,
+    )
+    return _density_bounds_from_density(
+        density,
+        display_black_percentile=display_black_percentile,
+        display_white_percentile=display_white_percentile,
+        analysis_crop_fraction=analysis_crop_fraction,
+    )
+
+
+def aggregate_positive_density_bounds(
+    composites: Iterable[np.ndarray],
+    descriptor: BaseRegionDescriptor,
+    *,
+    display_black_percentile: float = DEFAULT_POSITIVE_BLACK_PERCENTILE,
+    display_white_percentile: float = DEFAULT_POSITIVE_WHITE_PERCENTILE,
+    analysis_crop_fraction: float = DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION,
+    base_mode: str = "patch",
+    whole_frame_base_percentile: float = DEFAULT_WHOLE_FRAME_BASE_PERCENTILE,
+    auto_base_cv_threshold: float = DEFAULT_AUTO_BASE_CV_THRESHOLD,
+) -> DensityBounds:
+    """Aggregate roll-level density bounds as the median of frame bounds.
+
+    The caller chooses the representative frame iterable (all frames or a
+    deterministic subset). No sampling or randomness happens here.
+    """
+    frame_bounds = [
+        positive_density_bounds_from_composite(
+            composite,
+            descriptor,
+            display_black_percentile=display_black_percentile,
+            display_white_percentile=display_white_percentile,
+            analysis_crop_fraction=analysis_crop_fraction,
+            base_mode=base_mode,
+            whole_frame_base_percentile=whole_frame_base_percentile,
+            auto_base_cv_threshold=auto_base_cv_threshold,
+        )
+        for composite in composites
+    ]
+    if not frame_bounds:
+        raise ValueError("at least one composite is required to aggregate density bounds")
+
+    median_bounds = np.median(np.asarray(frame_bounds, dtype=np.float64), axis=0)
+    return _coerce_density_bounds(
+        median_bounds,
+        label="aggregate density bounds",
+        repair_degenerate=True,
+    )
 
 
 def auto_positive_from_composite(
@@ -300,59 +571,68 @@ def auto_positive_from_composite(
     display_white_percentile: float = DEFAULT_POSITIVE_WHITE_PERCENTILE,
     tone_gamma: float = DEFAULT_POSITIVE_TONE_GAMMA,
     analysis_crop_fraction: float = DEFAULT_POSITIVE_ANALYSIS_CROP_FRACTION,
+    base_mode: str = "patch",
+    whole_frame_base_percentile: float = DEFAULT_WHOLE_FRAME_BASE_PERCENTILE,
+    auto_base_cv_threshold: float = DEFAULT_AUTO_BASE_CV_THRESHOLD,
+    bounds_override: DensityBounds | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Render a linear negative composite into a usable 16-bit positive.
 
     This automates the operator workflow:
-      1. measure clear film/base from the saved region on this frame;
+      1. measure clear film/base (see ``base_mode``);
       2. normalize each channel to that base and convert to optical density;
-      3. stretch black/white points from robust scene percentiles;
+      3. stretch black/white points from robust scene percentiles, or from
+         locked ``bounds_override`` density bounds;
       4. apply a mild display curve so the preview is an editable workprint.
+
+    ``base_mode`` selects how the clear-film base is measured:
+      * ``"patch"`` (default): re-measure the saved rebate box on this frame.
+        Correct when a clean film rebate is in the descriptor box.
+      * ``"whole_frame"``: ignore the box; estimate the base from the whole
+        frame's per-channel high percentile (``whole_frame_base_percentile``).
+        For full-bleed scans with no clean rebate, where a patch would inject a
+        color cast — most visible in the shadows, which sit nearest the base.
+      * ``"auto"``: use the patch, but fall back to whole-frame when the
+        descriptor's ``uniformity_cv`` exceeds ``auto_base_cv_threshold``
+        (the patch is not clean film base).
 
     The archival composite remains unchanged; this function produces a
     separate rendered TIFF for inspection/editing.
     """
-    if triplet.ndim != 3 or triplet.shape[2] != 3:
-        raise ValueError(f"triplet must be HxWx3, got shape {triplet.shape}")
-    if triplet.dtype != np.uint16:
-        raise ValueError(f"triplet dtype must be uint16, got {triplet.dtype}")
-    if any(b < _MIN_BASE_CHANNEL for b in descriptor.base_rgb):
-        raise ValueError(
-            f"base_rgb {descriptor.base_rgb} has a channel below {_MIN_BASE_CHANNEL}; "
-            "recapture or reselect the film-base calibration patch"
-        )
     if tone_gamma <= 0:
         raise ValueError(f"tone_gamma must be > 0, got {tone_gamma}")
 
     profile_base_rgb = tuple(float(v) for v in descriptor.base_rgb)
-    frame_base_rgb = _frame_base_rgb(triplet, descriptor)
 
-    work = triplet.astype(np.float32)
-    base = np.maximum(np.asarray(frame_base_rgb, dtype=np.float32), _MIN_BASE_CHANNEL)
+    # S1: use _prepare_density to avoid duplicating validate/base/density logic.
+    density, frame_base_rgb, base_source, mode = _prepare_density(
+        triplet,
+        descriptor,
+        base_mode=base_mode,
+        whole_frame_base_percentile=whole_frame_base_percentile,
+        auto_base_cv_threshold=auto_base_cv_threshold,
+        analysis_crop_fraction=analysis_crop_fraction,
+        dmin_percentile=dmin_percentile,
+    )
 
-    # Normalize to clear film/base, then convert transmittance to density:
-    # high negative density becomes high positive brightness. This is the
-    # physical model the linear subtract/invert path was missing.
-    transmission = work / base.reshape(1, 1, 3)
-    np.clip(transmission, 1e-5, 1.0, out=transmission)
-    density = -np.log(transmission, dtype=np.float32)
+    if bounds_override is None:
+        display_levels = _density_bounds_from_density(
+            density,
+            display_black_percentile=display_black_percentile,
+            display_white_percentile=display_white_percentile,
+            analysis_crop_fraction=analysis_crop_fraction,
+        )
+    else:
+        display_levels = _coerce_density_bounds(
+            bounds_override,
+            label="bounds_override",
+            repair_degenerate=False,
+        )
 
-    sample = _analysis_sample(density, analysis_crop_fraction)
     positive = np.empty_like(density, dtype=np.float32)
-    display_levels: list[tuple[float, float]] = []
 
-    for ch in range(3):
-        values = sample[..., ch].reshape(-1)
-        values = values[np.isfinite(values)]
-        if values.size == 0:
-            raise ValueError("positive render analysis sample contains no finite pixels")
-
-        lo = float(np.percentile(values, display_black_percentile))
-        hi = float(np.percentile(values, display_white_percentile))
-        if hi - lo <= 1e-6:
-            hi = lo + 1e-6
+    for ch, (lo, hi) in enumerate(display_levels):
         positive[..., ch] = (density[..., ch] - lo) / (hi - lo)
-        display_levels.append((lo, hi))
 
     np.clip(positive, 0.0, 1.0, out=positive)
     positive = np.power(positive, tone_gamma, dtype=np.float32)
@@ -361,6 +641,9 @@ def auto_positive_from_composite(
     meta: dict[str, Any] = {
         "frame_base_rgb": tuple(float(v) for v in frame_base_rgb),
         "profile_base_rgb": profile_base_rgb,
+        "base_mode": mode,
+        "base_source": base_source,
+        "base_uniformity_cv": float(descriptor.uniformity_cv),
         "dmin_percentile": dmin_percentile,
         "display_levels": tuple(display_levels),
         "display_black_percentile": display_black_percentile,
@@ -371,6 +654,10 @@ def auto_positive_from_composite(
             float(np.mean(triplet[..., ch] >= 65535)) for ch in range(3)
         ),
     }
+    if bounds_override is not None:
+        meta["bounds_override_used"] = True
+        meta["locked_bounds_used"] = True
+        meta["display_bounds_source"] = "locked"
     return np.rint(positive * 65535.0).astype(np.uint16), meta
 
 
@@ -455,28 +742,40 @@ def composite_triplet(
     if ffc_calibration_dir is not None:
         ffc_maps = load_ffc_maps(Path(ffc_calibration_dir))
 
+    # Demosaic one RAW at a time, extract the matching channel, then free the
+    # full HxWx3 demosaic (F6 — reduces peak from ~1.45 GB to ~0.9 GB/worker).
+    # Shape is checked incrementally so we still raise DimensionMismatchError.
     r_img = demosaic_linear(r_path)
-    g_img = demosaic_linear(g_path)
-    b_img = demosaic_linear(b_path)
+    r_shape = r_img.shape
+    r_ch = _select_channel(r_img, 0).copy()   # copy so we can del the full array
+    del r_img
 
-    if not (r_img.shape == g_img.shape == b_img.shape):
+    g_img = demosaic_linear(g_path)
+    if g_img.shape != r_shape:
         raise DimensionMismatchError(
-            f"shape mismatch: R={r_img.shape} G={g_img.shape} B={b_img.shape} — "
+            f"shape mismatch: R={r_shape} G={g_img.shape} B=? — "
             "this typically means the film moved between captures; reshoot the frame"
         )
+    g_ch = _select_channel(g_img, 1).copy()
+    del g_img
 
-    if ffc_maps is not None and ffc_maps.shape != r_img.shape[:2]:
+    b_img = demosaic_linear(b_path)
+    if b_img.shape != r_shape:
+        raise DimensionMismatchError(
+            f"shape mismatch: R={r_shape} G=<ok> B={b_img.shape} — "
+            "this typically means the film moved between captures; reshoot the frame"
+        )
+    b_ch = _select_channel(b_img, 2).copy()
+    del b_img
+
+    if ffc_maps is not None and ffc_maps.shape != r_shape[:2]:
         raise CalibrationError(
             f"FFC shape {ffc_maps.shape} doesn't match frame shape "
-            f"{r_img.shape[:2]} — recapture calibration at the same crop/zoom"
+            f"{r_shape[:2]} — recapture calibration at the same crop/zoom"
         )
 
-    # Per PROJECT.md: take channel 0 from R-lit, channel 1 from G-lit,
-    # channel 2 from B-lit. The other two channels of each demosaic are
-    # cross-talk noise from the narrowband illumination and are discarded.
-    r_ch = _select_channel(r_img, 0)
-    g_ch = _select_channel(g_img, 1)
-    b_ch = _select_channel(b_img, 2)
+    # Per PROJECT.md: channel 0 from R-lit, channel 1 from G-lit,
+    # channel 2 from B-lit. Cross-talk channels are already discarded above.
 
     # FFC, if calibration was provided.
     r_ch, g_ch, b_ch = _maybe_apply_ffc(r_ch, g_ch, b_ch, ffc_maps)
@@ -570,6 +869,41 @@ def composite_triplet(
 _MIN_BASE_CHANNEL: float = 100.0
 
 
+def hd_sigmoid_tone(x: np.ndarray, *, contrast: float, pivot: float = 0.5) -> np.ndarray:
+    """Filmic H&D tone curve: endpoint-normalized logistic sigmoid.
+
+    ``x`` is expected to be float32 data in [0, 1].  Computation is performed
+    in float64 to avoid small-contrast cancellation, then cast back to float32.
+    The curve is monotonic, pins f(0)=0 and f(1)=1, and approaches identity as
+    contrast approaches zero.
+    """
+    x32 = np.asarray(x, dtype=np.float32)
+    k = float(contrast)
+    if k <= 1e-4:
+        return x32
+
+    x0 = min(max(float(pivot), 0.0), 1.0)
+    work = x32.astype(np.float64, copy=False)
+
+    def stable_sigmoid(z: np.ndarray | float) -> np.ndarray:
+        z64 = np.asarray(z, dtype=np.float64)
+        out = np.empty_like(z64, dtype=np.float64)
+        positive = z64 >= 0.0
+        out[positive] = 1.0 / (1.0 + np.exp(-z64[positive]))
+        exp_z = np.exp(z64[~positive])
+        out[~positive] = exp_z / (1.0 + exp_z)
+        return out
+
+    raw = stable_sigmoid(k * (work - x0))
+    raw0 = float(stable_sigmoid(k * (0.0 - x0)))
+    raw1 = float(stable_sigmoid(k * (1.0 - x0)))
+    denom = max(raw1 - raw0, np.finfo(np.float64).eps)
+
+    out = (raw - raw0) / denom
+    np.clip(out, 0.0, 1.0, out=out)
+    return out.astype(np.float32, copy=False)
+
+
 def _apply_tone_curve(
     data: np.ndarray,
     tone_curve_id: str,
@@ -577,28 +911,33 @@ def _apply_tone_curve(
 ) -> np.ndarray:
     """Apply a tone curve to HxWx3 float32 data in the range [0, 1].
 
-    Phase 11 implements ONLY the ``"linear"`` (identity) tone curve.  The
-    dispatch structure is present so a future phase can add an ``elif`` branch
-    without touching Phase 11 logic.  gamma is NOT applied here — see
+    Supports the archival ``"linear"`` identity curve and the opt-in
+    ``"filmic"`` H&D sigmoid.  gamma is NOT applied here — see
     ``invert_composite``.
 
     Args:
         data: HxWx3 float32 array, values in [0, 1] after Step 3 clip.
-        tone_curve_id: Identifier string.  Only ``"linear"`` is supported.
-        tone_curve_params: Tuple of float params (empty for ``"linear"``).
+        tone_curve_id: Identifier string.  Supports ``"linear"`` and
+            ``"filmic"``.
+        tone_curve_params: Tuple of float params.  ``"filmic"`` interprets
+            this as ``(contrast, pivot)``.
 
     Returns:
         The (possibly transformed) array.  For ``"linear"``, returns ``data``
         unchanged (identity — SC-1 monotonic tone satisfied).
 
     Raises:
-        NotImplementedError: for any ``tone_curve_id`` other than ``"linear"``.
+        NotImplementedError: for unknown ``tone_curve_id`` values.
     """
     if tone_curve_id == "linear":
         return data  # identity — monotonic, SC-1 satisfied
+    if tone_curve_id == "filmic":
+        contrast = float(tone_curve_params[0]) if len(tone_curve_params) >= 1 else 5.0
+        pivot = float(tone_curve_params[1]) if len(tone_curve_params) >= 2 else 0.5
+        return hd_sigmoid_tone(data, contrast=contrast, pivot=pivot)
     raise NotImplementedError(
         f"tone_curve_id {tone_curve_id!r} is not implemented; "
-        'only "linear" is supported in Phase 11'
+        'supported ids are "linear" and "filmic"'
     )
 
 
@@ -626,9 +965,10 @@ def invert_composite(
       Step 3 — Invert: ``(white[ch] - x) / (white[ch] - black[ch])`` then
                ``clip(0, 1)``.  The denominator is never zero — InversionParams
                CR-02 guarantees ``white > black`` per channel.
-      Step 4 — Tone curve: dispatched through ``_apply_tone_curve``.  Phase 11
-               implements ONLY ``"linear"`` (identity).  Non-``"linear"``
-               tone_curve_id raises ``NotImplementedError`` (fail-closed).
+      Step 4 — Tone curve: dispatched through ``_apply_tone_curve``.  The
+               archival default is ``"linear"`` (identity); ``"filmic"`` is an
+               opt-in H&D sigmoid.  Unknown tone_curve_id values raise
+               ``NotImplementedError`` (fail-closed).
       Step 5 — Encode: ``*= 65535``, ``clip(0, 65535)``,
                ``astype(np.uint16)``.
 
@@ -663,7 +1003,7 @@ def invert_composite(
     Raises:
         ValueError: if ``triplet`` is not HxWx3, or any ``base_rgb`` channel
             is below ``_MIN_BASE_CHANNEL`` (possible calibration failure).
-        NotImplementedError: if ``params.tone_curve_id`` is not ``"linear"``.
+        NotImplementedError: if ``params.tone_curve_id`` is unknown.
     """
     # Step 0: validate inputs (fail-closed — T-11-01, T-11-02)
     if triplet.ndim != 3 or triplet.shape[2] != 3:
@@ -684,12 +1024,11 @@ def invert_composite(
         )
     # Hoist tone_curve_id check before any array allocation (IN-02): an
     # unsupported curve would otherwise waste a full-image neutralize+invert
-    # before raising.  When a future phase adds a new curve, remove this
-    # early check alongside the matching elif in _apply_tone_curve.
-    if params.tone_curve_id != "linear":
+    # before raising.
+    if params.tone_curve_id not in ("linear", "filmic"):
         raise NotImplementedError(
             f"tone_curve_id {params.tone_curve_id!r} is not implemented; "
-            'only "linear" is supported in Phase 11'
+            'supported ids are "linear" and "filmic"'
         )
 
     # Step 1: float32 workspace — dtype change uint16→float32 guarantees a
@@ -714,7 +1053,7 @@ def invert_composite(
     # (Pitfall 5 — future gamma curves require valid domain).
     np.clip(work, 0.0, 1.0, out=work)
 
-    # Step 4: tone curve dispatch (Phase 11: identity only).
+    # Step 4: tone curve dispatch.
     # gamma is NOT applied here — deferred per Phase 11 scope.
     work = _apply_tone_curve(work, params.tone_curve_id, params.tone_curve_params)
 

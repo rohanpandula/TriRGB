@@ -178,6 +178,7 @@ Added with the Develop (positive inversion), Sony live-view, and film-stock-prof
 | lbl-invert-output-path | Invert output path | label |
 | lbl-invert-status | Invert status | label |
 | lbl-next-frame | Next frame | label |
+| lbl-scan-channel-prompt | Scan channel prompt | label |
 | lbl-scan-sony-live-view-status | Scan sony live view status | label |
 | lbl-scan-stock-profile-status | Scan stock profile status | label |
 | lbl-stock-manager-status | Stock manager status | label |
