@@ -116,6 +116,7 @@ def settings(tmp_path):
         level_g=128,
         level_b=128,
         settle_ms=0,
+        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
     )
 
 
@@ -499,22 +500,49 @@ def test_calibrate_checks_route(app_and_orch):
 
 
 def test_calibrate_route_locked_returns_409(app_and_orch):
-    """When orch._lock is already held, the exposure route returns 409."""
+    """When the activity guard is held (capture or calibration in progress),
+    the exposure route returns 409. Bug-2: the guard must cover the whole
+    calibration duration, not just a TOCTOU check-then-unlock window."""
     app, orch = app_and_orch
     client = app.test_client()
 
-    # Acquire the lock to simulate a capture in progress
+    # Simulate a capture in progress by claiming the activity slot.
     app.config["CURRENT_CAL_CALL_ID"] = "active-run"
-    acquired = orch._lock.acquire(blocking=False)
-    assert acquired, "could not acquire lock for test setup"
+    claimed = orch.try_begin_activity("capture")
+    assert claimed, "could not claim activity slot for test setup"
     try:
         r = client.post("/api/calibrate/exposure", json={})
         assert r.status_code == 409, (
-            f"expected 409 when lock is held, got {r.status_code}: {r.data}"
+            f"expected 409 when activity guard is held, got {r.status_code}: {r.data}"
         )
         assert r.get_json()["call_id"] == "active-run"
     finally:
-        orch._lock.release()
+        orch.end_activity()
+
+
+def test_preview_light_rejected_while_activity_held(app_and_orch):
+    """HIGH#2 (Codex): preview-light must not re-colour the Scanlight while a
+    capture or calibration owns the rig — those activities release _lock
+    between internal captures, so the activity guard is what protects the gap."""
+    app, orch = app_and_orch
+    client = app.test_client()
+
+    claimed = orch.try_begin_activity("calibrate_exposure")
+    assert claimed, "could not claim activity slot for test setup"
+    calls_before = len(orch._scanlight.calls)
+    try:
+        r = client.post("/api/calibrate/preview-light", json={"enabled": True, "level": 200})
+        assert r.status_code == 409, (
+            f"expected 409 while activity held, got {r.status_code}: {r.data}"
+        )
+        # The rejected request must not have touched the Scanlight at all.
+        assert len(orch._scanlight.calls) == calls_before
+    finally:
+        orch.end_activity()
+
+    # Once the activity is released, preview-light works again.
+    r2 = client.post("/api/calibrate/preview-light", json={"enabled": True, "level": 200})
+    assert r2.status_code == 200, f"expected 200 after release, got {r2.status_code}: {r2.data}"
 
 
 def test_calibrate_route_failclosed_500(settings, tmp_path):

@@ -113,6 +113,7 @@ def settings(tmp_path):
         level_g=180,
         level_b=160,
         settle_ms=0,  # no sleep in tests
+        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
     )
 
 
@@ -139,7 +140,7 @@ def test_settings_rejects_extended_low_iso(tmp_path):
         CaptureSettings(output_folder=tmp_path, sony_iso="50")
 
 def test_settings_maps_legacy_lowest_iso_to_scan_base(tmp_path):
-    settings = CaptureSettings(output_folder=tmp_path, sony_iso="lowest")
+    settings = CaptureSettings(output_folder=tmp_path, sony_iso="lowest", trigger_mode="sdk")
 
     assert settings.sony_iso == "100or125"
 
@@ -268,6 +269,8 @@ def test_sdk_runner_error_redacts_saved_auth(tmp_path, caplog):
         sony_capture_path=str(fake_capture),
         sony_user="USERSECRET",
         sony_password="PASSSECRET",
+        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        sdk_persistent=False,  # use one-shot runner so the shell script is invoked directly
     )
     orch = Orchestrator(FakeScanlight(), settings, sleep=_zero_sleep)
 
@@ -739,11 +742,78 @@ def test_manual_mode_selected_by_trigger_mode_setting(tmp_path):
     assert orch._runner.__func__ is Orchestrator._manual_runner
 
 
-def test_sdk_mode_remains_default(tmp_path):
-    s = CaptureSettings(output_folder=tmp_path)  # default trigger_mode="sdk"
+def test_sdk_mode_selectable(tmp_path):
+    # trigger_mode dataclass default was changed to "manual" to match the CLI
+    # default; now "sdk" must be passed explicitly.
+    # With sdk_persistent=True (new default) the persistent runner is selected;
+    # with sdk_persistent=False the one-shot _default_runner is selected.
+    s_persist = CaptureSettings(output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True)
     light = FakeScanlight()
+    orch_persist = Orchestrator(light, s_persist)
+    assert orch_persist._runner.__func__ is Orchestrator._persistent_runner
+
+    s_oneshot = CaptureSettings(output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=False)
+    orch_oneshot = Orchestrator(light, s_oneshot)
+    assert orch_oneshot._runner.__func__ is Orchestrator._default_runner
+
+
+def test_uniform_channel_shutter_classification(tmp_path):
+    light = FakeScanlight()
+    # All None → uniform, shared value None.
+    o = Orchestrator(light, CaptureSettings(output_folder=tmp_path, trigger_mode="sdk"))
+    assert o._uniform_channel_shutter() == (True, None)
+    # All equal non-None → uniform, shared value present.
+    o.update_settings(shutter_r="1/100", shutter_g="1/100", shutter_b="1/100")
+    assert o._uniform_channel_shutter() == (True, "1/100")
+    # Differ → not uniform.
+    o.update_settings(shutter_b="1/200")
+    assert o._uniform_channel_shutter()[0] is False
+
+
+def test_sdk_persistent_falls_back_to_oneshot_when_shutters_differ(tmp_path):
+    # HIGH#1 (Codex): the persistent session can only set one shutter at
+    # startup, so per-channel differing shutters MUST route to the one-shot
+    # runner (which applies each channel's --shutter-speed), even with
+    # sdk_persistent=True.
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/100", shutter_g="1/100", shutter_b="1/200",
+    )
     orch = Orchestrator(light, s)
     assert orch._runner.__func__ is Orchestrator._default_runner
+    # Make them uniform → persistent runner is now eligible.
+    orch.update_settings(shutter_b="1/100")
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
+
+
+def test_persistent_session_passes_uniform_startup_shutter(tmp_path, monkeypatch):
+    # The uniform shutter must reach the --persist process as a startup arg.
+    import triplet_capture.orchestrator as orch_mod
+
+    captured = {}
+
+    class _RecordingPersist:
+        def __init__(self, binary, extras, env, **kwargs):
+            captured["extras"] = list(extras)
+
+        def capture(self, out_path, *, timeout_s):  # pragma: no cover - unused
+            return 0
+
+        def close(self):  # pragma: no cover - unused
+            pass
+
+    monkeypatch.setattr(orch_mod, "PersistentSonyCapture", _RecordingPersist)
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/160", shutter_g="1/160", shutter_b="1/160",
+    )
+    orch = Orchestrator(light, s)
+    orch._get_or_create_persistent_session()
+    assert "--shutter-speed" in captured["extras"]
+    idx = captured["extras"].index("--shutter-speed")
+    assert captured["extras"][idx + 1] == "1/160"
 
 
 def test_sdk_runner_passes_sony_network_auth_args(tmp_path, monkeypatch):
@@ -762,6 +832,7 @@ def test_sdk_runner_passes_sony_network_auth_args(tmp_path, monkeypatch):
         sony_mac_address="10:32:2C:26:1A:3F",
         sony_user="sdk-user",
         sony_password="sdk-password",
+        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
     )
     orch = Orchestrator(FakeScanlight(), s)
 
@@ -804,6 +875,7 @@ def test_sdk_runner_passes_channel_shutter_speed(tmp_path, monkeypatch):
         shutter_r="1/8",
         shutter_g="1/4",
         shutter_b="1/2",
+        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
     )
     orch = Orchestrator(FakeScanlight(), s)
 
@@ -832,6 +904,8 @@ def test_sdk_runner_failure_stderr_is_returned_in_triplet_error(tmp_path, monkey
         output_folder=tmp_path,
         sony_capture_path="/bin/sony-capture",
         settle_ms=0,
+        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        sdk_persistent=False,  # use one-shot runner to test stderr surfacing via _default_runner
     )
     orch = Orchestrator(FakeScanlight(), s, sleep=_zero_sleep)
 
@@ -855,7 +929,7 @@ def test_sdk_runner_turns_scanlight_off_after_exposure_marker(tmp_path, monkeypa
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     light = FakeScanlight()
-    s = CaptureSettings(output_folder=tmp_path, sony_capture_path="/bin/sony-capture")
+    s = CaptureSettings(output_folder=tmp_path, sony_capture_path="/bin/sony-capture", trigger_mode="sdk")
     orch = Orchestrator(light, s)
 
     exit_code = orch._default_runner("R", tmp_path / "out.ARW", 30)
@@ -932,10 +1006,13 @@ def test_hw_mode_quarantines_late_files_after_timeout(tmp_path):
 def test_update_settings_repicks_runner_on_trigger_mode_change(tmp_path):
     """Per codex review: switching trigger_mode at runtime must repoint
     the orchestrator at the right internal runner."""
-    sdk_settings = CaptureSettings(output_folder=tmp_path)  # default sdk
+    # sdk_persistent=True → persistent_runner; sdk_persistent=False → default_runner.
+    sdk_settings = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True
+    )
     light = FakeScanlightWithPulse()
     orch = Orchestrator(light, sdk_settings)
-    assert orch._runner.__func__ is Orchestrator._default_runner
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
 
     # Switch to hw mode at runtime
     hw_inbox = tmp_path / "inbox"
@@ -949,8 +1026,12 @@ def test_update_settings_repicks_runner_on_trigger_mode_change(tmp_path):
     orch.update_settings(trigger_mode="manual", ied_inbox=manual_inbox)
     assert orch._runner.__func__ is Orchestrator._manual_runner
 
-    # Switch back to sdk
+    # Switch back to sdk (persistent)
     orch.update_settings(trigger_mode="sdk")
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
+
+    # Switch to sdk one-shot
+    orch.update_settings(sdk_persistent=False)
     assert orch._runner.__func__ is Orchestrator._default_runner
 
 
@@ -958,7 +1039,7 @@ def test_update_settings_does_not_override_explicit_runner(tmp_path):
     """When the caller injected an explicit runner (tests, custom
     deployments), update_settings must NOT clobber it on trigger_mode
     change. The injection is the operator's deliberate override."""
-    sdk_settings = CaptureSettings(output_folder=tmp_path)
+    sdk_settings = CaptureSettings(output_folder=tmp_path, trigger_mode="sdk")
     explicit = lambda *a, **kw: 0
     light = FakeScanlight()
     orch = Orchestrator(light, sdk_settings, sony_capture_runner=explicit)
@@ -975,7 +1056,7 @@ def test_capture_triplet_turns_scanlight_off_even_on_unexpected_exception(tmp_pa
     just in the success and TripletAbort branches. An uncaught OSError
     from the runner (e.g., disk full mid-move) must not leave the LEDs
     powered."""
-    s = CaptureSettings(output_folder=tmp_path, settle_ms=0)
+    s = CaptureSettings(output_folder=tmp_path, settle_ms=0, trigger_mode="sdk")
     light = FakeScanlight()
 
     # Runner that raises something unexpected (not TripletAbort).
@@ -1021,6 +1102,7 @@ def test_ephemeral_port_binds_and_writes_port_file(tmp_path):
         frame_number=1,
         output_folder=tmp_path,
         settle_ms=0,
+        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
     )
     orch = Orchestrator(light, settings, sony_capture_runner=lambda *a: 0, sleep=_zero_sleep)
     app = create_app(orch)
@@ -1107,6 +1189,7 @@ def test_signal_driven_shutdown_does_not_deadlock(tmp_path):
         frame_number=1,
         output_folder=tmp_path,
         settle_ms=0,
+        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
     )
     orch = Orchestrator(light, settings, sony_capture_runner=lambda *a: 0, sleep=_zero_sleep)
     app = create_app(orch)
