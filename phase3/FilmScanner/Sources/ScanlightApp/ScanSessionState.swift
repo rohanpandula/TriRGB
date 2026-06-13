@@ -193,6 +193,11 @@ final class ScanCoordinator: ObservableObject {
     /// the captureFrame HTTP call is blocked waiting for the operator (F1).
     private var channelPromptTask: Task<Void, Never>?
 
+    /// Monotonic token identifying the current captureFrame call. A crash / stop
+    /// bumps it so a stale in-flight capture (Swift tasks are reentrant across
+    /// `await`) can't apply its result or tear-down to a superseded context.
+    private var captureGeneration: Int = 0
+
     /// The settings the running backend was last started with (port-normalized).
     /// Used by the calibration→scan fast path to decide whether the backend can
     /// be reused as-is or must be restarted to pick up changed scan settings /
@@ -363,10 +368,11 @@ final class ScanCoordinator: ObservableObject {
         transitionInFlight = true
         defer { transitionInFlight = false }
 
-        // Step 1: Cancel the composite and channel-prompt polling loops.
+        // Step 1: Cancel the composite poll and invalidate any in-flight capture
+        // (bumps the generation so a stale capture resuming after client.stop()
+        // can't clobber the now-idle state).
         stopCompositePolling()
-        stopChannelPromptPolling()
-        waitingForChannel = nil
+        invalidateInFlightCapture()
 
         // Step 2: Stop the orchestrator (releases the serial port on the Python side).
         await client.stop()
@@ -507,19 +513,30 @@ final class ScanCoordinator: ObservableObject {
     /// blocking wait for the operator to fire the IED (F1).
     func captureFrame(retake: Bool) async {
         guard phase == .scanning, !captureInFlight else { return }
+        captureGeneration &+= 1
+        let myGen = captureGeneration
         captureInFlight = true
         waitingForChannel = nil
 
         // Start concurrent channel-prompt polling while the HTTP call blocks.
         startChannelPromptPolling()
         defer {
-            captureInFlight = false
-            stopChannelPromptPolling()
-            waitingForChannel = nil
+            // Only tear down shared capture state if THIS capture is still
+            // current. A crash / stop bumps captureGeneration and tears the
+            // state down itself; without this guard a stale capture's defer
+            // (resuming after `await`) would clobber a new scan. (codex#10)
+            if captureGeneration == myGen {
+                captureInFlight = false
+                stopChannelPromptPolling()
+                waitingForChannel = nil
+            }
         }
 
         do {
             let outcome = try await client.captureFrame(retake: retake)
+            // Superseded by a crash/stop/new scan while suspended → don't apply
+            // this (stale) result to the current context.
+            guard captureGeneration == myGen else { return }
             let frameNum = outcome.frameNumber
             nextFrameNumber = outcome.nextFrame
             if outcome.success {
@@ -532,6 +549,7 @@ final class ScanCoordinator: ObservableObject {
                 lastError = outcome.error ?? "Capture failed"
             }
         } catch {
+            guard captureGeneration == myGen else { return }
             lastError = "Capture error: \(error.localizedDescription)"
         }
     }
@@ -545,6 +563,10 @@ final class ScanCoordinator: ObservableObject {
         let crashedPhase = phase
         // The orchestrator has already exited — no need to call client.stop().
         stopCompositePolling()
+        // Invalidate any in-flight capture: bump the generation so its delayed
+        // resume no-ops, and tear down its UI state now (otherwise captureInFlight
+        // stays true and the stale prompt/poll could bleed into a new scan).
+        invalidateInFlightCapture()
         phase = .idle
         backendSettings = nil
         lightPanel.portOwner = .idle
@@ -609,6 +631,16 @@ final class ScanCoordinator: ObservableObject {
     private func stopChannelPromptPolling() {
         channelPromptTask?.cancel()
         channelPromptTask = nil
+    }
+
+    /// Invalidate any in-flight captureFrame and tear down its UI state. Bumping
+    /// captureGeneration makes the stale capture's delayed resume (Swift tasks
+    /// resume across `await`) no-op, so it can't clobber a superseded context.
+    private func invalidateInFlightCapture() {
+        captureGeneration &+= 1
+        captureInFlight = false
+        stopChannelPromptPolling()
+        waitingForChannel = nil
     }
 
     /// Poll GET /api/state and update `waitingForChannel`.

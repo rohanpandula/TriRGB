@@ -374,6 +374,46 @@ final class ScanCoordinatorTests: XCTestCase {
     ///   a) transition out of .scanning (don't leave it stuck forever).
     ///   b) set portOwner = .idle (don't leave the light panel permanently locked).
     ///   c) surface an error.
+    /// codex#10: a backend crash mid-capture must invalidate the in-flight
+    /// captureFrame — clear captureInFlight now, and ensure the stale capture's
+    /// delayed resume (Swift tasks resume across `await`) can't clobber the
+    /// now-idle state.
+    func testCrashDuringCaptureInvalidatesInFlightCapture() async throws {
+        let (coordinator, client, _) = makeCoordinator()
+        await coordinator.startScan(settings: makeScanSettings())
+
+        // Hold the capture open so it's in flight when the crash lands.
+        let gate = AsyncGate()
+        client.beforeCaptureReturns = { await gate.wait() }
+        let captureTask = Task { await coordinator.captureFrame(retake: false) }
+
+        var spins = 0
+        while await coordinator.captureInFlight == false {
+            await Task.yield()
+            spins += 1
+            XCTAssertLessThan(spins, 10_000, "captureInFlight never became true")
+            if spins >= 10_000 { break }
+        }
+
+        client.simulateCrash()
+        let deadline = Date(timeIntervalSinceNow: 2.0)
+        while await coordinator.phase == .scanning && Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let phaseAfterCrash = await coordinator.phase
+        XCTAssertEqual(phaseAfterCrash, .idle)
+        let inFlightAfterCrash = await coordinator.captureInFlight
+        XCTAssertFalse(inFlightAfterCrash, "crash must clear captureInFlight, not leave it stuck true")
+
+        // Release the now-stale capture; its resume must not re-touch state.
+        await gate.signal()
+        await captureTask.value
+        let inFlightAfterStale = await coordinator.captureInFlight
+        XCTAssertFalse(inFlightAfterStale, "stale capture's defer must not re-set captureInFlight")
+        let phaseAfterStale = await coordinator.phase
+        XCTAssertEqual(phaseAfterStale, .idle, "stale capture must not move the coordinator out of idle")
+    }
+
     func testPortOwnershipT4_MidScanCrashTransitionsToIdle() async throws {
         let (coordinator, client, lightPanel) = makeCoordinator()
 

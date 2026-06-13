@@ -670,7 +670,7 @@ struct PositiveInversionView: View {
             VStack(alignment: .leading, spacing: Theme.Space.section) {
                 GroupBox(label: Text("Triplet Input")) {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
-                        Banner(kind: .info, text: "Choose the three files from one RGB-lit frame. _R/_G/_B filename suffixes are preferred; generic camera names are auto-detected from RAW channel dominance when confidence is high. The matching channels are isolated and a positive TIFF is written.")
+                        Banner(kind: .info, text: "Choose the three files from one RGB-lit frame. Each file's channel (R/G/B) is auto-detected from its RAW channel dominance — filenames are not used — and a low-confidence or ambiguous set is flagged rather than guessed. The matching channels are isolated and a positive TIFF is written.")
 
                         HStack(spacing: Theme.Space.md) {
                             Button("Choose Files...") {
