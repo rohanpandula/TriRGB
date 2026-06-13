@@ -98,11 +98,14 @@ sony-capture --live-view-stream-out PATH [--ip-address IP [--mac-address MAC]]
 
 | stdin | stdout |
 |---|---|
+| `shutter <speed>` | `SHUTTER_OK <speed>` on success |
+| | `SHUTTER_FAIL <speed>` on failure (session stays alive) |
 | `capture <absolute-out-path>` | `CAPTURE_OK <absolute-out-path>` on success |
 | | `CAPTURE_FAIL <short-reason>` on failure (session stays alive) |
 | `quit` or EOF | clean teardown (Disconnect → ReleaseDevice → Release), exit 0 |
 | unknown | `ERR unknown-command` |
 
+- `shutter` re-applies the camera shutter mid-session (`SetDeviceProperty(ShutterSpeed)` on the live handle). Narrowband RGB scanning uses a **different shutter per channel** (blue needs far more exposure than red/green), so the orchestrator sends `shutter <speed>` before each channel's `capture` — and only when the value changed from the last one applied. A `SHUTTER_FAIL` makes the orchestrator abort that frame rather than expose at the wrong shutter.
 - The path after `capture ` is treated as everything after the first space, so paths containing spaces are supported.
 - `CAPTURE_FAIL` does **not** terminate the session — the orchestrator can retry or send `quit`.
 - The `SONY_CAPTURE_EXPOSURE_COMPLETE` stderr marker is still emitted per capture right after the shutter fires (the Python orchestrator uses it to turn the LED off early).
@@ -115,8 +118,14 @@ sony-capture --persist --ip-address 10.0.0.247 --user USER --password PW &
 PID=$!
 # Wait for READY
 read -r line  # "READY"
+echo "shutter 1/100"
+read -r s     # "SHUTTER_OK 1/100"
 echo "capture /Volumes/SSD/Roll001/Frame001_R.ARW"
 read -r result  # "CAPTURE_OK /Volumes/SSD/Roll001/Frame001_R.ARW"
+echo "shutter 1/4"   # blue channel: longer exposure
+read -r s     # "SHUTTER_OK 1/4"
+echo "capture /Volumes/SSD/Roll001/Frame001_B.ARW"
+read -r result  # "CAPTURE_OK ..."
 echo "quit"
 wait $PID
 ```

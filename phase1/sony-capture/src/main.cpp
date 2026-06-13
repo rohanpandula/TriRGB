@@ -1395,7 +1395,11 @@ bool set_iso_sensitivity(SDK::CrDeviceHandle handle, const std::string& requeste
     return true;
 }
 
-bool set_shutter_speed(SDK::CrDeviceHandle handle, const std::string& requested) {
+// `announce` controls the `shutter_speed=<value>` stdout status line: true for
+// the CLI setter (its contract), false for the --persist `shutter` command,
+// which must keep stdout to the documented SHUTTER_OK/FAIL protocol only.
+bool set_shutter_speed(SDK::CrDeviceHandle handle, const std::string& requested,
+                       bool announce = true) {
     struct Candidate {
         CrInt32u code;
         SDK::CrDataType value_type;
@@ -1434,7 +1438,7 @@ bool set_shutter_speed(SDK::CrDeviceHandle handle, const std::string& requested)
             continue;
         }
 
-        std::cout << "shutter_speed=" << requested << "\n";
+        if (announce) std::cout << "shutter_speed=" << requested << "\n";
         return true;
     }
 
@@ -2188,11 +2192,19 @@ int main(int argc, char** argv) {
     // Protocol (all lines newline-terminated, stdout flushed after each):
     //   stdin command             stdout response
     //   ─────────────────────     ──────────────────────────────────────
+    //   shutter <speed>         → SHUTTER_OK <speed>
+    //                           → SHUTTER_FAIL <speed>
     //   capture <abs-out-path>  → CAPTURE_OK <abs-out-path>
     //                           → CAPTURE_FAIL <short-reason>
     //   quit                    → (clean teardown, exit 0)
     //   EOF                     → (clean teardown, exit 0)
     //   <unknown>               → ERR unknown-command
+    //
+    // `shutter` re-applies the camera shutter mid-session. Narrowband RGB
+    // scanning uses a DIFFERENT shutter per channel (blue needs far more
+    // exposure than red/green), so the orchestrator sends `shutter <speed>`
+    // before each channel's `capture`. SetDeviceProperty(ShutterSpeed) works
+    // on the live handle exactly as it does at startup.
     //
     // Capture failures do NOT exit the loop — the session stays alive and the
     // Python orchestrator can retry or send quit.
@@ -2213,6 +2225,22 @@ int main(int argc, char** argv) {
 
             if (line == "quit") {
                 break;
+            }
+
+            if (line.rfind("shutter ", 0) == 0) {
+                // Re-apply the shutter for the next capture(s). Everything after
+                // the first space is the speed token (e.g. "1/100", "1/4", "1\"").
+                const std::string speed = line.substr(8);
+                if (speed.empty()) {
+                    std::cout << "SHUTTER_FAIL missing-value" << std::endl;
+                    continue;
+                }
+                if (set_shutter_speed(handle, speed, /*announce=*/false)) {
+                    std::cout << "SHUTTER_OK " << speed << std::endl;
+                } else {
+                    std::cout << "SHUTTER_FAIL " << speed << std::endl;
+                }
+                continue;
             }
 
             if (line.rfind("capture ", 0) == 0) {

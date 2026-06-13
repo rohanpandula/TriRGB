@@ -92,6 +92,10 @@ class PersistentSonyCapture:
 
         self._proc: Optional["subprocess.Popen[str]"] = None
         self._closed = False
+        # Last shutter applied to the live session via the `shutter` command.
+        # Reset to None on (re)spawn — a fresh process is at the camera's own
+        # shutter, so the next non-None request must re-apply.
+        self._last_shutter: Optional[str] = None
 
         # Per-capture channel for routing stdout lines.
         self._stdout_q: "queue.Queue[str]" = queue.Queue()
@@ -103,11 +107,19 @@ class PersistentSonyCapture:
     # Public API
     # ------------------------------------------------------------------
 
-    def capture(self, out_path: Path, *, timeout_s: int) -> int:
+    def capture(
+        self, out_path: Path, *, timeout_s: int, shutter: Optional[str] = None
+    ) -> int:
         """Trigger one capture via the persistent session.
 
-        Returns 0 on success, 1 on CAPTURE_FAIL, 124 on timeout, 127 if the
-        binary is not found, or other non-zero on unexpected error.
+        `shutter` (e.g. "1/100") is applied to the live session before the
+        capture when it differs from the last-applied value — narrowband RGB
+        uses a different shutter per channel. `None` leaves the current shutter
+        untouched (matching the one-shot runner skipping --shutter-speed).
+
+        Returns 0 on success, 1 on CAPTURE_FAIL / shutter-set failure, 124 on
+        timeout, 127 if the binary is not found, or other non-zero on
+        unexpected error.
 
         Automatically spawns the process on first call (lazy init).
         Respawns once if the process died between captures.
@@ -124,7 +136,9 @@ class PersistentSonyCapture:
             if rc != 0:
                 return rc
 
-        return self._do_capture(out_path, timeout_s=timeout_s, is_retry=False)
+        return self._do_capture(
+            out_path, timeout_s=timeout_s, is_retry=False, shutter=shutter
+        )
 
     def close(self) -> None:
         """Gracefully shut down the persistent subprocess.
@@ -166,6 +180,8 @@ class PersistentSonyCapture:
             return 127
 
         self._proc = proc
+        # Fresh process → camera is at its own shutter; force re-apply.
+        self._last_shutter = None
 
         # Start stderr drain (fires on_exposure_complete for every marker line).
         self._stderr_thread = threading.Thread(
@@ -228,6 +244,7 @@ class PersistentSonyCapture:
         *,
         timeout_s: int,
         is_retry: bool,
+        shutter: Optional[str] = None,
     ) -> int:
         """Send the capture command and wait for CAPTURE_OK or CAPTURE_FAIL."""
         proc = self._proc
@@ -238,8 +255,33 @@ class PersistentSonyCapture:
                 rc = self._spawn()
                 if rc != 0:
                     return rc
-                return self._do_capture(out_path, timeout_s=timeout_s, is_retry=True)
+                return self._do_capture(
+                    out_path, timeout_s=timeout_s, is_retry=True, shutter=shutter
+                )
             return 1
+
+        # Apply the per-channel shutter before firing, if it changed. Firing at
+        # the wrong exposure would silently corrupt per-channel calibration.
+        if shutter is not None and shutter != self._last_shutter:
+            if not self._apply_shutter(shutter):
+                # Distinguish the two failure modes (Codex review fix):
+                #  - process DIED during shutter apply → respawn-and-retry once,
+                #    same policy as the capture-write path below (the new process
+                #    reset _last_shutter to None, so the retry re-applies it).
+                #  - camera REJECTED the speed (process still alive) → abort;
+                #    retrying the same invalid speed won't help.
+                proc = self._proc
+                if (proc is None or proc.poll() is not None) and not is_retry:
+                    logger.warning("process died during shutter apply; respawning")
+                    self._cleanup_proc()
+                    rc = self._spawn()
+                    if rc != 0:
+                        return rc
+                    return self._do_capture(
+                        out_path, timeout_s=timeout_s, is_retry=True, shutter=shutter
+                    )
+                logger.error("could not apply shutter %s; aborting capture", shutter)
+                return 1
 
         # Clear any leftover lines from a previous capture.
         while not self._stdout_q.empty():
@@ -259,7 +301,9 @@ class PersistentSonyCapture:
                 rc = self._spawn()
                 if rc != 0:
                     return rc
-                return self._do_capture(out_path, timeout_s=timeout_s, is_retry=True)
+                return self._do_capture(
+                    out_path, timeout_s=timeout_s, is_retry=True, shutter=shutter
+                )
             return 1
 
         deadline = time.monotonic() + timeout_s + 5  # 5 s slack for SDK teardown
@@ -291,7 +335,8 @@ class PersistentSonyCapture:
                         if rc != 0:
                             return rc
                         return self._do_capture(
-                            out_path, timeout_s=timeout_s, is_retry=True
+                            out_path, timeout_s=timeout_s, is_retry=True,
+                            shutter=shutter,
                         )
                     return 1
                 continue
@@ -305,6 +350,54 @@ class PersistentSonyCapture:
                 logger.error("CAPTURE_FAIL: %s", reason)
                 return 1
             logger.debug("sony-capture mid-capture stdout: %s", line)
+
+    def _apply_shutter(self, speed: str, *, timeout_s: float = 10.0) -> bool:
+        """Apply `speed` to the live session via the `shutter` command.
+
+        Returns True on SHUTTER_OK (and records `_last_shutter`); False on
+        SHUTTER_FAIL, timeout, or a dead process — the caller must then abort
+        rather than capture at the wrong exposure. Does not respawn (a dead
+        process here is handled by _do_capture's own retry on the next call).
+        """
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False
+
+        # Drain stale lines so we read this command's response, not a prior one.
+        while not self._stdout_q.empty():
+            try:
+                self._stdout_q.get_nowait()
+            except queue.Empty:
+                break
+
+        try:
+            proc.stdin.write(f"shutter {speed}\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            logger.warning("shutter stdin write failed (process died?): %s", exc)
+            return False
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error("sony-capture timed out applying shutter %s", speed)
+                return False
+            try:
+                line = self._stdout_q.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                if proc.poll() is not None:
+                    return False
+                continue
+            line = line.strip()
+            if line.startswith("SHUTTER_OK"):
+                self._last_shutter = speed
+                return True
+            if line.startswith("SHUTTER_FAIL"):
+                logger.error("sony-capture rejected shutter %s: %s", speed, line)
+                return False
+            # Other lines (logs): ignore and keep waiting.
+            logger.debug("sony-capture pre-SHUTTER_OK stdout: %s", line)
 
     def _drain_stderr(self, proc: "subprocess.Popen[str]") -> None:
         """Read stderr in a dedicated thread; fire on_exposure_complete on marker."""

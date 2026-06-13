@@ -288,30 +288,12 @@ class Orchestrator:
             return self._hw_runner
         if self._settings.trigger_mode == "manual":
             return self._manual_runner
-        # sdk mode
-        if self._settings.sdk_persistent and self._uniform_channel_shutter()[0]:
+        # sdk mode. The persistent runner applies each channel's shutter per
+        # capture via the persist `shutter <speed>` command, so per-channel
+        # differing shutters (the narrowband-RGB norm) are fully supported.
+        if self._settings.sdk_persistent:
             return self._persistent_runner
-        # Per-channel shutter differs (or persist disabled): use the one-shot
-        # runner. A persistent session is created once and can only set one
-        # shutter (at startup), so it cannot honor shutter_r/g/b that differ
-        # between channels — the one-shot runner applies each channel's
-        # --shutter-speed on its own fresh process. (Codex review fix.)
         return self._default_runner
-
-    def _uniform_channel_shutter(self) -> tuple[bool, Optional[str]]:
-        """Whether all three channels share one shutter, and that value.
-
-        Returns ``(True, value)`` when ``shutter_r == shutter_g == shutter_b``
-        (``value`` may be ``None`` = use the camera's own shutter), else
-        ``(False, None)``. The persistent SDK session can only apply a single
-        shutter (passed once at process startup, honored by ``sony-capture``
-        before it enters the ``--persist`` loop), so it may only serve a roll
-        whose three channels agree.
-        """
-        s = self._settings
-        if s.shutter_r == s.shutter_g == s.shutter_b:
-            return True, s.shutter_r
-        return False, None
 
     def close(self) -> None:
         """Close any persistent session.  Call on orchestrator shutdown."""
@@ -388,11 +370,11 @@ class Orchestrator:
         _PERSIST_AFFECTING_KEYS = frozenset({
             "sony_capture_path", "sony_ip_address", "sony_mac_address",
             "sony_user", "sony_password", "sdk_persistent", "trigger_mode",
-            # Everything baked into the persistent session's startup args must
-            # invalidate it on change: ISO + the (uniform) channel shutter +
-            # the per-capture timeout all go into the --persist spawn extras.
-            "sony_iso", "shutter_r", "shutter_g", "shutter_b",
-            "sony_capture_timeout_s",
+            # Settings baked into the persist startup args must invalidate the
+            # session on change. Shutter is NOT here — it is applied per capture
+            # over the `shutter` command, so changing shutter_r/g/b only affects
+            # the next capture, no session rebuild needed.
+            "sony_iso", "sony_capture_timeout_s",
         })
         with self._lock:
             if "roll_name" in kwargs and "frame_number" not in kwargs:
@@ -1007,14 +989,10 @@ class Orchestrator:
             extras += ["--mac-address", s.sony_mac_address]
         if s.sony_iso:
             extras += ["--iso", s.sony_iso]
-        # _pick_runner only routes here when the three channel shutters agree,
-        # so this single startup shutter is correct for all three captures.
-        # sony-capture applies --shutter-speed before entering the --persist
-        # loop; None (the shared value) means "use the camera's set shutter",
-        # matching the one-shot runner skipping the flag. (Codex review fix.)
-        uniform, shared_shutter = self._uniform_channel_shutter()
-        if uniform and shared_shutter:
-            extras += ["--shutter-speed", shared_shutter]
+        # NOTE: shutter is intentionally NOT a startup arg. It is applied per
+        # capture over the persist `shutter <speed>` command (see
+        # _persistent_runner / PersistentSonyCapture.capture), because
+        # narrowband RGB uses a different shutter per channel.
 
         def on_exposure_complete() -> None:
             try:
@@ -1034,14 +1012,19 @@ class Orchestrator:
     def _persistent_runner(self, channel: str, out_path: Path, timeout_s: int) -> int:
         """F2: SDK runner that reuses a persistent sony-capture session.
 
-        Falls through to _default_runner semantics on unexpected failure so
-        existing error-path tests remain valid.  Per-channel shutter speed is
-        NOT supported in persistent mode (the binary handles it internally once
-        set at session start; per-capture shutter would require a protocol
-        extension beyond the current spec).
+        The session is reused across the whole roll. The per-channel shutter is
+        applied per capture via the persist `shutter <speed>` command —
+        narrowband RGB needs a DIFFERENT shutter per channel (blue far longer
+        than red/green), so this is required, not optional. Falls through to
+        _default_runner semantics on unexpected failure so existing error-path
+        tests remain valid.
         """
         session = self._get_or_create_persistent_session()
-        exit_code = session.capture(out_path, timeout_s=timeout_s)
+        exit_code = session.capture(
+            out_path,
+            timeout_s=timeout_s,
+            shutter=self._shutter_for_channel(channel),
+        )
         if exit_code == 127:
             # Binary not found — replicate _default_runner's detail message.
             s = self._settings
