@@ -364,6 +364,13 @@ final class OrchestratorClient: ObservableObject {
     /// this (× 3 channels + margin) so an SDK triplet (3 × 60s) can't be killed
     /// client-side before the backend finishes. Internal for test injection.
     var activePerChannelCaptureTimeoutS: TimeInterval = OrchestratorClient.defaultBackendCaptureTimeoutS
+    /// The Scanlight serial port the backend was launched with
+    /// (`settings.scanlightPort`), or nil if the backend auto-discovered it. The
+    /// SIGKILL / app-shutdown emergency light-off passes this as `--port` so it
+    /// still targets the right device when multiple Pico CDC ports are present
+    /// (auto-discovery refuses to guess — see scanlight/device.py). Set in
+    /// start(); internal for test injection.
+    var activeScanlightPort: String?
     /// Margin (seconds) added on top of 3 × per-channel before the client gives up.
     private static let captureTimeoutMarginS: TimeInterval = 15
     internal var sonyConnectionProbeOverride: ((ScanSettings) async -> SonyConnectionProbeResult)?
@@ -455,7 +462,7 @@ final class OrchestratorClient: ObservableObject {
         // terminating. waitUntilExit returns promptly (already exiting or just
         // SIGKILLed) so the port is free before scanlightctl claims it.
         proc.waitUntilExit()
-        Self.bestEffortScanlightOffSync()
+        Self.bestEffortScanlightOffSync(port: activeScanlightPort)
     }
 
     // MARK: - Public API
@@ -677,6 +684,10 @@ final class OrchestratorClient: ObservableObject {
             ? Self.sdkBackendCaptureTimeoutS
             : Self.defaultBackendCaptureTimeoutS
 
+        // Remember the explicit Scanlight port (if any) so the emergency light-off
+        // paths can pass `--port` and still find the device with multiple Pico CDCs.
+        activeScanlightPort = (settings.scanlightPort?.isEmpty == false) ? settings.scanlightPort : nil
+
         // Bump the launch token. Every async callback/cleanup below captures this
         // value and no-ops if a newer launch has superseded it — so a slow callback
         // from a prior (killed/failed) child can't corrupt this launch's state.
@@ -852,28 +863,38 @@ final class OrchestratorClient: ObservableObject {
             // so the LED would stay lit indefinitely. Fire a best-effort, non-blocking
             // `scanlightctl off` to turn the light off from the Swift side.
             // Swallow all errors: this is fire-and-forget insurance, not a hard requirement.
+            let port = activeScanlightPort
             Task.detached(priority: .background) {
-                await Self.bestEffortScanlightOff()
+                await Self.bestEffortScanlightOff(port: port)
             }
         }
     }
 
     /// Resolve the `scanlightctl off` invocation candidates (locator path first,
     /// then the `python3 -m scanlight.cli off` module fallback).
-    private nonisolated static func scanlightOffCandidates() -> [(executable: String, arguments: [String])] {
+    /// Build the `scanlightctl off` invocation candidates. `--port` is a GLOBAL
+    /// scanlightctl arg (precedes the `off` subcommand) — pass it through when the
+    /// backend was launched with an explicit port so the emergency off still
+    /// targets the right device when multiple Pico CDC ports are present.
+    /// Internal for test injection.
+    internal nonisolated static func scanlightOffCandidates(port: String?) -> [(executable: String, arguments: [String])] {
+        let portArgs: [String] = {
+            guard let port, !port.isEmpty else { return [] }
+            return ["--port", port]
+        }()
         var list: [(String, [String])] = []
         if let url = try? PythonToolLocator.resolve("scanlightctl") {
-            list.append((url.path, ["off"]))
+            list.append((url.path, portArgs + ["off"]))
         }
-        list.append(("/usr/bin/env", ["python3", "-m", "scanlight.cli", "off"]))
+        list.append(("/usr/bin/env", ["python3", "-m", "scanlight.cli"] + portArgs + ["off"]))
         return list
     }
 
     /// SYNCHRONOUS best-effort `scanlightctl off`, bounded to ~2s per candidate.
     /// Used on the app-termination path (`terminateChildForAppShutdown`), where a
     /// detached async Task would not get a chance to run before the process exits.
-    private nonisolated static func bestEffortScanlightOffSync() {
-        for (executable, arguments) in scanlightOffCandidates() {
+    private nonisolated static func bestEffortScanlightOffSync(port: String?) {
+        for (executable, arguments) in scanlightOffCandidates(port: port) {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: executable)
             proc.arguments = arguments
@@ -897,8 +918,8 @@ final class OrchestratorClient: ObservableObject {
     /// escalation. Tries the project-locator path first, falls back to
     /// `python3 -m scanlight.cli off`. Swallows all errors and enforces a short
     /// timeout so a missing binary can't stall the shutdown path.
-    private nonisolated static func bestEffortScanlightOff() async {
-        let candidates = scanlightOffCandidates()
+    private nonisolated static func bestEffortScanlightOff(port: String?) async {
+        let candidates = scanlightOffCandidates(port: port)
         for (executable, arguments) in candidates {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: executable)
@@ -1372,10 +1393,14 @@ final class OrchestratorClient: ObservableObject {
             arguments: ["-axo", "pid=,ppid=,command="]
         )
         let cwd = FileManager.default.currentDirectoryPath
+        // Only keep hints specific enough to identify THIS checkout. A "/" cwd
+        // (common for Finder/packaged launches) is a substring of every absolute
+        // command and would match — and kill — every other checkout's orphaned
+        // backend. isSpecificRepoHint drops "/", "$HOME", and shallow paths.
         let repoHints = [
             cwd,
             settings.sonyCapturePath ?? "",
-        ].filter { !$0.isEmpty }
+        ].filter { Self.isSpecificRepoHint($0) }
 
         for candidate in Self.parseTripletProcesses(from: psOutput) {
             guard Self.shouldCleanupStaleTripletProcess(
@@ -1426,10 +1451,29 @@ final class OrchestratorClient: ObservableObject {
             return true
         }
 
+        // The cwd comparison only identifies THIS checkout when cwd is specific.
+        // A "/" or "$HOME" cwd (common for Finder/packaged launches) would match
+        // unrelated backends that happen to share it, so don't trust it.
+        guard Self.isSpecificRepoHint(currentWorkingDirectory) else { return false }
         guard let processCwd = cwdLookup(process.pid) else { return false }
         let current = URL(fileURLWithPath: currentWorkingDirectory).standardizedFileURL.path
         let discovered = URL(fileURLWithPath: processCwd).standardizedFileURL.path
         return discovered == current
+    }
+
+    /// Whether a path is specific enough to safely identify THIS checkout's
+    /// backend — both as a substring hint matched against arbitrary process
+    /// command lines and as a cwd compared for equality. A Finder/packaged-app
+    /// launch often has cwd "/", which is a substring of every absolute command
+    /// (so it would match unrelated TriRGB backends); "$HOME" is nearly as broad.
+    /// Require a non-root, non-home absolute path at least two components deep.
+    internal static func isSpecificRepoHint(_ raw: String) -> Bool {
+        guard !raw.isEmpty else { return false }
+        let path = URL(fileURLWithPath: raw).standardizedFileURL.path
+        if path == "/" { return false }
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        if path == home { return false }
+        return path.split(separator: "/").count >= 2
     }
 
     private static func cwdForProcess(pid: Int32) -> String? {

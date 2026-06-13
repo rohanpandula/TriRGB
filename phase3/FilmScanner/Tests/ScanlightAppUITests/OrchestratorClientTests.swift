@@ -419,6 +419,64 @@ final class OrchestratorClientTests: XCTestCase {
         ))
     }
 
+    func testStaleTripletCleanupIgnoresWeakRootCwd() {
+        // Audit #15: a Finder/packaged launch with cwd "/" must NOT match unrelated
+        // backends — "/" is a substring of every absolute command line. repoHints
+        // is empty (the "/" cwd is dropped by isSpecificRepoHint at the builder),
+        // and the cwd comparison is skipped because "/" isn't specific — even when
+        // the orphan's real cwd is also "/".
+        let unrelated = RunningTripletProcess(
+            pid: 444,
+            parentPID: 1,
+            command: "/opt/homebrew/bin/python3 -m triplet_capture.app --sony-capture /other/phase1/sony-capture/build/sony-capture"
+        )
+        XCTAssertFalse(OrchestratorClient.shouldCleanupStaleTripletProcess(
+            unrelated,
+            repoHints: [],
+            currentWorkingDirectory: "/",
+            cwdLookup: { _ in "/" }
+        ))
+    }
+
+    func testIsSpecificRepoHintRejectsWeakPaths() {
+        XCTAssertFalse(OrchestratorClient.isSpecificRepoHint(""))
+        XCTAssertFalse(OrchestratorClient.isSpecificRepoHint("/"))
+        XCTAssertFalse(OrchestratorClient.isSpecificRepoHint(
+            FileManager.default.homeDirectoryForCurrentUser.path))
+        XCTAssertTrue(OrchestratorClient.isSpecificRepoHint("/Users/x/Projects/TriRGB"))
+        XCTAssertTrue(OrchestratorClient.isSpecificRepoHint(
+            "/repo/phase1/sony-capture/build/sony-capture"))
+    }
+
+    func testScanlightOffCandidatesIncludePortBeforeSubcommand() {
+        // Audit #15: the emergency light-off must pass the explicit --port (a GLOBAL
+        // scanlightctl arg, BEFORE the `off` subcommand) so it still targets the
+        // right device when multiple Pico CDC ports are present.
+        let withPort = OrchestratorClient.scanlightOffCandidates(port: "/dev/cu.usbmodem1234")
+        XCTAssertFalse(withPort.isEmpty)
+        for candidate in withPort {
+            let args = candidate.arguments
+            guard let portIdx = args.firstIndex(of: "--port"),
+                  let offIdx = args.firstIndex(of: "off") else {
+                XCTFail("candidate \(args) missing --port or off")
+                continue
+            }
+            XCTAssertEqual(args[portIdx + 1], "/dev/cu.usbmodem1234",
+                           "--port must be followed by the port path")
+            XCTAssertLessThan(portIdx, offIdx, "--port must precede the off subcommand")
+        }
+
+        // No port (auto-discovery, single-device case) → no --port arg.
+        for candidate in OrchestratorClient.scanlightOffCandidates(port: nil) {
+            XCTAssertFalse(candidate.arguments.contains("--port"))
+            XCTAssertTrue(candidate.arguments.contains("off"))
+        }
+        // Empty string is treated as "no port".
+        for candidate in OrchestratorClient.scanlightOffCandidates(port: "") {
+            XCTAssertFalse(candidate.arguments.contains("--port"))
+        }
+    }
+
     func testProcessOutputDrainsLargeStdoutBeforeWaiting() {
         let output = OrchestratorClient.processOutput(
             executable: "/bin/zsh",
