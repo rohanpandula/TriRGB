@@ -263,9 +263,10 @@ The 36 TIFFs are 16-bit linear ProPhoto-RGB. Imported into FilmLab or NLP, inver
 
 ## Phase 3 — Swift app + future live preview
 
-**Current goal:** Use the native macOS app as the unified operator surface
-for Light, Settings, Calibrate, and Scan while wrapping the tested Python
-pipeline. Live inverted preview remains a future hardware-gated goal.
+**Current goal:** Use the native macOS app as the unified operator surface for
+the per-roll workflow (Set up → Calibrate → Scan → Develop) while wrapping the
+tested Python pipeline. Live inverted preview remains a future hardware-gated
+goal.
 
 ### Architecture
 
@@ -273,12 +274,12 @@ Swift / SwiftUI macOS app. Apple Silicon target.
 
 - The Sony Camera Remote SDK bridge is still CLI-based. The app launches `triplet-capture`, which routes SDK mode through the verified `sony-capture` Wi-Fi path.
 - The Scanlight serial protocol is re-implemented in Swift (it's tiny — six host-to-device packets, simple framing).
-- Current tabs (shipped names; original plan names in parentheses):
-  - **Session:** roll/session dashboard.
+- Navigation is a **workflow sidebar** (replacing the earlier 5-tab layout in the 2026-06 UX redesign): the four ordered per-roll steps above two utilities, with a persistent **readiness strip** (roll/output identity + live light/camera/backend status) across every pane.
+  - **Set up:** roll/output/trigger/composite settings, Sony camera connection, and capture output. Default trigger is `manual`.
   - **Calibrate:** guided rig check, exposure calibration, FFC capture, and numeric checks.
   - **Scan:** starts/stops the Python orchestrator, captures/retakes frames, and polls composite status.
-  - **Develop:** in-app positive inversion / render-look surface (added in v1.2).
-  - **Set Up** (was **Light** + **Settings**): roll/output/trigger/composite/calibration settings plus manual Scanlight serial control and diagnostics. Default trigger is `manual`.
+  - **Develop:** in-app positive inversion / render-look surface.
+  - *Utilities* — **Diagnostics:** manual Scanlight serial control + live-view tools; **Film stocks:** saved per-stock RGB exposure recipes. (The old **Session** dashboard was removed — the readiness strip now shows that state live and always-on.)
 - Future live-preview mode:
   - Scanlight set to white channel only (e.g., W=200, RGB=0).
   - A camera live-view bridge delivers frames for a Core Image invert/tone pipeline.

@@ -27,7 +27,28 @@ public enum AccessibilityID {
     /// Version of the AX-ID schema. AI agents and external tests should
     /// check this matches what they expect before relying on individual
     /// IDs. Bump when an existing ID is renamed or removed.
-    public static let schemaVersion = "4"
+    ///
+    /// v5 (2026-06 UX redesign): the 5-tab TabView was replaced by a workflow
+    /// sidebar (`NavItem`). Automation that navigated via `app.tabs[...]` must
+    /// switch to clicking the `btn-nav-*` rows below. No existing ID was renamed
+    /// or removed, but the navigation mechanism changed — hence the bump.
+    public static let schemaVersion = "5"
+
+    // MARK: - Navigation (workflow sidebar)
+
+    /// The workflow sidebar that replaced the 5-tab TabView. Each row selects a
+    /// pane; drive the app by clicking these instead of tab labels. The first
+    /// four are the ordered workflow, the last two are utilities.
+    public static let navSetup               = "btn-nav-setup"
+    public static let navCalibrate           = "btn-nav-calibrate"
+    public static let navScan                = "btn-nav-scan"
+    public static let navDevelop             = "btn-nav-develop"
+    public static let navDiagnostics         = "btn-nav-diagnostics"
+    public static let navFilmStocks          = "btn-nav-film-stocks"
+
+    /// The persistent readiness strip (roll/output identity + live hardware
+    /// status pills). A queryable status region, not a control.
+    public static let readinessStrip         = "lbl-readiness-strip"
 
     // MARK: - Connection
 

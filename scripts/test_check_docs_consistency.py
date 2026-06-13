@@ -37,7 +37,7 @@ _MD_FILE = _REPO_ROOT / "docs" / "ax-id-reference.md"
 # Bump this when AX-IDs are added/removed. The real drift gate is
 # test_real_sources_are_consistent (set equality between the two sources); this
 # constant is a parser sanity-check shared by the two count tests below.
-_EXPECTED_AX_ID_COUNT = 134
+_EXPECTED_AX_ID_COUNT = 141
 
 
 # --------------------------------------------------------------------------

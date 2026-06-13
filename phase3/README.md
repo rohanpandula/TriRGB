@@ -4,8 +4,10 @@ Phase 3 of the film scanner build — see `../PROJECT.md`.
 
 **Current status:** this is now a real SwiftPM macOS app target, not only a
 driver scaffold. The app is the intended unified operator surface for the
-scanner: Light, Settings, Calibrate, and Scan tabs all share one set of
-state objects.
+scanner: a workflow sidebar (**Set up → Calibrate → Scan → Develop**, plus
+**Diagnostics** and **Film stocks** utilities) over one shared set of state
+objects, with a persistent readiness strip showing roll/output identity and
+live light/camera/backend status.
 
 The app still wraps the tested Python/C++ pipeline instead of reimplementing
 image processing in Swift. That is intentional. The Swift app owns UI,
@@ -19,7 +21,7 @@ math, and inversion helpers.
 |---|---|---|
 | `ScanlightSwift` | Swift Scanlight protocol/driver and fake transport | no for tests, yes for real serial |
 | `scanlight-swift-cli` | JSON-capable CLI/selftest for automation | optional |
-| `scanlight-app` | SwiftUI control hub with Light, Settings, Calibrate, and Scan tabs | no for fake-transport UI tests, yes for real scanning |
+| `scanlight-app` | SwiftUI control hub: a workflow sidebar (Set up → Calibrate → Scan → Develop) plus Diagnostics / Film stocks utilities and a persistent readiness strip | no for fake-transport UI tests, yes for real scanning |
 | `OrchestratorClient` | Starts/stops `triplet-capture` as a child process and drives its HTTP API | yes for real capture |
 | `ScanCoordinator` | Owns the serial-port handoff between the manual Light panel and the Python scan/calibration process | no for tests |
 | Calibration wizard | Starts `triplet-capture`, enters `.calibrating`, drives exposure calibration, FFC capture, and numeric checks through the Python backend, then releases the port | yes for real calibration |

@@ -24,14 +24,6 @@
 import SwiftUI
 import AppKit
 
-enum ProductTab: Hashable {
-    case session
-    case calibrate
-    case scan
-    case develop
-    case setup
-}
-
 @main
 struct ScanlightAppMain: App {
     @NSApplicationDelegateAdaptor(ScanlightAppDelegate.self) private var appDelegate
@@ -58,9 +50,12 @@ struct ScanlightAppMain: App {
     var body: some Scene {
         WindowGroup {
             ScanHubRootView()
+                // Width budget: ~200pt sidebar + the detail panes, which were
+                // designed for ~680pt of content. The old TabView gave content
+                // the full window; the sidebar now needs its share on top.
                 .frame(
-                    minWidth: 680, idealWidth: 800, maxWidth: .infinity,
-                    minHeight: 520, idealHeight: 700, maxHeight: .infinity
+                    minWidth: 880, idealWidth: 1040, maxWidth: .infinity,
+                    minHeight: 560, idealHeight: 720, maxHeight: .infinity
                 )
         }
     }
@@ -105,7 +100,7 @@ struct ScanHubRootView: View {
     @StateObject private var calibrationWizardViewModel: CalibrationWizardViewModel
     @StateObject private var positiveInversionViewModel = PositiveInversionViewModel()
     @StateObject private var sonyCameraConnection = SonyCameraConnection()
-    @State private var selectedTab: ProductTab = .session
+    @State private var nav: NavItem = .setup
 
     init() {
         // Build shared objects first so they can be passed to the coordinators.
@@ -123,48 +118,42 @@ struct ScanHubRootView: View {
     }
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            SessionView(
-                selectedTab: $selectedTab,
-                store: settingsStore,
-                coordinator: scanCoordinator,
-                orchestratorClient: orchestratorClient,
-                lightViewModel: scanlightViewModel,
-                cameraConnection: sonyCameraConnection
-            )
-                .tabItem { Label("Session", systemImage: "rectangle.stack") }
-                .tag(ProductTab.session)
-
-            CalibrationWizardView(
-                viewModel: calibrationWizardViewModel,
-                store: settingsStore,
-                coordinator: scanCoordinator,
-                cameraConnection: sonyCameraConnection
-            )
-                .tabItem { Label("Calibrate", systemImage: "scope") }
-                .tag(ProductTab.calibrate)
-
-            ScanView(
-                coordinator: scanCoordinator,
-                store: settingsStore,
-                orchestratorClient: orchestratorClient,
-                lightViewModel: scanlightViewModel
-            )
-                .tabItem { Label("Scan", systemImage: "camera") }
-                .tag(ProductTab.scan)
-
-            PositiveInversionView(viewModel: positiveInversionViewModel)
-                .tabItem { Label("Develop", systemImage: "wand.and.stars") }
-                .tag(ProductTab.develop)
-
-            SetupView(
-                store: settingsStore,
-                orchestratorClient: orchestratorClient,
-                lightViewModel: scanlightViewModel,
-                cameraConnection: sonyCameraConnection
-            )
-                .tabItem { Label("Set Up", systemImage: "slider.horizontal.3") }
-                .tag(ProductTab.setup)
+        NavigationSplitView {
+            List(selection: $nav) {
+                Section("Workflow") {
+                    sidebarRow(.setup)
+                    sidebarRow(.calibrate)
+                    sidebarRow(.scan)
+                    sidebarRow(.develop)
+                }
+                Section("Utilities") {
+                    sidebarRow(.diagnostics)
+                    sidebarRow(.filmStocks)
+                }
+            }
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 188, ideal: 200, max: 230)
+        } detail: {
+            VStack(spacing: 0) {
+                ReadinessStrip(
+                    store: settingsStore,
+                    light: scanlightViewModel,
+                    camera: sonyCameraConnection,
+                    client: orchestratorClient,
+                    coordinator: scanCoordinator,
+                    onConnectLight: {
+                        // Send the operator to the panel that owns the serial
+                        // connection (so they can pick a port / see status) and
+                        // kick an auto-discovery connect.
+                        nav = .diagnostics
+                        scanlightViewModel.connect()
+                    }
+                )
+                Divider()
+                detailContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+            .navigationTitle(nav.title)
         }
         .tint(Theme.accent)
         .onAppear {
@@ -187,6 +176,63 @@ struct ScanHubRootView: View {
         }
         .onChange(of: settingsStore.settings.sonyPassword) { _ in
             sonyCameraConnection.update(for: settingsStore.settings)
+        }
+    }
+
+    @ViewBuilder
+    private func sidebarRow(_ item: NavItem) -> some View {
+        HStack(spacing: 9) {
+            if let n = item.stepNumber {
+                Text("\(n)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(nav == item ? Color.accentColor : .secondary)
+                    .frame(width: 20, height: 20)
+                    .background(
+                        Circle().fill(nav == item
+                                      ? Theme.accent.opacity(0.20)
+                                      : Color.primary.opacity(0.06))
+                    )
+            } else if let icon = item.utilityIcon {
+                Image(systemName: icon)
+                    .frame(width: 20)
+                    .foregroundStyle(.secondary)
+            }
+            Text(item.title)
+        }
+        .tag(item)
+        .accessibilityIdentifier(item.axID)
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        switch nav {
+        case .setup:
+            ScanSettingsView(
+                store: settingsStore,
+                orchestratorClient: orchestratorClient,
+                lightViewModel: scanlightViewModel,
+                cameraConnection: sonyCameraConnection
+            )
+        case .calibrate:
+            CalibrationWizardView(
+                viewModel: calibrationWizardViewModel,
+                store: settingsStore,
+                coordinator: scanCoordinator,
+                cameraConnection: sonyCameraConnection
+            )
+        case .scan:
+            ScanView(
+                coordinator: scanCoordinator,
+                store: settingsStore,
+                orchestratorClient: orchestratorClient,
+                lightViewModel: scanlightViewModel
+            )
+        case .develop:
+            PositiveInversionView(viewModel: positiveInversionViewModel)
+        case .diagnostics:
+            ScanlightView(viewModel: scanlightViewModel)
+        case .filmStocks:
+            FilmStockManagerView(store: settingsStore)
         }
     }
 }

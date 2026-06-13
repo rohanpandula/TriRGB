@@ -33,7 +33,7 @@ will fail; fix the code or the doc before merging.
 | `triplet-capture` | Python Flask app + CLI (`phase2/triplet-capture/`) | Per-frame capture orchestration; provides the scanning web UI/backend used by Swift | yes (`--trigger-mode manual`, `hw`, or `sdk`) |
 | `scripts/inspect-calibration.py` | Python script | Quantitative vignette/saturation check on a captured FFC calibration triplet | no (needs cal ARWs) |
 | `scripts/test_swift_cli.py` | Python pytest harness | Regression CI for the Swift CLI via subprocess; canonical Python-driving example | no (`--fake` transport) |
-| SwiftUI app (`phase3/FilmScanner/`) | macOS app | Unified operator surface for Light, Settings, Calibrate, and Scan tabs; driven via XCTest UI or cua-driver | yes for real scanning, no for fake-transport tests |
+| SwiftUI app (`phase3/FilmScanner/`) | macOS app | Unified operator surface with a workflow sidebar (Set up → Calibrate → Scan → Develop) plus Diagnostics / Film stocks utilities; driven via XCTest UI or cua-driver | yes for real scanning, no for fake-transport tests |
 
 ### CLI entry points
 
@@ -253,7 +253,7 @@ when you launched the daemon yourself with that explicit port.
 **`waiting_for_channel`** (top-level key on `GET /api/state`): `"R"`, `"G"`,
 `"B"`, or `null`. Non-null only during a capture, while the orchestrator is
 waiting for that channel's frame. In `manual`/`hw` mode this is the operator's
-cue to fire the IED for that channel; the Swift Scan tab renders it as a
+cue to fire the IED for that channel; the Swift Scan pane renders it as a
 banner. `null` when idle or between channels.
 
 **Single-activity guard (409).** Captures and the three blocking calibrate
@@ -356,12 +356,18 @@ exercise any GUI action from a shell command.
 The contract source is
 `phase3/FilmScanner/Sources/ScanlightApp/AccessibilityIDs.swift`.
 
-`schemaVersion` is currently `"4"` (see `AccessibilityIDs.swift:30`). External
+`schemaVersion` is currently `"5"` (see `AccessibilityIDs.swift`). External
 tests and AI agents should check this value before relying on individual IDs:
 
 ```swift
-AccessibilityID.schemaVersion  // currently "4"
+AccessibilityID.schemaVersion  // currently "5"
 ```
+
+> **v5 (2026-06 UX redesign):** the 5-tab TabView (Session / Calibrate / Scan /
+> Develop / Set Up) was replaced by a workflow sidebar plus a persistent
+> readiness strip. Navigate by clicking the `btn-nav-*` rows (see the
+> [Navigation](#navigation) section of `ax-id-reference.md`) instead of
+> `app.tabs[...]`. No existing ID was renamed or removed.
 
 Rules for schema maintenance:
 
