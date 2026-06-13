@@ -363,14 +363,19 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                     )
                 except (ValueError, TypeError) as e:
                     return jsonify({"error": f"calibration levels must be numeric: {e}"}), 400
-                orch.update_settings(
-                    level_r=black_levels[0].led_level,
-                    level_g=black_levels[1].led_level,
-                    level_b=black_levels[2].led_level,
-                    shutter_r=black_levels[0].shutter_speed or None,
-                    shutter_g=black_levels[1].shutter_speed or None,
-                    shutter_b=black_levels[2].shutter_speed or None,
-                )
+                try:
+                    orch.update_settings(
+                        level_r=black_levels[0].led_level,
+                        level_g=black_levels[1].led_level,
+                        level_b=black_levels[2].led_level,
+                        shutter_r=black_levels[0].shutter_speed or None,
+                        shutter_g=black_levels[1].shutter_speed or None,
+                        shutter_b=black_levels[2].shutter_speed or None,
+                    )
+                except ValueError as e:
+                    # Out-of-range levels (numeric but invalid) raise from
+                    # __post_init__ — a 400, not an unhandled 500.
+                    return jsonify({"error": f"calibration levels out of range: {e}"}), 400
             else:
                 from c41_core import ChannelCalibration
                 black_levels = (

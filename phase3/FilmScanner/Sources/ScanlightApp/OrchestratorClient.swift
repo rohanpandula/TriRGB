@@ -448,6 +448,14 @@ final class OrchestratorClient: ObservableObject {
         if proc.isRunning {
             kill(proc.processIdentifier, SIGKILL)
         }
+        // The child owned the serial port; once it exits the port frees. Python's
+        // SIGTERM/SIGKILL cleanup may not have turned the LEDs off (firmware
+        // thermal protection is unreliable), so do a bounded, SYNCHRONOUS
+        // best-effort off here — a detached Task would never run while the app is
+        // terminating. waitUntilExit returns promptly (already exiting or just
+        // SIGKILLed) so the port is free before scanlightctl claims it.
+        proc.waitUntilExit()
+        Self.bestEffortScanlightOffSync()
     }
 
     // MARK: - Public API
@@ -846,24 +854,47 @@ final class OrchestratorClient: ObservableObject {
         }
     }
 
+    /// Resolve the `scanlightctl off` invocation candidates (locator path first,
+    /// then the `python3 -m scanlight.cli off` module fallback).
+    private nonisolated static func scanlightOffCandidates() -> [(executable: String, arguments: [String])] {
+        var list: [(String, [String])] = []
+        if let url = try? PythonToolLocator.resolve("scanlightctl") {
+            list.append((url.path, ["off"]))
+        }
+        list.append(("/usr/bin/env", ["python3", "-m", "scanlight.cli", "off"]))
+        return list
+    }
+
+    /// SYNCHRONOUS best-effort `scanlightctl off`, bounded to ~2s per candidate.
+    /// Used on the app-termination path (`terminateChildForAppShutdown`), where a
+    /// detached async Task would not get a chance to run before the process exits.
+    private nonisolated static func bestEffortScanlightOffSync() {
+        for (executable, arguments) in scanlightOffCandidates() {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: executable)
+            proc.arguments = arguments
+            proc.standardOutput = Pipe()
+            proc.standardError = Pipe()
+            do {
+                try proc.run()
+                let deadline = Date(timeIntervalSinceNow: 2.0)
+                while proc.isRunning && Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                if proc.isRunning { proc.terminate() }
+                if proc.terminationStatus == 0 { return }
+            } catch {
+                // Didn't launch (binary missing etc.) — try the next candidate.
+            }
+        }
+    }
+
     /// Fire `scanlightctl off` in a best-effort, non-blocking way after a SIGKILL
     /// escalation. Tries the project-locator path first, falls back to
     /// `python3 -m scanlight.cli off`. Swallows all errors and enforces a short
     /// timeout so a missing binary can't stall the shutdown path.
     private nonisolated static func bestEffortScanlightOff() async {
-        // Resolve `scanlightctl` via PythonToolLocator (mirrors how other CLI
-        // tools are resolved in this file). Fall back to the Python module form.
-        let candidates: [(executable: String, arguments: [String])] = {
-            var list: [(String, [String])] = []
-            if let url = try? PythonToolLocator.resolve("scanlightctl") {
-                list.append((url.path, ["off"]))
-            }
-            // Fallback: Python module form — works when scanlightctl is installed
-            // as a Python entry-point but the wrapper script isn't on PATH.
-            list.append(("/usr/bin/env", ["python3", "-m", "scanlight.cli", "off"]))
-            return list
-        }()
-
+        let candidates = scanlightOffCandidates()
         for (executable, arguments) in candidates {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: executable)
@@ -950,15 +981,13 @@ final class OrchestratorClient: ObservableObject {
             "level_b": settings.levelB,
             "settle_ms": settings.settleMs,
         ]
-        if let shutterR = settings.shutterR, !shutterR.isEmpty {
-            body["shutter_r"] = shutterR
-        }
-        if let shutterG = settings.shutterG, !shutterG.isEmpty {
-            body["shutter_g"] = shutterG
-        }
-        if let shutterB = settings.shutterB, !shutterB.isEmpty {
-            body["shutter_b"] = shutterB
-        }
+        // Always send shutter keys, including empty, so CLEARING a per-channel
+        // shutter propagates: POST /api/settings only updates keys present in the
+        // body and coerces "" → None. Omitting an emptied shutter would leave the
+        // backend capturing that channel at the stale shutter.
+        body["shutter_r"] = settings.shutterR ?? ""
+        body["shutter_g"] = settings.shutterG ?? ""
+        body["shutter_b"] = settings.shutterB ?? ""
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {

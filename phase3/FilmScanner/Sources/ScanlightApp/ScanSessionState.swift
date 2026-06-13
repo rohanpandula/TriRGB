@@ -404,7 +404,31 @@ final class ScanCoordinator: ObservableObject {
             lastError = ""
             reconnectNeeded = false
             compositePending = 0
+
+            let wanted = settings.withScanlightPort(lightPanel.scanlightPort)
+            // Reuse the running backend only if it was started with exactly these
+            // settings. Otherwise restart: settings may have changed since the
+            // scan started (trigger mode, Sony transport/path, output folder,
+            // inbox), several of which are spawn-only and a POST cannot carry, so
+            // a stale reuse would calibrate against the wrong path/camera/output.
+            if backendSettings == wanted {
+                lightPanel.portOwner = .calibrating
+                phase = .calibrating
+                return
+            }
             lightPanel.portOwner = .calibrating
+            await client.stop()
+            do {
+                try await client.start(settings: wanted)
+            } catch {
+                backendSettings = nil
+                lightPanel.portOwner = .idle
+                lightPanel.connect()
+                phase = .idle
+                lastError = "Failed to switch to calibration: \(error.localizedDescription)"
+                return
+            }
+            backendSettings = wanted
             phase = .calibrating
             return
         }

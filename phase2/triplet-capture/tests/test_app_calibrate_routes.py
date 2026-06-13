@@ -459,6 +459,24 @@ def test_calibrate_ffc_route_uses_posted_exposure_without_last_cal(app_and_orch)
     assert orch.settings.shutter_b == "1/2"
 
 
+def test_calibrate_ffc_out_of_range_level_returns_400(app_and_orch):
+    """codex#4: a numeric-but-out-of-range led_level passes the numeric parse but
+    raises ValueError from update_settings/__post_init__; the route must return a
+    controlled 400, not surface an unhandled 500."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    r = client.post("/api/calibrate/ffc", json={
+        "led_level_r": 300,   # numeric but out of the 0-255 range
+        "led_level_g": 130,
+        "led_level_b": 140,
+        "black_level_r": 256.0,
+        "black_level_g": 256.0,
+        "black_level_b": 256.0,
+    })
+    assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.data}"
+    assert "error" in r.get_json()
+
+
 def test_calibrate_ffc_n_frames_bad_input_returns_400(app_and_orch):
     """FIX-D: non-integer n_frames must return 400, not 500."""
     app, _ = app_and_orch

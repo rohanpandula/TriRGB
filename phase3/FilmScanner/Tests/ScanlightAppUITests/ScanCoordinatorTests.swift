@@ -515,6 +515,30 @@ final class ScanCoordinatorTests: XCTestCase {
                        "Switching scan → calibration should not disconnect/reconnect the light")
     }
 
+    /// codex#4: symmetric to the calibration→scan case — scan→calibration with
+    /// changed (possibly spawn-only) settings must restart the backend, not run
+    /// calibration against a stale capture path / camera mode / output folder.
+    func testSwitchFromScanToCalibrationRestartsBackendWhenSettingsChanged() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+
+        await coordinator.startScan(settings: makeScanSettings())
+        let clientLogAfterScan = client.callLog          // ["start"]
+        let lightLogAfterScan = lightPanel.callLog
+
+        var calSettings = makeScanSettings()
+        calSettings.outputFolder = NSTemporaryDirectory() + "different/"
+        calSettings.cameraModel = "ILCE-7CR"
+        await coordinator.startCalibration(settings: calSettings)
+
+        XCTAssertEqual(coordinator.phase, .calibrating)
+        XCTAssertEqual(lightPanel.portOwner, .calibrating)
+        XCTAssertEqual(client.callLog, clientLogAfterScan + ["stop", "start"],
+                       "changed settings must restart the backend for calibration")
+        XCTAssertEqual(lightPanel.callLog, lightLogAfterScan,
+                       "restart must not disconnect/reconnect the light panel")
+        XCTAssertEqual(client.lastStartSettings?.cameraModel, "ILCE-7CR")
+    }
+
     // MARK: - T5: startScan is no-op if already scanning
 
     func testStartScanIsNoOpIfAlreadyScanning() async throws {
