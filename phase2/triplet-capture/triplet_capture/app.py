@@ -1114,6 +1114,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
 
+    orch = None
     try:
         orch = Orchestrator(scanlight, settings, on_triplet_complete=on_triplet_complete)
         app = create_app(orch, composite_worker=composite_worker, ready_nonce=args.ready_nonce)
@@ -1197,6 +1198,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                     logging.warning("background composite frame %d failed: %s",
                                     cr.frame_number, cr.error)
             composite_worker.shutdown(wait=True)
+        # Deterministically close the persistent sony-capture session (if any) so
+        # the camera SDK session is released before this process exits — otherwise
+        # a Swift-restarted backend can race a lingering --persist child for the
+        # camera. No-op when no session was opened.
+        if orch is not None:
+            orch.close()
         scanlight.close()
 
 
