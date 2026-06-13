@@ -129,63 +129,75 @@ struct SonyLiveViewPanel: View {
                 Spacer(minLength: 0)
             }
 
-            HStack(spacing: Theme.Space.md) {
-                Toggle("Invert", isOn: $invertPreview)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
+            // Two rows so the controls breathe: orientation transforms on top,
+            // zoom + reset below. `.fixedSize()` keeps the switch labels on one
+            // line (a single overcrowded row squeezed them into "In-/vert" wraps).
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                HStack(spacing: Theme.Space.lg) {
+                    Toggle("Invert", isOn: $invertPreview)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .disabled(liveViewImage == nil)
+                        .fixedSize()
+                        .accessibilityIdentifier(invertToggleID)
+
+                    Toggle("Mirror", isOn: $mirrorPreview)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .disabled(liveViewImage == nil)
+                        .fixedSize()
+                        .accessibilityIdentifier(mirrorToggleID)
+
+                    Toggle("Flip", isOn: $flipPreview)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .disabled(liveViewImage == nil)
+                        .fixedSize()
+                        .accessibilityIdentifier(flipToggleID)
+
+                    Spacer(minLength: Theme.Space.md)
+
+                    Text("Rotate")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Picker("Rotate", selection: $rotationDegrees) {
+                        Text("0").tag(0)
+                        Text("90").tag(90)
+                        Text("180").tag(180)
+                        Text("270").tag(270)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
                     .disabled(liveViewImage == nil)
-                    .accessibilityIdentifier(invertToggleID)
-
-                Toggle("Mirror", isOn: $mirrorPreview)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .disabled(liveViewImage == nil)
-                    .accessibilityIdentifier(mirrorToggleID)
-
-                Toggle("Flip", isOn: $flipPreview)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .disabled(liveViewImage == nil)
-                    .accessibilityIdentifier(flipToggleID)
-
-                Text("Rotate")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Picker("Rotate", selection: $rotationDegrees) {
-                    Text("0").tag(0)
-                    Text("90").tag(90)
-                    Text("180").tag(180)
-                    Text("270").tag(270)
+                    .accessibilityIdentifier(rotatePickerID)
                 }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 180)
-                .disabled(liveViewImage == nil)
-                .accessibilityIdentifier(rotatePickerID)
 
-                Text("Zoom")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Slider(value: $previewZoom, in: 1.0...6.0, step: 0.25) {
+                HStack(spacing: Theme.Space.md) {
                     Text("Zoom")
-                }
-                .labelsHidden()
-                .disabled(liveViewImage == nil)
-                .accessibilityIdentifier(zoomSliderID)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
-                Text("\(Int(previewZoom * 100))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 44, alignment: .trailing)
+                    Slider(value: $previewZoom, in: 1.0...6.0, step: 0.25) {
+                        Text("Zoom")
+                    }
+                    .labelsHidden()
+                    .disabled(liveViewImage == nil)
+                    .accessibilityIdentifier(zoomSliderID)
 
-                Button("Reset") {
-                    resetPreviewTransforms()
+                    Text("\(Int(previewZoom * 100))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 44, alignment: .trailing)
+
+                    Button("Reset") {
+                        resetPreviewTransforms()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(liveViewImage == nil)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(liveViewImage == nil)
             }
 
             TransformedSonyLiveViewSurface(
