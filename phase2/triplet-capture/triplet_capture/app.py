@@ -82,7 +82,9 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             if "inbox_stable_for_s" in updates:
                 updates["inbox_stable_for_s"] = float(updates["inbox_stable_for_s"])
             settings = orchestrator.update_settings(**updates)
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
+            # TypeError covers JSON null reaching int()/float() coercion — a
+            # client input error (400), not an internal server error (500).
             return jsonify({"error": str(e)}), 400
         finally:
             orchestrator.end_activity()
