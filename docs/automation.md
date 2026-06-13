@@ -245,7 +245,7 @@ when you launched the daemon yourself with that explicit port.
 | GET | `/api/composite-status` | Poll streaming-composite worker | per-frame composite job states |
 | GET | `/api/calibrate/progress` | Poll long calibration progress | recent scan-log events |
 | GET | `/api/calibrate/exposure-result` | Last exposure-calibration result | `CalibrationResult` JSON |
-| POST | `/api/calibrate/preview-light` | Light a channel for framing | `ok` |
+| POST | `/api/calibrate/preview-light` | White light on/off for framing (body: `{enabled, level}`) | `{"enabled": bool, "level": int}` |
 | POST | `/api/calibrate/exposure` | Run exposure auto-calibration (blocking) | `CalibrationResult` |
 | POST | `/api/calibrate/ffc` | Capture flat-field reference (blocking) | FFC result |
 | POST | `/api/calibrate/checks` | Run numeric self-consistency checks (blocking) | checks result |

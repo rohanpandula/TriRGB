@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -189,6 +190,15 @@ class CaptureSettings:
                 raise ValueError(
                     f"shutter_pulse_ms must be a multiple of 10 in [10, 2550], "
                     f"got {self.shutter_pulse_ms}"
+                )
+        # Inbox timing must be finite and strictly positive: <= 0 bypasses the
+        # stability window (or makes sleep() spin/raise), and NaN/inf makes the
+        # stability check never pass so wait_for_new_file hangs until timeout.
+        for _name in ("inbox_stable_for_s", "inbox_poll_interval_s"):
+            _val = getattr(self, _name)
+            if not (isinstance(_val, (int, float)) and math.isfinite(_val) and _val > 0):
+                raise ValueError(
+                    f"{_name} must be a finite number > 0, got {_val!r}"
                 )
 
 

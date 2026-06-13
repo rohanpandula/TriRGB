@@ -144,16 +144,12 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     @app.post("/api/calibrate/preview-light")
     def post_calibrate_preview_light():
         orch = app.config["ORCHESTRATOR"]
-        # Reject while a capture or a blocking calibration owns the rig. Those
-        # activities release _lock between their internal captures, so the
-        # non-blocking _lock probe below is not enough on its own — a preview
-        # light could otherwise re-colour the Scanlight inside a calibration's
-        # gap and corrupt it. The activity guard covers those gaps. (Codex fix.)
-        if orch.current_activity is not None:
+        # Claim the single activity slot for the whole operation. This is
+        # atomically mutually exclusive with capture and the blocking calibrate
+        # routes (they claim the same slot), closing the check-then-lock TOCTOU
+        # a separate current_activity probe + _lock.acquire would leave open.
+        if not orch.try_begin_activity("preview_light"):
             return jsonify({"error": "A capture or calibration is in progress — wait for it to finish."}), 409
-        lock_acquired = orch._lock.acquire(blocking=False)
-        if not lock_acquired:
-            return jsonify({"error": "A capture is in progress — wait for it to finish."}), 409
 
         try:
             data = request.get_json(force=True, silent=True) or {}
@@ -174,7 +170,7 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
         except Exception as e:  # noqa: BLE001 - surface hardware errors as JSON
             return jsonify({"error": str(e)}), 500
         finally:
-            orch._lock.release()
+            orch.end_activity()
 
     @app.post("/api/calibrate/exposure")
     def post_calibrate_exposure():

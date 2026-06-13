@@ -139,6 +139,14 @@ def test_settings_rejects_extended_low_iso(tmp_path):
     with pytest.raises(ValueError, match="sony_iso"):
         CaptureSettings(output_folder=tmp_path, sony_iso="50")
 
+@pytest.mark.parametrize("field", ["inbox_stable_for_s", "inbox_poll_interval_s"])
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0, float("nan"), float("inf")])
+def test_settings_rejects_nonpositive_or_nonfinite_inbox_timing(tmp_path, field, bad):
+    # <= 0 bypasses the stability window / makes sleep() spin or raise; NaN/inf
+    # makes the stability check never pass so wait_for_new_file hangs.
+    with pytest.raises(ValueError, match=field):
+        CaptureSettings(output_folder=tmp_path, trigger_mode="sdk", **{field: bad})
+
 def test_settings_maps_legacy_lowest_iso_to_scan_base(tmp_path):
     settings = CaptureSettings(output_folder=tmp_path, sony_iso="lowest", trigger_mode="sdk")
 
