@@ -778,6 +778,30 @@ def test_sdk_persistent_used_with_per_channel_shutter(tmp_path):
     assert orch._runner.__func__ is Orchestrator._persistent_runner
 
 
+def test_shutter_change_closes_persistent_session(tmp_path):
+    # codex#8: a shutter change (esp. CLEARING to None) must close the live
+    # persist session — None means "leave current shutter", so a reused session
+    # would keep capturing at the stale last-applied shutter. A fresh session
+    # starts at the camera default.
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/100", shutter_g="1/100", shutter_b="1/100",
+    )
+    orch = Orchestrator(light, s)
+
+    closed = {"n": 0}
+
+    class _FakeSession:
+        def close(self):
+            closed["n"] += 1
+
+    orch._persistent_session = _FakeSession()
+    orch.update_settings(shutter_r=None, shutter_g=None, shutter_b=None)  # clear all
+    assert closed["n"] == 1, "shutter change must close the live session"
+    assert orch._persistent_session is None
+
+
 def test_mixed_none_shutters_fall_back_to_oneshot(tmp_path):
     # codex#6: a MIX of explicit and None shutters can't be honored by the
     # persist session (None can't reset to the camera default after another

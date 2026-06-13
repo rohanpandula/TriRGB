@@ -425,9 +425,16 @@ class Orchestrator:
                 if self._explicit_runner is None:
                     self._runner = self._pick_runner()
             elif kwargs.keys() & {"shutter_r", "shutter_g", "shutter_b"}:
-                # A shutter change can flip the mixed-None status (persist↔one-shot
-                # eligibility) — re-pick the runner WITHOUT rebuilding the session
-                # (shutter is per-capture, not baked into the spawn args).
+                # Close the live session on ANY shutter change. CLEARING a channel
+                # (value → None) is the trap: `None` means "leave the current
+                # shutter", so a session that earlier applied an explicit shutter
+                # would keep capturing at that stale value instead of the camera
+                # default. A fresh session always starts at the camera default and
+                # re-applies per channel, so closing here is correct for clear, set,
+                # and set→different transitions. (Shutter changes happen at
+                # calibration/setup, not per frame, so the rebuild cost is trivial.)
+                # Then re-pick the runner — the change can also flip mixed↔uniform.
+                self._close_persistent_session()
                 if self._explicit_runner is None:
                     self._runner = self._pick_runner()
             return self._settings

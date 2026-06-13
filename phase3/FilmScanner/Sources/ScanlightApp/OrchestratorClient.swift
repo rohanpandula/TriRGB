@@ -522,7 +522,11 @@ final class OrchestratorClient: ObservableObject {
                     do {
                         try await Task.sleep(nanoseconds: UInt64(attempt) * 750_000_000)
                     } catch {
-                        break  // Task cancelled — surface last failure immediately
+                        // Task cancelled — return the ACTUAL last failure now.
+                        // `break` would fall through to the post-loop "Retried N
+                        // times" message, falsely claiming retries that never ran
+                        // and giving misleading operator guidance. (codex#8)
+                        return lastFailure
                     }
                     continue
                 }
