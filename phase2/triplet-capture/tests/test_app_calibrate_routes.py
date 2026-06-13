@@ -116,7 +116,7 @@ def settings(tmp_path):
         level_g=128,
         level_b=128,
         settle_ms=0,
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
 
 

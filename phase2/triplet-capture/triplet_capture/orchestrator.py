@@ -110,10 +110,14 @@ class CaptureSettings:
     shutter_g: Optional[str] = None
     shutter_b: Optional[str] = None
 
-    # Hardware-trigger mode fields. Default values keep "manual" mode working
-    # unchanged for existing callers.  The dataclass default was previously
-    # "sdk" but the CLI/app.py default has always been "manual"; align them.
-    trigger_mode: str = "manual"
+    # Hardware-trigger mode fields.
+    # Dataclass default is "sdk" ON PURPOSE: it is the only mode that needs no
+    # extra required field, so `CaptureSettings()` stays constructible for
+    # library/test use. The USER-FACING default is "manual" and is set
+    # explicitly at the CLI (app.py) and by the Swift app — do NOT "align" this
+    # to "manual" here, or the no-arg constructor raises (manual requires
+    # ied_inbox, validated in __post_init__).
+    trigger_mode: str = "sdk"
     ied_inbox: Optional[Path] = None
     shutter_pulse_ms: int = 100  # matches the canonical app_bsl default
     # How long the inbox file size must hold steady before we call it

@@ -113,7 +113,7 @@ def settings(tmp_path):
         level_g=180,
         level_b=160,
         settle_ms=0,  # no sleep in tests
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
 
 
@@ -269,7 +269,7 @@ def test_sdk_runner_error_redacts_saved_auth(tmp_path, caplog):
         sony_capture_path=str(fake_capture),
         sony_user="USERSECRET",
         sony_password="PASSSECRET",
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         sdk_persistent=False,  # use one-shot runner so the shell script is invoked directly
     )
     orch = Orchestrator(FakeScanlight(), settings, sleep=_zero_sleep)
@@ -967,7 +967,7 @@ def test_sdk_runner_passes_sony_network_auth_args(tmp_path, monkeypatch):
         sony_mac_address="10:32:2C:26:1A:3F",
         sony_user="sdk-user",
         sony_password="sdk-password",
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(FakeScanlight(), s)
 
@@ -1010,7 +1010,7 @@ def test_sdk_runner_passes_channel_shutter_speed(tmp_path, monkeypatch):
         shutter_r="1/8",
         shutter_g="1/4",
         shutter_b="1/2",
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(FakeScanlight(), s)
 
@@ -1039,7 +1039,7 @@ def test_sdk_runner_failure_stderr_is_returned_in_triplet_error(tmp_path, monkey
         output_folder=tmp_path,
         sony_capture_path="/bin/sony-capture",
         settle_ms=0,
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         sdk_persistent=False,  # use one-shot runner to test stderr surfacing via _default_runner
     )
     orch = Orchestrator(FakeScanlight(), s, sleep=_zero_sleep)
@@ -1237,7 +1237,7 @@ def test_ephemeral_port_binds_and_writes_port_file(tmp_path):
         frame_number=1,
         output_folder=tmp_path,
         settle_ms=0,
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(light, settings, sony_capture_runner=lambda *a: 0, sleep=_zero_sleep)
     app = create_app(orch)
@@ -1324,7 +1324,7 @@ def test_signal_driven_shutdown_does_not_deadlock(tmp_path):
         frame_number=1,
         output_folder=tmp_path,
         settle_ms=0,
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(light, settings, sony_capture_runner=lambda *a: 0, sleep=_zero_sleep)
     app = create_app(orch)

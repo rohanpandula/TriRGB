@@ -219,7 +219,7 @@ def test_orchestrator_hook_fires_on_success(tmp_path):
         roll_name="Roll001",
         frame_number=1,
         output_folder=tmp_path / "scans",
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(
         FakeScanlight(),
@@ -256,7 +256,7 @@ def test_orchestrator_hook_failure_does_not_abort_capture(tmp_path):
 
     settings = CaptureSettings(
         roll_name="Roll001", frame_number=1, output_folder=tmp_path / "scans",
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(
         FakeScanlight(),

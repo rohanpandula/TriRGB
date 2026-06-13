@@ -205,7 +205,7 @@ def settings(tmp_path):
         level_g=128,
         level_b=128,
         settle_ms=0,
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
 
 
@@ -226,7 +226,7 @@ def _run_calibrate(tmp_path, *, scale=None) -> tuple[CalibrationResult, list]:
             level_g=128,
             level_b=128,
             settle_ms=0,
-            trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+            trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         ),
         base_region=make_base_region(),
         ffc_cal_dir="",
@@ -334,7 +334,7 @@ def test_fast_shutter_under_at_max_falls_back_to_slower_target(tmp_path):
             level_g=128,
             level_b=128,
             settle_ms=0,
-            trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+            trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         ),
         base_region=make_base_region(),
         ffc_cal_dir="",
@@ -399,7 +399,7 @@ def test_clipped_slow_verify_tries_intermediate_bracket_shutter(tmp_path):
             level_g=128,
             level_b=128,
             settle_ms=0,
-            trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+            trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         ),
         base_region=make_base_region(),
         ffc_cal_dir="",
@@ -599,7 +599,7 @@ def test_sensor_clipped_probe_is_not_selected_over_safe_probe(tmp_path):
             level_g=128,
             level_b=128,
             settle_ms=0,
-            trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+            trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         ),
         base_region=make_base_region(),
         ffc_cal_dir="",
@@ -647,7 +647,7 @@ def test_source_limited_channel_reports_brightest_clean_setting(tmp_path):
             level_g=128,
             level_b=128,
             settle_ms=0,
-            trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+            trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         ),
         base_region=make_base_region(),
         ffc_cal_dir="",
@@ -830,7 +830,7 @@ def test_dark_frame_failure_restores_original_levels(tmp_path):
         shutter_g="1/15",
         shutter_b="1/30",
         settle_ms=0,
-        trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+        trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
     )
     orch = Orchestrator(
         FakeScanlight(),
@@ -938,7 +938,7 @@ def test_loop_terminates_bounded(tmp_path):
             level_g=128,
             level_b=128,
             settle_ms=0,
-            trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+            trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         ),
         base_region=make_base_region(),
         ffc_cal_dir="",
@@ -980,7 +980,7 @@ def test_calibration_uses_single_dark_and_single_channel_probes(tmp_path):
             level_g=128,
             level_b=128,
             settle_ms=0,
-            trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+            trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         ),
         base_region=make_base_region(),
         ffc_cal_dir="",
@@ -1018,7 +1018,7 @@ def test_non_convergence_records_flag(tmp_path):
             level_g=128,
             level_b=128,
             settle_ms=0,
-            trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+            trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
         ),
         base_region=make_base_region(),
         ffc_cal_dir="",
@@ -1110,7 +1110,7 @@ def test_max_iterations_zero_raises(tmp_path):
                 level_g=128,
                 level_b=128,
                 settle_ms=0,
-                trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+                trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
             ),
             base_region=make_base_region(),
             ffc_cal_dir="",
@@ -1155,7 +1155,7 @@ def test_zero_signal_raises(tmp_path):
                 level_g=128,
                 level_b=128,
                 settle_ms=0,
-                trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+                trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
             ),
             base_region=make_base_region(),
             ffc_cal_dir="",
@@ -1199,7 +1199,7 @@ def test_near_zero_signal_raises(tmp_path):
                 level_g=128,
                 level_b=128,
                 settle_ms=0,
-                trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+                trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
             ),
             base_region=make_base_region(),
             ffc_cal_dir="",
@@ -1235,7 +1235,7 @@ def test_non_convergence_logs_warning(tmp_path, caplog):
                 level_g=128,
                 level_b=128,
                 settle_ms=0,
-                trigger_mode="sdk",  # explicit: dataclass default changed to "manual"
+                trigger_mode="sdk",  # sdk mode (also the dataclass default; no ied_inbox needed)
             ),
             base_region=make_base_region(),
             ffc_cal_dir="",
