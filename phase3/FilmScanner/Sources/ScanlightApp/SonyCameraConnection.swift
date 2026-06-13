@@ -198,20 +198,39 @@ final class SonyCameraConnection: ObservableObject {
             }
         }
 
-        let resolved = orchestratorClient.settingsWithResolvedSonyIP(store.settings)
-        if !resolved.usesSonyUSB, resolved.sonyIpAddress != store.settings.sonyIpAddress {
-            store.settings.sonyIpAddress = resolved.sonyIpAddress
-        }
-
-        let signature = Signature(store.settings)
-        NSLog("Scanlight Sony Check Camera started for %@", Self.connectionLabel(for: signature))
+        let signatureBefore = Signature(store.settings)
+        NSLog("Scanlight Sony Check Camera started for %@", Self.connectionLabel(for: signatureBefore))
         let result = await Self.runProbeWithTimeout(
             settings: store.settings,
             orchestratorClient: orchestratorClient,
             timeout: checkTimeout
         )
         guard checkGeneration == generation else { return false }
+
+        // Persist the address that actually connected. Auto-discovery (the
+        // try-saved-IP → search → reconnect path) may have found the camera at a
+        // new IP/MAC — e.g. after a DHCP lease change — so save it for next time.
+        if result.success {
+            // Transport first: auto-discovery may have found the camera on USB
+            // when the saved transport was Wi-Fi, so adopt USB going forward.
+            if let transport = result.resolvedTransport, !transport.isEmpty,
+               transport != store.settings.sonyTransportMode {
+                store.settings.sonyTransport = transport
+            }
+            if let ip = result.resolvedIP, !ip.isEmpty,
+               ip != Self.clean(store.settings.sonyIpAddress) {
+                store.settings.sonyIpAddress = ip
+            }
+            if let mac = result.resolvedMAC, !mac.isEmpty,
+               mac != Self.clean(store.settings.sonyMacAddress) {
+                store.settings.sonyMacAddress = mac
+            }
+        }
+
         let checkedAt = Date()
+        // Signature AFTER persisting the discovered address, so a successful
+        // auto-discovery isn't immediately reported as "stale" on the next update.
+        let signature = Signature(store.settings)
         lastSignature = signature
         lastResult = result
         lastResultAt = checkedAt
@@ -236,10 +255,10 @@ final class SonyCameraConnection: ObservableObject {
 
     private static func missingFields(in settings: ScanSettings) -> [String] {
         var missing: [String] = []
-        if !settings.usesSonyUSB && clean(settings.sonyIpAddress).isEmpty {
-            missing.append("Sony IP")
-        }
-        // Access Auth is a Wi-Fi requirement; the USB path connects without it.
+        // Sony IP is NOT required: Check Camera auto-discovers the camera on the
+        // LAN (SDK enumeration) and resolves IP from MAC via ARP when it isn't
+        // saved or has gone stale. Access Auth IS required for Wi-Fi — those are
+        // secrets set on the camera that the SDK can't read back. USB needs neither.
         if !settings.usesSonyUSB {
             if clean(settings.sonyUser).isEmpty {
                 missing.append("Access Auth user")

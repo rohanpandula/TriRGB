@@ -1551,4 +1551,181 @@ final class OrchestratorClientTests: XCTestCase {
         XCTAssertNil(state.waitingForChannel,
                      "waitingForChannel should be nil when JSON value is null")
     }
+
+    // MARK: - Sony auto-discovery (try saved IP → search the LAN → reconnect)
+
+    private func makeSdkSonySettings(
+        ip: String? = nil, mac: String? = nil, transport: String = "wifi"
+    ) -> ScanSettings {
+        ScanSettings(
+            rollName: "Roll001",
+            outputFolder: "/tmp/scans",
+            triggerMode: "sdk",
+            iedInbox: nil,
+            sonyTransport: transport,
+            sonyIpAddress: ip,
+            sonyMacAddress: mac,
+            sonyUser: "user",
+            sonyPassword: "pw",
+            streamComposite: false,
+            ffcCalibration: nil,
+            cameraModel: nil,
+            compositeFormat: "dng",
+            levelR: 200, levelG: 200, levelB: 200, settleMs: 50
+        )
+    }
+
+    func testParseDiscoveredCamerasHandlesJSONWithLogNoise() {
+        let output = """
+        2026-06-13 SDK log line on stdout before the array
+        [{"index":0,"model":"ILCE-7CR","name":"ILCE-7CR","connection":"IP","adapter":"","ip":"10.0.0.247","mac":"10:32:2c:26:1a:3f","ssh":true}]
+        trailing noise
+        """
+        let cams = OrchestratorClient.parseDiscoveredCameras(from: output)
+        XCTAssertEqual(cams.count, 1)
+        XCTAssertEqual(cams.first?.model, "ILCE-7CR")
+        XCTAssertEqual(cams.first?.ip, "10.0.0.247")
+        XCTAssertEqual(cams.first?.mac, "10:32:2c:26:1a:3f")
+        XCTAssertTrue(cams.first?.isNetwork ?? false)
+    }
+
+    func testParseDiscoveredCamerasEmptyOrGarbageReturnsEmpty() {
+        XCTAssertTrue(OrchestratorClient.parseDiscoveredCameras(from: "[]").isEmpty)
+        XCTAssertTrue(OrchestratorClient.parseDiscoveredCameras(from: "no cameras found").isEmpty)
+        XCTAssertTrue(OrchestratorClient.parseDiscoveredCameras(from: "").isEmpty)
+        XCTAssertTrue(OrchestratorClient.parseDiscoveredCameras(from: "[not json").isEmpty)
+    }
+
+    func testPickSonyCameraPrefersMACThenNetwork() {
+        let a = DiscoveredSonyCamera(connection: "IP", ip: "10.0.0.10", mac: "AA:BB:CC:DD:EE:01")
+        let b = DiscoveredSonyCamera(connection: "IP", ip: "10.0.0.20", mac: "AA:BB:CC:DD:EE:02")
+        // MAC match wins (and MAC formatting is normalized).
+        XCTAssertEqual(
+            OrchestratorClient.pickSonyCamera([a, b], preferMAC: "aa-bb-cc-dd-ee-02")?.ip, "10.0.0.20")
+        // No preference → first network camera with an IP.
+        XCTAssertEqual(
+            OrchestratorClient.pickSonyCamera([a, b], preferMAC: nil)?.ip, "10.0.0.10")
+        XCTAssertNil(OrchestratorClient.pickSonyCamera([], preferMAC: "AA:BB:CC:DD:EE:01"))
+    }
+
+    func testResolveConnectionPrefersUSBOverWiFiWhenCablePluggedIn() async {
+        let recorder = ProbeRecorder()
+        let s = makeSdkSonySettings(ip: "10.0.0.244", mac: "AA:BB:CC:DD:EE:01")  // Wi-Fi configured
+        let usb = DiscoveredSonyCamera(model: "ILCE-7CR", connection: "USB", ip: "", mac: "")
+        let result = await OrchestratorClient.resolveConnection(
+            settings: s,
+            resolveIP: { $0 },
+            probe: { probeSettings in
+                recorder.append(probeSettings.usesSonyUSB ? "USB" : (probeSettings.sonyIpAddress ?? ""))
+                return SonyConnectionProbeResult(success: probeSettings.usesSonyUSB, message: "connected")
+            },
+            discover: { [usb] }
+        )
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.resolvedTransport, "usb")
+        XCTAssertEqual(recorder.ips, ["USB"], "USB is tried first; the stale Wi-Fi IP is never probed")
+        XCTAssertTrue(result.message.contains("USB"))
+    }
+
+    func testResolveConnectionUsesDiscoveredNetworkIPWhenNoUSB() async {
+        let recorder = ProbeRecorder()
+        let s = makeSdkSonySettings(ip: "10.0.0.99", mac: "AA:BB:CC:DD:EE:01")  // stale saved IP
+        let net = DiscoveredSonyCamera(connection: "IP", ip: "10.0.0.247", mac: "AA:BB:CC:DD:EE:01")
+        let result = await OrchestratorClient.resolveConnection(
+            settings: s,
+            resolveIP: { $0 },
+            probe: { probeSettings in
+                let ip = probeSettings.sonyIpAddress ?? ""
+                recorder.append(ip)
+                return SonyConnectionProbeResult(success: ip == "10.0.0.247",
+                                                 message: ip == "10.0.0.247" ? "connected" : "unreachable")
+            },
+            discover: { [net] }
+        )
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.resolvedIP, "10.0.0.247")
+        XCTAssertEqual(recorder.ips.first, "10.0.0.247", "the discovered network IP is tried before the stale saved IP")
+        XCTAssertTrue(result.message.contains("Found camera at 10.0.0.247"))
+    }
+
+    func testResolveConnectionFallsBackToSavedIPWhenEnumerationEmpty() async {
+        let recorder = ProbeRecorder()
+        let s = makeSdkSonySettings(ip: "10.0.0.244", mac: "AA:BB:CC:DD:EE:01")
+        let result = await OrchestratorClient.resolveConnection(
+            settings: s,
+            resolveIP: { $0 },
+            probe: { probeSettings in
+                let ip = probeSettings.sonyIpAddress ?? ""
+                recorder.append(ip)
+                return SonyConnectionProbeResult(success: ip == "10.0.0.244", message: "connected")
+            },
+            discover: { [] }   // SSDP enumeration found nothing
+        )
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.resolvedIP, "10.0.0.244")
+        XCTAssertEqual(recorder.ips, ["10.0.0.244"])
+    }
+
+    func testResolveConnectionExplicitUSBConnectsDirectlyNoSearch() async {
+        let s = makeSdkSonySettings(transport: "usb")
+        let result = await OrchestratorClient.resolveConnection(
+            settings: s,
+            resolveIP: { $0 },
+            probe: { probeSettings in
+                XCTAssertTrue(probeSettings.usesSonyUSB)
+                return SonyConnectionProbeResult(success: true, message: "connected")
+            },
+            discover: {
+                XCTFail("explicit USB transport must not enumerate the LAN")
+                return []
+            }
+        )
+        XCTAssertTrue(result.success)
+    }
+
+    func testResolveConnectionFallsThroughToWiFiWhenUSBConnectFails() async {
+        let recorder = ProbeRecorder()
+        let s = makeSdkSonySettings(ip: "10.0.0.99", mac: "AA:BB:CC:DD:EE:01")
+        let usb = DiscoveredSonyCamera(model: "ILCE-7CR", connection: "USB", ip: "", mac: "")
+        let net = DiscoveredSonyCamera(connection: "IP", ip: "10.0.0.247", mac: "AA:BB:CC:DD:EE:01")
+        let result = await OrchestratorClient.resolveConnection(
+            settings: s,
+            resolveIP: { $0 },
+            probe: { probeSettings in
+                if probeSettings.usesSonyUSB {
+                    recorder.append("USB")
+                    return SonyConnectionProbeResult(success: false, message: "usb busy")
+                }
+                let ip = probeSettings.sonyIpAddress ?? ""
+                recorder.append(ip)
+                return SonyConnectionProbeResult(success: ip == "10.0.0.247",
+                                                 message: ip == "10.0.0.247" ? "connected" : "unreachable")
+            },
+            discover: { [usb, net] }
+        )
+        XCTAssertTrue(result.success)
+        XCTAssertEqual(result.resolvedIP, "10.0.0.247")
+        XCTAssertEqual(recorder.ips, ["USB", "10.0.0.247"], "tried USB first, then fell through to the discovered network IP")
+    }
+
+    func testResolveConnectionFailsWhenNothingConnects() async {
+        let s = makeSdkSonySettings(ip: "10.0.0.99", mac: "AA:BB:CC:DD:EE:01")
+        let result = await OrchestratorClient.resolveConnection(
+            settings: s,
+            resolveIP: { $0 },
+            probe: { _ in SonyConnectionProbeResult(success: false, message: "unreachable") },
+            discover: { [] }
+        )
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.message, "unreachable")
+    }
+}
+
+/// Thread-safe recorder for capturing probe-call order from the injected async
+/// closures in the auto-discovery tests.
+private final class ProbeRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+    var ips: [String] { lock.lock(); defer { lock.unlock() }; return storage }
+    func append(_ value: String) { lock.lock(); storage.append(value); lock.unlock() }
 }
