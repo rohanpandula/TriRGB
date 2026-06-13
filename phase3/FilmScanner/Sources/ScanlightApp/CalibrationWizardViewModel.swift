@@ -143,7 +143,12 @@ final class CalibrationWizardViewModel: ObservableObject {
             }
         }
 
-        if coordinator.phase == .idle {
+        // Start (or switch into) calibration from idle OR from an active scan —
+        // ScanCoordinator.startCalibration handles the scan→calibration transition
+        // (reuse/restart of the backend), symmetric with the wired calibrate→scan
+        // "Switch to Scan". A mid-capture switch is refused inside startCalibration
+        // and surfaced via coordinator.lastError below.
+        if coordinator.phase == .idle || coordinator.phase == .scanning {
             rigCheckProgressText = "Starting calibration backend."
             await coordinator.startCalibration(settings: store.settings)
         }

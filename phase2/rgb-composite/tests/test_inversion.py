@@ -17,11 +17,31 @@ import pytest
 
 from c41_core import BaseRegionDescriptor, InversionParams, make_c41_negative
 from rgb_composite.composite import (
+    _frame_base_rgb,
     aggregate_positive_density_bounds,
     auto_positive_from_composite,
     invert_composite,
     positive_density_bounds_from_composite,
 )
+
+
+def test_frame_base_rgb_honors_dmin_percentile():
+    """codex#13: dmin_percentile must actually change the measured d-min base —
+    it was accepted/reported by auto_positive_from_composite but _frame_base_rgb
+    hardcoded the default constant, so the parameter was a silent no-op."""
+    h, w = 64, 64
+    ramp = np.linspace(1000.0, 12000.0, h * w).reshape(h, w)
+    triplet = np.stack([ramp, ramp, ramp], axis=-1).astype(np.uint16)
+    desc = BaseRegionDescriptor(
+        x=0, y=0, w=w, h=h,
+        base_rgb=(5000.0, 5000.0, 5000.0),
+        uniformity_cv=0.0, source="manual",
+    )
+    base_low = _frame_base_rgb(triplet, desc, dmin_percentile=20.0)
+    base_high = _frame_base_rgb(triplet, desc, dmin_percentile=98.0)
+    assert base_high[0] > base_low[0] + 100.0, (
+        f"dmin_percentile must change the base: p20={base_low[0]}, p98={base_high[0]}"
+    )
 
 
 # ---------------------------------------------------------------------------

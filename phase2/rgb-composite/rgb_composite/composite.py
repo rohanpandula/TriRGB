@@ -279,6 +279,8 @@ def _analysis_sample(
 def _frame_base_rgb(
     triplet: np.ndarray,
     descriptor: BaseRegionDescriptor,
+    *,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
 ) -> tuple[float, float, float]:
     """Measure d-min color from the selected box in this specific frame.
 
@@ -299,7 +301,7 @@ def _frame_base_rgb(
     if patch.size == 0:
         return tuple(float(v) for v in descriptor.base_rgb)
 
-    base = tuple(float(v) for v in np.percentile(patch, DEFAULT_POSITIVE_DMIN_PERCENTILE, axis=0))
+    base = tuple(float(v) for v in np.percentile(patch, dmin_percentile, axis=0))
     if any(v < _MIN_BASE_CHANNEL for v in base):
         return tuple(float(v) for v in descriptor.base_rgb)
     return base
@@ -362,6 +364,7 @@ def _resolve_positive_base_rgb(
     whole_frame_base_percentile: float,
     auto_base_cv_threshold: float,
     analysis_crop_fraction: float,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
 ) -> tuple[tuple[float, float, float], str]:
     # "auto" falls back to the whole-frame proxy only when the rebate patch is
     # non-uniform AND the base was not hand-picked. Manual boxes are trusted.
@@ -379,7 +382,7 @@ def _resolve_positive_base_rgb(
             ),
             "whole_frame",
         )
-    return _frame_base_rgb(triplet, descriptor), "patch"
+    return _frame_base_rgb(triplet, descriptor, dmin_percentile=dmin_percentile), "patch"
 
 
 def _density_from_composite(
@@ -465,6 +468,7 @@ def _prepare_density(
     whole_frame_base_percentile: float,
     auto_base_cv_threshold: float,
     analysis_crop_fraction: float,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
 ) -> tuple[np.ndarray, tuple[float, float, float], str, str]:
     """Shared density-pass helper for bounds and positive rendering (S1).
 
@@ -482,6 +486,7 @@ def _prepare_density(
         whole_frame_base_percentile=whole_frame_base_percentile,
         auto_base_cv_threshold=auto_base_cv_threshold,
         analysis_crop_fraction=analysis_crop_fraction,
+        dmin_percentile=dmin_percentile,
     )
     density = _density_from_composite(triplet, frame_base_rgb)
     return density, frame_base_rgb, base_source, mode
@@ -497,6 +502,7 @@ def positive_density_bounds_from_composite(
     base_mode: str = "patch",
     whole_frame_base_percentile: float = DEFAULT_WHOLE_FRAME_BASE_PERCENTILE,
     auto_base_cv_threshold: float = DEFAULT_AUTO_BASE_CV_THRESHOLD,
+    dmin_percentile: float = DEFAULT_POSITIVE_DMIN_PERCENTILE,
 ) -> DensityBounds:
     """Compute per-channel density display bounds for one composite frame."""
     density, _frame_base_rgb, _base_source, _mode = _prepare_density(
@@ -506,6 +512,7 @@ def positive_density_bounds_from_composite(
         whole_frame_base_percentile=whole_frame_base_percentile,
         auto_base_cv_threshold=auto_base_cv_threshold,
         analysis_crop_fraction=analysis_crop_fraction,
+        dmin_percentile=dmin_percentile,
     )
     return _density_bounds_from_density(
         density,
@@ -605,6 +612,7 @@ def auto_positive_from_composite(
         whole_frame_base_percentile=whole_frame_base_percentile,
         auto_base_cv_threshold=auto_base_cv_threshold,
         analysis_crop_fraction=analysis_crop_fraction,
+        dmin_percentile=dmin_percentile,
     )
 
     if bounds_override is None:
