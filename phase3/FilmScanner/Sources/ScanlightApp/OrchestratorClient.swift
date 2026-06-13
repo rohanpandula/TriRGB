@@ -184,11 +184,13 @@ extension ScanSettings {
 struct SonyConnectionProbeResult: Equatable {
     var success: Bool
     var message: String
-    /// The IP/MAC that actually connected — set when auto-discovery found the
-    /// camera at a different address than the saved one, so the caller can
-    /// persist it. nil when nothing changed.
+    /// The IP/MAC/transport that actually connected — set when auto-discovery
+    /// found the camera at a different address (or on a different transport, e.g.
+    /// USB instead of Wi-Fi) than saved, so the caller can persist it. nil when
+    /// nothing changed.
     var resolvedIP: String? = nil
     var resolvedMAC: String? = nil
+    var resolvedTransport: String? = nil
 }
 
 /// One camera surfaced by `sony-capture --list --json` (the SDK's USB + network
@@ -662,15 +664,21 @@ final class OrchestratorClient: ObservableObject {
         let cameras = await discover()
         guard let cam = pickSonyCamera(cameras, preferMAC: settings.sonyMacAddress),
               !cam.ip.isEmpty, cam.ip != triedIP else {
-            // No usable network camera. If one is plugged in over USB, the Wi-Fi
-            // path can't use it — point the operator at USB transport instead.
+            // No usable network camera. If one is plugged in over USB, just use
+            // it — auto-switch to USB transport and connect (USB needs no IP or
+            // Access Auth). This is the point of "auto-find": connect wherever the
+            // camera actually is, not just report the Wi-Fi address unreachable.
             if cameras.contains(where: { !$0.isNetwork }) {
-                return SonyConnectionProbeResult(
-                    success: false,
-                    message: "A Sony camera was found on USB, but the trigger transport is set to Wi-Fi. Switch the Sony transport to USB to use it (no IP or Access Auth needed)."
-                )
+                var usbSettings = settings
+                usbSettings.sonyTransport = "usb"
+                var usbResult = await probe(usbSettings)
+                if usbResult.success {
+                    usbResult.resolvedTransport = "usb"
+                    usbResult.message = "Connected over USB (camera wasn't on Wi-Fi). \(usbResult.message)"
+                    return usbResult
+                }
             }
-            return first   // nothing found — keep the original failure
+            return first   // nothing usable found — keep the original failure
         }
 
         var retrySettings = settings

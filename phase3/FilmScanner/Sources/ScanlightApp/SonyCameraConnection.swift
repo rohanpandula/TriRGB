@@ -211,6 +211,12 @@ final class SonyCameraConnection: ObservableObject {
         // try-saved-IP → search → reconnect path) may have found the camera at a
         // new IP/MAC — e.g. after a DHCP lease change — so save it for next time.
         if result.success {
+            // Transport first: auto-discovery may have found the camera on USB
+            // when the saved transport was Wi-Fi, so adopt USB going forward.
+            if let transport = result.resolvedTransport, !transport.isEmpty,
+               transport != store.settings.sonyTransportMode {
+                store.settings.sonyTransport = transport
+            }
             if let ip = result.resolvedIP, !ip.isEmpty,
                ip != Self.clean(store.settings.sonyIpAddress) {
                 store.settings.sonyIpAddress = ip

@@ -1673,18 +1673,36 @@ final class OrchestratorClientTests: XCTestCase {
         XCTAssertEqual(result.message, "unreachable", "keeps the original failure when search is empty")
     }
 
-    func testResolveConnectionHintsUSBWhenWiFiSearchFindsUSBOnly() async {
+    func testResolveConnectionAutoConnectsUSBWhenWiFiSearchFindsUSBOnly() async {
         let s = makeSdkSonySettings(ip: "10.0.0.99", mac: "AA:BB:CC:DD:EE:01")  // Wi-Fi mode
         let usbOnly = DiscoveredSonyCamera(model: "ILCE-7CR", connection: "USB", ip: "", mac: "")
         let result = await OrchestratorClient.resolveConnection(
             settings: s,
             resolveIP: { $0 },
-            probe: { _ in SonyConnectionProbeResult(success: false, message: "unreachable") },
+            probe: { probeSettings in
+                // Wi-Fi IP probe fails; the auto USB retry (transport switched) connects.
+                probeSettings.usesSonyUSB
+                    ? SonyConnectionProbeResult(success: true, message: "connected")
+                    : SonyConnectionProbeResult(success: false, message: "unreachable")
+            },
+            discover: { [usbOnly] }
+        )
+        XCTAssertTrue(result.success, "should auto-connect over USB when the camera is on a USB cable")
+        XCTAssertEqual(result.resolvedTransport, "usb")
+        XCTAssertTrue(result.message.contains("USB"))
+    }
+
+    func testResolveConnectionKeepsOriginalErrorWhenUSBAutoConnectAlsoFails() async {
+        let s = makeSdkSonySettings(ip: "10.0.0.99", mac: "AA:BB:CC:DD:EE:01")
+        let usbOnly = DiscoveredSonyCamera(model: "ILCE-7CR", connection: "USB", ip: "", mac: "")
+        let result = await OrchestratorClient.resolveConnection(
+            settings: s,
+            resolveIP: { $0 },
+            probe: { _ in SonyConnectionProbeResult(success: false, message: "unreachable") },  // both fail
             discover: { [usbOnly] }
         )
         XCTAssertFalse(result.success)
-        XCTAssertTrue(result.message.contains("USB"),
-                      "should hint to switch to USB when the camera is found on a USB cable")
+        XCTAssertEqual(result.message, "unreachable")
     }
 }
 
