@@ -520,6 +520,10 @@ struct SonyLiveViewPanel: View {
                         liveViewProcess = nil
                         liveViewTask = nil
                         isLiveViewActive = false
+                        // Live view turned the preview white light on; the
+                        // process is gone, so turn it back off here too — manual
+                        // stop isn't the only way out (idempotent: no-op if off).
+                        turnOffPreviewWhiteLightIfNeeded()
                     }
                     if !sawFrame {
                         liveViewState = .failed(stderr.isEmpty
@@ -541,6 +545,9 @@ struct SonyLiveViewPanel: View {
                         liveViewProcess = nil
                         liveViewTask = nil
                         isLiveViewActive = false
+                        // Same cleanup as the exit path / manual stop: don't
+                        // strand the preview white light when we time out.
+                        turnOffPreviewWhiteLightIfNeeded()
                     }
                     liveViewState = .failed("Timed out opening Sony live view after 45 seconds. Check camera power, SDK remote mode, and whether another Sony app is connected.")
                 }

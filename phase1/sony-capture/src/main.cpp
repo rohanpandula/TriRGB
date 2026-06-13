@@ -765,17 +765,28 @@ bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
     const auto rc_up = SDK::SendCommand(
         handle, SDK::CrCommandId_Release, SDK::CrCommandParam_Up);
 
-    if (post_release_ms > 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(post_release_ms));
-    s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
-    auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
-
+    // The exposure is physically complete the instant Release-Up is sent: the
+    // sensor has the frame and the LED is no longer needed. On success, emit the
+    // exposure-complete marker HERE — before the post-release dead-time and the
+    // S1 unlock — so the caller's LED-off hook fires ~post_release_ms sooner
+    // (1000ms per channel by default). Previously this marker waited until the
+    // whole function returned, keeping the LED lit through that dead-time.
     if (CR_FAILED(rc_down) || CR_FAILED(rc_up)) {
         const auto first_err = CR_FAILED(rc_down) ? rc_down : rc_up;
         log_err("SendCommand(Release) failed (CrError "
                 + std::to_string(static_cast<unsigned>(first_err)) + ")");
+        // Best-effort S1 unlock so a failed shutter doesn't strand the body in a
+        // locked state.
+        s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+        SDK::SetDeviceProperty(handle, &s1);
         return false;
     }
+    std::cerr << kExposureCompleteMarker << std::endl;
+
+    if (post_release_ms > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(post_release_ms));
+    s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+    auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
     if (CR_FAILED(s1_unlock_err)) {
         log_err("SetDeviceProperty(S1 unlocked) failed (CrError "
                 + std::to_string(static_cast<unsigned>(s1_unlock_err)) + ")");
@@ -2150,11 +2161,12 @@ int main(int argc, char** argv) {
         }
 
         // Trigger the shutter using the same S1-lock + Release sequence SonShell
-        // uses for Access Auth bodies.
+        // uses for Access Auth bodies. trigger_full_shutter_press now emits the
+        // exposure-complete marker itself, the moment Release-Up succeeds —
+        // before its post-release dead-time — so the LED-off hook fires sooner.
         if (!trigger_full_shutter_press(handle, s1_settle_ms, post_release_ms)) {
             return false;
         }
-        std::cerr << kExposureCompleteMarker << std::endl;
 
         std::string downloaded_filename;
         if (!cb.wait_downloaded(std::chrono::seconds(timeout_s), downloaded_filename)) {

@@ -130,6 +130,9 @@ def app_and_orch(settings):
     application = create_app(orch)
     application.config["DEMOSAIC_FACTORY"] = make_calibration_demosaic
     application.config["FLAT_DEMOSAIC_FN"] = make_flat_demosaic()
+    # Skip the real warmup so the route tests don't sleep 2s/5s each. Production
+    # keeps the time.sleep default (see create_app).
+    application.config["CAL_WARMUP_SLEEP"] = _zero_sleep
     return application, orch
 
 
@@ -662,6 +665,7 @@ def test_calibrate_route_failclosed_500(settings, tmp_path):
     orch = Orchestrator(light, settings, sony_capture_runner=failing_runner, sleep=_zero_sleep)
     app = create_app(orch)
     app.config["DEMOSAIC_FACTORY"] = make_calibration_demosaic
+    app.config["CAL_WARMUP_SLEEP"] = _zero_sleep
     client = app.test_client()
 
     r = client.post("/api/calibrate/exposure", json={})

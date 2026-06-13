@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,12 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     app.config["LAST_CAL_RESULT"] = None
     app.config["LAST_CAL_CALL_ID"] = None
     app.config["CURRENT_CAL_CALL_ID"] = None
+    # Warmup sleep for calibration routes. Production uses real time.sleep so the
+    # LED/sensor actually stabilizes before measuring (calibrate_exposure's 2s,
+    # capture_flats' 5s). Tests override this with a no-op so the suite stays
+    # fast — the routes must NOT hard-code the no-op (that skips the warmup in
+    # production and calibrates against an unstable LED).
+    app.config["CAL_WARMUP_SLEEP"] = time.sleep
 
     @app.get("/")
     def index():
@@ -309,7 +316,7 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                     orch.settings,
                     base_region,
                     orchestrator=orch,
-                    sleep=lambda _: None,
+                    sleep=app.config["CAL_WARMUP_SLEEP"],
                     demosaic_factory=demosaic_factory,
                     seed_recipe=seed_recipe,
                     call_id=call_id,
@@ -456,7 +463,7 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                     orch.settings,
                     black_levels,
                     n_frames=n_frames,
-                    sleep=lambda _: None,
+                    sleep=app.config["CAL_WARMUP_SLEEP"],
                     # Reuse the MAIN orchestrator's runner (orch._runner), not
                     # orch._explicit_runner (None in production). In SDK mode that
                     # runner owns the live `sony-capture --persist` session, so
