@@ -157,11 +157,14 @@ struct SessionView: View {
             issues.append("IED inbox is missing for this trigger mode.")
         }
         if store.settings.triggerMode == "sdk" {
-            if !store.settings.usesSonyUSB, (store.settings.sonyIpAddress ?? "").isEmpty {
-                issues.append("Sony camera IP is missing.")
-            }
-            if (store.settings.sonyUser ?? "").isEmpty || (store.settings.sonyPassword ?? "").isEmpty {
-                issues.append("Sony credentials are missing.")
+            // USB connects without IP / Access Auth; only require them for Wi-Fi.
+            if !store.settings.usesSonyUSB {
+                if (store.settings.sonyIpAddress ?? "").isEmpty {
+                    issues.append("Sony camera IP is missing.")
+                }
+                if (store.settings.sonyUser ?? "").isEmpty || (store.settings.sonyPassword ?? "").isEmpty {
+                    issues.append("Sony credentials are missing.")
+                }
             }
         }
         return issues
@@ -280,7 +283,9 @@ struct SessionView: View {
 
     private var triggerReady: Bool {
         if store.settings.triggerMode == "sdk" {
-            return (store.settings.usesSonyUSB || !(store.settings.sonyIpAddress ?? "").isEmpty)
+            // USB is ready without IP / Access Auth; Wi-Fi needs IP + creds.
+            if store.settings.usesSonyUSB { return true }
+            return !(store.settings.sonyIpAddress ?? "").isEmpty
                 && !(store.settings.sonyUser ?? "").isEmpty
                 && !(store.settings.sonyPassword ?? "").isEmpty
         }

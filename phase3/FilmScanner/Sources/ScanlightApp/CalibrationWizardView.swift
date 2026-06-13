@@ -445,8 +445,10 @@ private struct Step1RigCheckView: View {
     }
 
     private var sonyCredentialsSaved: Bool {
-        (store.settings.usesSonyUSB
-            || !(store.settings.sonyIpAddress ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        // USB connects without IP / Access Auth — it's "ready" on its own.
+        // Wi-Fi still needs an IP plus Access Auth user + password.
+        if store.settings.usesSonyUSB { return true }
+        return !(store.settings.sonyIpAddress ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !(store.settings.sonyUser ?? "").isEmpty
             && !(store.settings.sonyPassword ?? "").isEmpty
     }

@@ -239,11 +239,14 @@ final class SonyCameraConnection: ObservableObject {
         if !settings.usesSonyUSB && clean(settings.sonyIpAddress).isEmpty {
             missing.append("Sony IP")
         }
-        if clean(settings.sonyUser).isEmpty {
-            missing.append("Access Auth user")
-        }
-        if clean(settings.sonyPassword).isEmpty {
-            missing.append("Access Auth password")
+        // Access Auth is a Wi-Fi requirement; the USB path connects without it.
+        if !settings.usesSonyUSB {
+            if clean(settings.sonyUser).isEmpty {
+                missing.append("Access Auth user")
+            }
+            if clean(settings.sonyPassword).isEmpty {
+                missing.append("Access Auth password")
+            }
         }
         return missing
     }

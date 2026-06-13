@@ -132,6 +132,7 @@ def capture_flats(
     first_channels: list[Optional[np.ndarray]] = [None, None, None]  # for CV(single)
 
     flats_dir = Path(tempfile.mkdtemp(prefix="trirgb_flats_"))
+    orch: Optional[Orchestrator] = None
     try:
         # 2. Construct one Orchestrator reusing the existing IED-backed path,
         #    pointed at the isolated flats dir. Pass sleep through (noop in tests).
@@ -184,7 +185,12 @@ def capture_flats(
             frame_hwx3 = np.stack(frame_channels, axis=-1)   # HxWx3 uint16
             frames.append(frame_hwx3)
     finally:
-        # Intermediate flat ARWs are no longer needed (demosaiced into `frames`).
+        # Close any persistent sony-capture session this Orchestrator opened
+        # (sdk_persistent default + no injected runner) so a direct library
+        # caller can't leak the --persist child / camera session. No-op when the
+        # caller injected a runner (it owns the session). Then drop the temp ARWs.
+        if orch is not None:
+            orch.close()
         shutil.rmtree(flats_dir, ignore_errors=True)
 
     # 5. Stack all frames into the flat_stack primary output: NxHxWx3 uint16.

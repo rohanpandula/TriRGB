@@ -283,6 +283,21 @@ void print_usage() {
         "  -h, --help         Show this message.\n";
 }
 
+// Strict non-negative integer parse. std::atoi silently returns 0 for
+// non-numeric input ("abc" -> 0), which would mask a typo'd timing flag by
+// quietly removing the intended delay. Rejects empty / non-numeric / trailing
+// junk / out-of-range and returns false instead.
+static bool parse_nonneg_int(const char* s, int& out) {
+    if (s == nullptr || *s == '\0') return false;
+    errno = 0;
+    char* end = nullptr;
+    long val = std::strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') return false;
+    if (val < 0 || val > std::numeric_limits<int>::max()) return false;
+    out = static_cast<int>(val);
+    return true;
+}
+
 bool parse_args(int argc, char** argv, Args& a) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -345,12 +360,16 @@ bool parse_args(int argc, char** argv, Args& a) {
             return false;
         } else if (arg == "--s1-settle-ms") {
             if (i + 1 >= argc) { log_err("--s1-settle-ms requires a value"); return false; }
-            a.s1_settle_ms = std::atoi(argv[++i]);
-            if (a.s1_settle_ms < 0) { log_err("--s1-settle-ms must be >= 0"); return false; }
+            if (!parse_nonneg_int(argv[++i], a.s1_settle_ms)) {
+                log_err("--s1-settle-ms must be a non-negative integer (milliseconds)");
+                return false;
+            }
         } else if (arg == "--post-release-ms") {
             if (i + 1 >= argc) { log_err("--post-release-ms requires a value"); return false; }
-            a.post_release_ms = std::atoi(argv[++i]);
-            if (a.post_release_ms < 0) { log_err("--post-release-ms must be >= 0"); return false; }
+            if (!parse_nonneg_int(argv[++i], a.post_release_ms)) {
+                log_err("--post-release-ms must be a non-negative integer (milliseconds)");
+                return false;
+            }
         } else if (arg == "--persist") {
             a.persist = true;
         } else if (arg == "--list" || arg == "--list-cameras") {

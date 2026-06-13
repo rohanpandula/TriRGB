@@ -164,6 +164,38 @@ def test_capture_flats_does_not_pollute_roll_output_folder(settings):
         assert not Path(out_path).exists(), f"intermediate flat ARW not cleaned up: {out_path}"
 
 
+def test_capture_flats_closes_its_orchestrator(settings, monkeypatch):
+    """codex#3: capture_flats builds its own Orchestrator; it must close() it so
+    a direct caller (default sdk_persistent=True) can't leak the persistent
+    sony-capture session / camera connection."""
+    import sys
+    # The package re-exports the capture_flats *function*, shadowing the
+    # submodule name, so fetch the real module object from sys.modules.
+    cf_mod = sys.modules["triplet_capture.capture_flats"]
+
+    closed = {"n": 0}
+    Base = cf_mod.Orchestrator
+
+    class _TrackingOrch(Base):  # type: ignore[valid-type, misc]
+        def close(self):
+            closed["n"] += 1
+            super().close()
+
+    monkeypatch.setattr(cf_mod, "Orchestrator", _TrackingOrch)
+
+    runner, _ = make_runner()
+    capture_flats(
+        scanlight=FakeScanlight(),
+        settings=settings,
+        black_levels=_make_black_levels(),
+        n_frames=1,
+        sony_capture_runner=runner,
+        sleep=lambda _: None,
+        demosaic_fn=fake_demosaic,
+    )
+    assert closed["n"] == 1, "capture_flats must close its Orchestrator exactly once"
+
+
 def test_capture_flats_drives_loop_n_times(settings):
     """The Orchestrator runner is invoked n_frames * 3 times (R/G/B per frame).
 

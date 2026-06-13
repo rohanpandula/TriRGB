@@ -592,14 +592,17 @@ struct SonyLiveViewPanel: View {
     }
 
     private func sonyCredentialValidationError() -> String? {
-        if !settings.usesSonyUSB && missing(settings.sonyIpAddress) {
-            return "Enter the Sony IP address first."
-        }
-        if missing(settings.sonyUser) {
-            return "Enter the Sony Access Auth user first."
-        }
-        if missing(settings.sonyPassword) {
-            return "Enter the Sony Access Auth password first."
+        // USB connects without IP / Access Auth; only gate those for Wi-Fi.
+        if !settings.usesSonyUSB {
+            if missing(settings.sonyIpAddress) {
+                return "Enter the Sony IP address first."
+            }
+            if missing(settings.sonyUser) {
+                return "Enter the Sony Access Auth user first."
+            }
+            if missing(settings.sonyPassword) {
+                return "Enter the Sony Access Auth password first."
+            }
         }
         return nil
     }
