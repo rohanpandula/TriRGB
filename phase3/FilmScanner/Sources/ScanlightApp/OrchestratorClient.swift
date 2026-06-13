@@ -628,69 +628,80 @@ final class OrchestratorClient: ObservableObject {
         }
     }
 
-    /// Try the saved/ARP-resolved address first; if that fails on Wi-Fi, search
-    /// the LAN (SDK enumeration) and retry at the discovered address. Pure
-    /// orchestration over injected `probe` and `discover` closures so the
-    /// try → search → reconnect flow is unit-testable without hardware.
+    /// USB-preferred connection resolution. If the user explicitly chose USB,
+    /// connect over USB directly. Otherwise (Wi-Fi-configured) enumerate first
+    /// (the SDK `--list`): if the camera is plugged in over USB, use it — fastest
+    /// pipe, no IP or Access Auth — otherwise connect over Wi-Fi, preferring the
+    /// freshly-discovered network IP and falling back to the saved/ARP-resolved IP.
     ///
-    /// On success the result carries `resolvedIP`/`resolvedMAC` so the caller
-    /// can persist the address that actually worked (handles DHCP IP changes).
+    /// Pure orchestration over injected `probe`/`discover` closures so the whole
+    /// flow is unit-testable without hardware. On success the result carries
+    /// `resolvedIP`/`resolvedMAC`/`resolvedTransport` so the caller can persist
+    /// whatever actually connected (a tethered cable, or a DHCP IP change).
     internal static func resolveConnection(
         settings: ScanSettings,
         resolveIP: (ScanSettings) -> ScanSettings,
         probe: (ScanSettings) async -> SonyConnectionProbeResult,
         discover: () async -> [DiscoveredSonyCamera]
     ) async -> SonyConnectionProbeResult {
-        let resolved = resolveIP(settings)
-        let triedIP = resolved.usesSonyUSB
-            ? ""
-            : (resolved.sonyIpAddress ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // 1. Try the saved / ARP-resolved address (or USB enumeration).
-        var first = await probe(resolved)
-        if first.success {
-            if !resolved.usesSonyUSB {
-                first.resolvedIP = resolved.sonyIpAddress
-                first.resolvedMAC = resolved.sonyMacAddress
-            }
-            return first
+        // Explicit USB transport → connect over USB; the SDK enumerates the body,
+        // so there's no network address to discover.
+        if settings.usesSonyUSB {
+            return await probe(settings)
         }
 
-        // 2. USB has no network address to rediscover — the SDK already
-        //    enumerates the USB body, so a failure here is terminal.
-        if resolved.usesSonyUSB { return first }
-
-        // 3. Wi-Fi: the saved IP is stale (or empty). Search the LAN.
+        // Wi-Fi-configured → USB-PREFERRED. Enumerate up front so a plugged-in
+        // cable wins immediately instead of first wasting ~10s on a stale Wi-Fi
+        // address. "Cable in → USB, cable out → Wi-Fi."
         let cameras = await discover()
-        guard let cam = pickSonyCamera(cameras, preferMAC: settings.sonyMacAddress),
-              !cam.ip.isEmpty, cam.ip != triedIP else {
-            // No usable network camera. If one is plugged in over USB, just use
-            // it — auto-switch to USB transport and connect (USB needs no IP or
-            // Access Auth). This is the point of "auto-find": connect wherever the
-            // camera actually is, not just report the Wi-Fi address unreachable.
-            if cameras.contains(where: { !$0.isNetwork }) {
-                var usbSettings = settings
-                usbSettings.sonyTransport = "usb"
-                var usbResult = await probe(usbSettings)
-                if usbResult.success {
-                    usbResult.resolvedTransport = "usb"
-                    usbResult.message = "Connected over USB (camera wasn't on Wi-Fi). \(usbResult.message)"
-                    return usbResult
-                }
+
+        // 1. Cable plugged in → use USB (no IP, no Access Auth, fastest pipe).
+        if cameras.contains(where: { !$0.isNetwork }) {
+            var usbSettings = settings
+            usbSettings.sonyTransport = "usb"
+            var usbResult = await probe(usbSettings)
+            if usbResult.success {
+                usbResult.resolvedTransport = "usb"
+                usbResult.message = "Connected over USB. \(usbResult.message)"
+                return usbResult
             }
-            return first   // nothing usable found — keep the original failure
+            // USB present but couldn't connect — fall through to Wi-Fi.
         }
 
-        var retrySettings = settings
-        retrySettings.sonyIpAddress = cam.ip
-        if !cam.mac.isEmpty { retrySettings.sonyMacAddress = cam.mac }
-        var retry = await probe(retrySettings)
-        if retry.success {
-            retry.resolvedIP = cam.ip
-            retry.resolvedMAC = cam.mac.isEmpty ? settings.sonyMacAddress : cam.mac
-            retry.message = "Found camera at \(cam.ip). \(retry.message)"
+        // 2. No USB. Wi-Fi: try the freshly-discovered network IP first (current),
+        //    then the saved/ARP-resolved IP (SSDP may have missed a reachable one).
+        let resolved = resolveIP(settings)
+        let savedIP = (resolved.sonyIpAddress ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let network = pickSonyCamera(cameras, preferMAC: settings.sonyMacAddress)
+
+        var candidates: [(ip: String, mac: String?)] = []
+        if let network, !network.ip.isEmpty {
+            candidates.append((network.ip, network.mac.isEmpty ? settings.sonyMacAddress : network.mac))
         }
-        return retry
+        if !savedIP.isEmpty, savedIP != candidates.first?.ip {
+            candidates.append((savedIP, resolved.sonyMacAddress))
+        }
+
+        var lastFailure = SonyConnectionProbeResult(
+            success: false,
+            message: "No Sony camera found. Plug in the USB cable, or put the camera in PC-Remote (Wi-Fi) mode on this network."
+        )
+        for candidate in candidates {
+            var wifiSettings = settings
+            wifiSettings.sonyIpAddress = candidate.ip
+            if let mac = candidate.mac { wifiSettings.sonyMacAddress = mac }
+            var result = await probe(wifiSettings)
+            if result.success {
+                result.resolvedIP = candidate.ip
+                result.resolvedMAC = candidate.mac
+                if candidate.ip != savedIP {
+                    result.message = "Found camera at \(candidate.ip). \(result.message)"
+                }
+                return result
+            }
+            lastFailure = result
+        }
+        return lastFailure
     }
 
     /// Pick the best discovered camera: prefer one whose MAC matches the saved
