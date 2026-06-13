@@ -360,7 +360,16 @@ def render_roll_positives_from_composites(
     # sys.modules). Constants were imported at module load time (see top-level
     # _DEFAULT_* names) so they're never pulled from the possibly-fake module.
     import tifffile
-    import rgb_composite as _rgb
+    # rgb_composite owns the density math; via composite.py it imports rawpy at
+    # module load, so this requires rawpy even though reading composites does not.
+    # Surface a clear message instead of a confusing transitive ImportError.
+    try:
+        import rgb_composite as _rgb
+    except ImportError as exc:
+        raise RuntimeError(
+            "render_roll_positives_from_composites requires the rgb-composite "
+            f"package and its rawpy dependency for the density math ({exc})."
+        ) from exc
     aggregate_positive_density_bounds = _rgb.aggregate_positive_density_bounds
     auto_positive_from_composite = _rgb.auto_positive_from_composite
 

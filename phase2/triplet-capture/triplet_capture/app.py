@@ -55,6 +55,13 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     @app.post("/api/settings")
     def post_settings():
         data = request.get_json(force=True, silent=True) or {}
+        # Claim the activity slot for the (brief) update so it cannot interleave
+        # with a capture or a blocking calibration. Those hold the activity but
+        # release Orchestrator._lock between single-channel captures, so mutating
+        # levels/shutters/output mid-run could corrupt an exposure bisection or
+        # the roll. Same guard the capture/calibrate/preview-light routes use.
+        if not orchestrator.try_begin_activity("update_settings"):
+            return jsonify({"error": "A capture or calibration is in progress — wait for it to finish."}), 409
         try:
             # Whitelist fields so HTTP can't set arbitrary attrs.
             allowed = {
@@ -77,6 +84,8 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             settings = orchestrator.update_settings(**updates)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        finally:
+            orchestrator.end_activity()
         return jsonify(_settings_dict(settings))
 
     @app.post("/api/capture")
@@ -405,7 +414,12 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                     black_levels,
                     n_frames=n_frames,
                     sleep=lambda _: None,
-                    sony_capture_runner=orch._explicit_runner,
+                    # Reuse the MAIN orchestrator's runner (orch._runner), not
+                    # orch._explicit_runner (None in production). In SDK mode that
+                    # runner owns the live `sony-capture --persist` session, so
+                    # capture_flats shares it instead of spawning a SECOND persist
+                    # process that would fight the first for the camera and leak.
+                    sony_capture_runner=orch._runner,
                     demosaic_fn=flat_demosaic_fn,
                 )
 

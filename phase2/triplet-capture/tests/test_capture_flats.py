@@ -132,6 +132,38 @@ def test_capture_flats_returns_flat_field_result(settings):
     assert restored == result
 
 
+def test_capture_flats_does_not_pollute_roll_output_folder(settings):
+    """F2: flat captures must NOT land in the roll's output folder.
+
+    capture_triplet(retake=True) names files {roll}_FrameNNN_{ch}.ARW at the
+    current frame number; writing those into the roll folder would overwrite a
+    real roll frame. They must go to an isolated temp dir that is cleaned up.
+    """
+    runner, calls = make_runner()
+    out_folder = Path(settings.output_folder)
+
+    capture_flats(
+        scanlight=FakeScanlight(),
+        settings=settings,
+        black_levels=_make_black_levels(),
+        n_frames=1,
+        sony_capture_runner=runner,
+        sleep=lambda _: None,
+        demosaic_fn=fake_demosaic,
+    )
+
+    # Nothing leaked into the roll output folder.
+    leaked = sorted(out_folder.glob(f"{settings.roll_name}_*")) + sorted(out_folder.glob("*.ARW"))
+    assert leaked == [], f"flat captures polluted the roll folder: {leaked}"
+
+    # Captures were directed OUTSIDE the roll folder, and the temp dir is gone.
+    assert calls, "runner was never called"
+    for _ch, out_path, _t in calls:
+        assert out_folder not in Path(out_path).parents, \
+            f"flat capture wrote into the roll folder: {out_path}"
+        assert not Path(out_path).exists(), f"intermediate flat ARW not cleaned up: {out_path}"
+
+
 def test_capture_flats_drives_loop_n_times(settings):
     """The Orchestrator runner is invoked n_frames * 3 times (R/G/B per frame).
 

@@ -22,7 +22,10 @@ Design notes
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -118,64 +121,71 @@ def capture_flats(
     # 1. Warmup sleep (noop in tests via injected sleep=lambda _: None)
     sleep(warmup_s)
 
-    # 2. Construct one Orchestrator reusing the existing IED-backed path.
-    #    Pass sleep through so settle delays are also noop in tests.
-    orch = Orchestrator(
-        scanlight,
-        settings,
-        sony_capture_runner=sony_capture_runner,
-        sleep=sleep,
-    )
-
-    # 3. Resolve demosaic: use the injected fn if provided, else lazy-import
-    #    _demosaic_cal_frame.  This ensures rawpy is never pulled in when
-    #    demosaic_fn is set (hardware-free tests never touch rawpy).
-    if demosaic_fn is not None:
-        dem = demosaic_fn
-    else:
-        def dem(path: Path) -> np.ndarray:
-            from rgb_composite.ffc import _demosaic_cal_frame
-            return _demosaic_cal_frame(path)
-
-    # 4. Capture N frames; keep all demosaiced HxWx3 uint16 frames in a list.
-    #    Shapes are known after the first frame; the list is then stacked at
-    #    the end into a single NxHxWx3 array (the primary output).
-    #    Also accumulate per-channel float64 sums for the CV metric and
-    #    keep the first frame per channel for the CV(single) baseline.
+    # Capture flats into an ISOLATED temp directory, NOT the roll's output
+    # folder. capture_triplet(retake=True) names files {roll}_FrameNNN_{ch}.ARW
+    # at the CURRENT frame number; writing those into the roll folder would
+    # overwrite/leave junk in a real roll frame (flats are blank-light, not roll
+    # frames). The ARWs are intermediate — demosaiced into `frames` in memory —
+    # so the temp dir is removed afterward.
     frames: list[np.ndarray] = []                              # HxWx3 uint16, len = N
     sums: list[Optional[np.ndarray]] = [None, None, None]     # per channel float64 sum
     first_channels: list[Optional[np.ndarray]] = [None, None, None]  # for CV(single)
 
-    for i in range(n_frames):
-        # retake=True so the frame counter does not advance — flat frames
-        # are not part of the roll sequence.
-        result = orch.capture_triplet(retake=True)
-        if not result.success:
-            raise RuntimeError(f"flat capture {i} failed: {result.error}")
+    flats_dir = Path(tempfile.mkdtemp(prefix="trirgb_flats_"))
+    try:
+        # 2. Construct one Orchestrator reusing the existing IED-backed path,
+        #    pointed at the isolated flats dir. Pass sleep through (noop in tests).
+        orch = Orchestrator(
+            scanlight,
+            replace(settings, output_folder=flats_dir),
+            sony_capture_runner=sony_capture_runner,
+            sleep=sleep,
+        )
 
-        # Accumulate the full HxWx3 frame for the flat_stack primary output.
-        # Demosaic each channel file; note all three channels of a given frame
-        # are demosaiced from separate R/G/B exposures, so we collect them into
-        # one HxWx3 array aligned to the canonical channel order.
-        frame_channels: list[np.ndarray] = []
-        for ch_idx, ch in enumerate("RGB"):
-            img = dem(result.files[ch])             # HxWx3 uint16
-            channel_hw = img[..., ch_idx]           # HxW uint16 — matching channel
-            frame_channels.append(channel_hw)
+        # 3. Resolve demosaic: use the injected fn if provided, else lazy-import
+        #    _demosaic_cal_frame.  This ensures rawpy is never pulled in when
+        #    demosaic_fn is set (hardware-free tests never touch rawpy).
+        if demosaic_fn is not None:
+            dem = demosaic_fn
+        else:
+            def dem(path: Path) -> np.ndarray:
+                from rgb_composite.ffc import _demosaic_cal_frame
+                return _demosaic_cal_frame(path)
 
-            # Accumulate for the CV metric (float64 for accuracy)
-            channel_f64 = channel_hw.astype(np.float64)
-            if sums[ch_idx] is None:
-                sums[ch_idx] = channel_f64.copy()
-                first_channels[ch_idx] = channel_hw.copy()
-            else:
-                sums[ch_idx] += channel_f64  # type: ignore[operator]
+        # 4. Capture N frames; keep all demosaiced HxWx3 uint16 frames in a list.
+        for i in range(n_frames):
+            # retake=True so the frame counter does not advance — flat frames
+            # are not part of the roll sequence.
+            result = orch.capture_triplet(retake=True)
+            if not result.success:
+                raise RuntimeError(f"flat capture {i} failed: {result.error}")
 
-        # Reconstruct an HxWx3 uint16 frame from the three matching channels.
-        # Each ch_idx slot holds the radiometrically-correct channel from its
-        # respective narrow-band exposure (R-lit→ch0, G-lit→ch1, B-lit→ch2).
-        frame_hwx3 = np.stack(frame_channels, axis=-1)   # HxWx3 uint16
-        frames.append(frame_hwx3)
+            # Accumulate the full HxWx3 frame for the flat_stack primary output.
+            # Demosaic each channel file; note all three channels of a given frame
+            # are demosaiced from separate R/G/B exposures, so we collect them into
+            # one HxWx3 array aligned to the canonical channel order.
+            frame_channels: list[np.ndarray] = []
+            for ch_idx, ch in enumerate("RGB"):
+                img = dem(result.files[ch])             # HxWx3 uint16
+                channel_hw = img[..., ch_idx]           # HxW uint16 — matching channel
+                frame_channels.append(channel_hw)
+
+                # Accumulate for the CV metric (float64 for accuracy)
+                channel_f64 = channel_hw.astype(np.float64)
+                if sums[ch_idx] is None:
+                    sums[ch_idx] = channel_f64.copy()
+                    first_channels[ch_idx] = channel_hw.copy()
+                else:
+                    sums[ch_idx] += channel_f64  # type: ignore[operator]
+
+            # Reconstruct an HxWx3 uint16 frame from the three matching channels.
+            # Each ch_idx slot holds the radiometrically-correct channel from its
+            # respective narrow-band exposure (R-lit→ch0, G-lit→ch1, B-lit→ch2).
+            frame_hwx3 = np.stack(frame_channels, axis=-1)   # HxWx3 uint16
+            frames.append(frame_hwx3)
+    finally:
+        # Intermediate flat ARWs are no longer needed (demosaiced into `frames`).
+        shutil.rmtree(flats_dir, ignore_errors=True)
 
     # 5. Stack all frames into the flat_stack primary output: NxHxWx3 uint16.
     flat_stack = np.stack(frames, axis=0)    # (N, H, W, 3)

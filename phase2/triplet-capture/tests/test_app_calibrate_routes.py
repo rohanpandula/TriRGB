@@ -520,6 +520,27 @@ def test_calibrate_route_locked_returns_409(app_and_orch):
         orch.end_activity()
 
 
+def test_settings_post_rejected_while_activity_held(app_and_orch):
+    """F1: /api/settings must not mutate levels/output/shutters while a capture
+    or calibration owns the rig (they release _lock between channel captures, so
+    a mid-run mutation could corrupt an exposure bisection). It claims the same
+    activity slot and 409s while one is held; works once released."""
+    app, orch = app_and_orch
+    client = app.test_client()
+
+    assert orch.try_begin_activity("calibrate_exposure"), "could not claim slot for setup"
+    try:
+        r = client.post("/api/settings", json={"level_r": 111})
+        assert r.status_code == 409, f"expected 409 while activity held, got {r.status_code}: {r.data}"
+        assert orch.settings.level_r != 111, "settings must not change while rejected"
+    finally:
+        orch.end_activity()
+
+    r2 = client.post("/api/settings", json={"level_r": 111})
+    assert r2.status_code == 200, f"expected 200 after release, got {r2.status_code}: {r2.data}"
+    assert orch.settings.level_r == 111
+
+
 def test_preview_light_rejected_while_activity_held(app_and_orch):
     """HIGH#2 (Codex): preview-light must not re-colour the Scanlight while a
     capture or calibration owns the rig — those activities release _lock
