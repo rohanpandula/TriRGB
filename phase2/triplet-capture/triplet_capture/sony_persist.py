@@ -335,15 +335,15 @@ class PersistentSonyCapture:
                         "sony-capture persistent process exited %d mid-capture",
                         proc.returncode,
                     )
-                    if not is_retry:
-                        self._cleanup_proc()
-                        rc = self._spawn()
-                        if rc != 0:
-                            return rc
-                        return self._do_capture(
-                            out_path, timeout_s=timeout_s, is_retry=True,
-                            shutter=shutter,
-                        )
+                    # Do NOT respawn-retry here. The capture command was already
+                    # sent, so the shutter may have fired and the orchestrator may
+                    # have turned the Scanlight OFF on the exposure-complete marker
+                    # (emitted on stderr BEFORE CAPTURE_OK). A blind retry would
+                    # then capture this channel with the light already off — a dark
+                    # frame that still passes the RAW size check. Fail cleanly so
+                    # the orchestrator aborts the triplet and the operator retakes
+                    # with full LED control. (codex#11)
+                    self._cleanup_proc()
                     return 1
                 continue
 

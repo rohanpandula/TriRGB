@@ -985,6 +985,55 @@ for line in sys.stdin:
 """
 
 
+# Fake that dies AFTER receiving the capture command but BEFORE CAPTURE_OK —
+# i.e. the shutter "fired" (marker would have been emitted, LED turned off).
+_FAKE_PERSIST_DIES_MID_CAPTURE = """#!/usr/bin/env python3
+import sys
+cpath = None
+for i, a in enumerate(sys.argv):
+    if a == "--count":
+        cpath = sys.argv[i + 1]
+n = 0
+try:
+    n = int(open(cpath).read() or "0")
+except Exception:
+    n = 0
+open(cpath, "w").write(str(n + 1))
+print("READY", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if line == "quit":
+        break
+    if line.startswith("shutter "):
+        print("SHUTTER_OK %s" % line[len("shutter "):], flush=True)
+    elif line.startswith("capture "):
+        sys.exit(1)   # die mid-capture (after the command, before CAPTURE_OK)
+"""
+
+
+def test_persistent_capture_mid_capture_death_does_not_retry(tmp_path):
+    # codex#11: a death AFTER the capture command (shutter may have fired, LED
+    # turned off on the marker) must NOT respawn-retry — a blind retry would
+    # capture a dark frame. It must fail cleanly and spawn exactly once.
+    import os
+    from triplet_capture.sony_persist import PersistentSonyCapture
+
+    script = tmp_path / "fake_mid_death.py"
+    script.write_text(_FAKE_PERSIST_DIES_MID_CAPTURE)
+    script.chmod(0o755)
+    counter = tmp_path / "spawns.txt"
+
+    p = PersistentSonyCapture(
+        str(script), ["--count", str(counter)], env=dict(os.environ), ready_timeout_s=5,
+    )
+    try:
+        rc = p.capture(tmp_path / "R.ARW", timeout_s=5, shutter="1/100")
+        assert rc != 0, "mid-capture death must fail, not silently succeed"
+    finally:
+        p.close()
+    assert int(counter.read_text()) == 1, "mid-capture death must NOT respawn-retry"
+
+
 def test_persistent_capture_respawns_when_process_dies_during_shutter(tmp_path):
     import os
     from triplet_capture.sony_persist import PersistentSonyCapture

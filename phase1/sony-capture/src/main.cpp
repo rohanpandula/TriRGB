@@ -1892,15 +1892,13 @@ int main(int argc, char** argv) {
             if (!load_binary_file(fingerprint_cache_path, cached_fingerprint_blob, read_error)) {
                 log_err(read_error);
                 if (enum_info) enum_info->Release();
-                cleanup();
-                return 1;
+                return fail_persist("fingerprint-cache-read-failed");
             }
         } else if (fp_ec) {
             log_err("could not stat fingerprint cache " + fingerprint_cache_path.string()
                     + ": " + fp_ec.message());
             if (enum_info) enum_info->Release();
-            cleanup();
-            return 1;
+            return fail_persist("fingerprint-cache-stat-failed");
         }
     }
 
@@ -1912,8 +1910,7 @@ int main(int argc, char** argv) {
             if (fp_len > sizeof(fp_buffer)) {
                 log_err("SDK::GetFingerprint returned an unexpectedly large fingerprint");
                 if (enum_info) enum_info->Release();
-                cleanup();
-                return 1;
+                return fail_persist("fingerprint-too-large");
             }
             fingerprint_blob.assign(fp_buffer, fp_buffer + fp_len);
             fingerprint_source = "SDK::GetFingerprint";
@@ -1933,8 +1930,7 @@ int main(int argc, char** argv) {
     if (fingerprint_blob.size() > std::numeric_limits<CrInt32u>::max()) {
         log_err("fingerprint cache is too large: " + fingerprint_cache_path.string());
         if (enum_info) enum_info->Release();
-        cleanup();
-        return 1;
+        return fail_persist("fingerprint-cache-too-large");
     }
 
     // Sony's USB sample passes non-null empty strings for password and
