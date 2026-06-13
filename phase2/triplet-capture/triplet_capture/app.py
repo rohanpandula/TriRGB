@@ -311,6 +311,10 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                 n_frames = int(data.get("n_frames", 8))
             except (ValueError, TypeError):
                 return jsonify({"error": "n_frames must be an integer"}), 400
+            if n_frames < 1:
+                # capture_flats() raises ValueError for n_frames < 1; reject it
+                # here as a client error (400), not an unhandled 500.
+                return jsonify({"error": "n_frames must be >= 1"}), 400
 
             # Get black levels from last calibration or defaults
             last_cal = app.config.get("LAST_CAL_RESULT", None)

@@ -477,6 +477,16 @@ def test_calibrate_ffc_out_of_range_level_returns_400(app_and_orch):
     assert "error" in r.get_json()
 
 
+def test_calibrate_ffc_n_frames_below_one_returns_400(app_and_orch):
+    """codex#6: n_frames < 1 (valid int, but capture_flats raises ValueError)
+    must be a 400 client error, not an unhandled 500."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    r = client.post("/api/calibrate/ffc", json={"n_frames": 0})
+    assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.data}"
+    assert "error" in r.get_json()
+
+
 def test_calibrate_ffc_n_frames_bad_input_returns_400(app_and_orch):
     """FIX-D: non-integer n_frames must return 400, not 500."""
     app, _ = app_and_orch

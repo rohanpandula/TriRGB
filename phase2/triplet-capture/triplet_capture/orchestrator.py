@@ -304,10 +304,28 @@ class Orchestrator:
             return self._manual_runner
         # sdk mode. The persistent runner applies each channel's shutter per
         # capture via the persist `shutter <speed>` command, so per-channel
-        # differing shutters (the narrowband-RGB norm) are fully supported.
-        if self._settings.sdk_persistent:
+        # DIFFERING shutters (the narrowband-RGB norm) are fully supported.
+        # The ONE case persist can't represent is a MIX of explicit shutters and
+        # None: None means "use the camera's own shutter", but once another
+        # channel changed the shutter mid-session there's no reset-to-default
+        # command, so the None channel would inherit the prior channel's shutter.
+        # Fall back to the one-shot runner only for that mix (each fresh process
+        # simply omits --shutter-speed → camera default). All-None and all-set
+        # (even all-different) keep the persistent session. (NOT the rejected
+        # uniform-shutter gate — differing explicit shutters still use persist.)
+        if self._settings.sdk_persistent and not self._channel_shutters_mixed():
             return self._persistent_runner
         return self._default_runner
+
+    def _channel_shutters_mixed(self) -> bool:
+        """True when the three channel shutters mix explicit value(s) with None.
+
+        (Empty string is treated as None.) All-None and all-set return False.
+        """
+        vals = (self._settings.shutter_r, self._settings.shutter_g, self._settings.shutter_b)
+        has_none = any(v is None or v == "" for v in vals)
+        has_set = any(v is not None and v != "" for v in vals)
+        return has_none and has_set
 
     def close(self) -> None:
         """Close any persistent session.  Call on orchestrator shutdown."""
@@ -404,6 +422,12 @@ class Orchestrator:
             if kwargs.keys() & _PERSIST_AFFECTING_KEYS:
                 self._close_persistent_session()
                 # Re-pick runner in case sdk_persistent toggled.
+                if self._explicit_runner is None:
+                    self._runner = self._pick_runner()
+            elif kwargs.keys() & {"shutter_r", "shutter_g", "shutter_b"}:
+                # A shutter change can flip the mixed-None status (persist↔one-shot
+                # eligibility) — re-pick the runner WITHOUT rebuilding the session
+                # (shutter is per-capture, not baked into the spawn args).
                 if self._explicit_runner is None:
                     self._runner = self._pick_runner()
             return self._settings

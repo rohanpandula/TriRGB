@@ -778,6 +778,31 @@ def test_sdk_persistent_used_with_per_channel_shutter(tmp_path):
     assert orch._runner.__func__ is Orchestrator._persistent_runner
 
 
+def test_mixed_none_shutters_fall_back_to_oneshot(tmp_path):
+    # codex#6: a MIX of explicit and None shutters can't be honored by the
+    # persist session (None can't reset to the camera default after another
+    # channel changed it mid-session) → one-shot runner. All-set (even differing)
+    # and all-None keep the persistent session.
+    light = FakeScanlight()
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        shutter_r="1/100", shutter_g=None, shutter_b="1/4",
+    )
+    orch = Orchestrator(light, s)
+    assert orch._channel_shutters_mixed() is True
+    assert orch._runner.__func__ is Orchestrator._default_runner
+
+    # Fill the gap → all-set (differing) → persist again (re-picked on change).
+    orch.update_settings(shutter_g="1/200")
+    assert orch._channel_shutters_mixed() is False
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
+
+    # Clear all → all-None → persist (camera default for every channel).
+    orch.update_settings(shutter_r=None, shutter_g=None, shutter_b=None)
+    assert orch._channel_shutters_mixed() is False
+    assert orch._runner.__func__ is Orchestrator._persistent_runner
+
+
 def test_persistent_session_extras_have_no_startup_shutter(tmp_path, monkeypatch):
     # Shutter is per-capture now, NOT a startup arg — the session spawn must not
     # carry --shutter-speed (that would pin all channels to one shutter).
