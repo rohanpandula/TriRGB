@@ -136,7 +136,7 @@ struct OrchestratorState: Codable {
 
 /// Sent to start() for CLI args and to updateSettings() as POST /api/settings body.
 /// Snake-case encoding via .convertToSnakeCase.
-struct ScanSettings: Codable {
+struct ScanSettings: Codable, Equatable {
     var rollName: String
     var outputFolder: String      // BASE folder for CLI spawn; full path for POST
     var scanlightPort: String? = nil

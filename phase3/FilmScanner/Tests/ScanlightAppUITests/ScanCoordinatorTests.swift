@@ -101,8 +101,12 @@ final class FakeOrchestratorClient: OrchestratorClientProtocol {
         enabled: false, pending: nil, results: nil
     )
 
+    /// The settings passed to the most recent start() — lets tests assert that
+    /// a restart actually carried the changed settings to the backend.
+    private(set) var lastStartSettings: ScanSettings?
     func start(settings: ScanSettings) async throws {
         callLog.append("start")
+        lastStartSettings = settings
         if let err = startError { throw err }
         isRunning = true
         isRunningSubject.send(true)
@@ -459,9 +463,39 @@ final class ScanCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .scanning)
         XCTAssertEqual(lightPanel.portOwner, .scanning)
         XCTAssertEqual(client.callLog, clientLogAfterCalibrationStart,
-                       "Switching calibration → scan should reuse the running backend, not start another one")
+                       "Switching calibration → scan with UNCHANGED settings should reuse the running backend")
         XCTAssertEqual(lightPanel.callLog, lightLogAfterCalibrationStart,
                        "Switching calibration → scan should not disconnect/reconnect the light")
+    }
+
+    /// High-severity regression: when scan settings / stock profile changed since
+    /// calibration, the fast path must NOT silently reuse the calibration backend
+    /// (stale LED levels/shutters, and `positiveProfileJSON` is spawn-only so a
+    /// reuse omits auto-positive output). It must restart with the new settings.
+    func testSwitchFromCalibrationToScanRestartsBackendWhenSettingsChanged() async throws {
+        let (coordinator, client, lightPanel) = makeCoordinator()
+
+        await coordinator.startCalibration(settings: makeScanSettings())
+        let clientLogAfterCalibration = client.callLog        // ["start"]
+        let lightLogAfterCalibration = lightPanel.callLog
+
+        // Operator selects a stock profile / different exposure before scanning.
+        var scanSettings = makeScanSettings()
+        scanSettings.positiveProfileJSON = "{\"look\":\"filmic\"}"
+        scanSettings.levelR = 123
+        await coordinator.startScan(settings: scanSettings)
+
+        XCTAssertEqual(coordinator.phase, .scanning)
+        XCTAssertEqual(lightPanel.portOwner, .scanning)
+        // Backend restarted: stop + start appended.
+        XCTAssertEqual(client.callLog, clientLogAfterCalibration + ["stop", "start"],
+                       "changed settings must restart the backend, not reuse it")
+        // The light is NOT flapped (it was already disconnected for calibration).
+        XCTAssertEqual(lightPanel.callLog, lightLogAfterCalibration,
+                       "restart must not disconnect/reconnect the light panel")
+        // The restart carried the new settings, including the spawn-only profile.
+        XCTAssertEqual(client.lastStartSettings?.positiveProfileJSON, "{\"look\":\"filmic\"}")
+        XCTAssertEqual(client.lastStartSettings?.levelR, 123)
     }
 
     func testSwitchFromScanToCalibrationReusesRunningBackend() async throws {

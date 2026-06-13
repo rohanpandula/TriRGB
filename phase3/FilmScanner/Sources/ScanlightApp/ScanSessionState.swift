@@ -193,6 +193,13 @@ final class ScanCoordinator: ObservableObject {
     /// the captureFrame HTTP call is blocked waiting for the operator (F1).
     private var channelPromptTask: Task<Void, Never>?
 
+    /// The settings the running backend was last started with (port-normalized).
+    /// Used by the calibration→scan fast path to decide whether the backend can
+    /// be reused as-is or must be restarted to pick up changed scan settings /
+    /// stock profile (`positiveProfileJSON` is spawn-only, so a stale reuse would
+    /// silently scan with the wrong exposure recipe or omit auto-positive output).
+    private var backendSettings: ScanSettings?
+
     // MARK: - Init
 
     /// Production init: pass the concrete OrchestratorClient and ScanlightViewModel.
@@ -247,6 +254,10 @@ final class ScanCoordinator: ObservableObject {
     /// On failure at step 2, reconnect the light panel before re-throwing.
     func startScan(settings: ScanSettings) async {
         if phase == .calibrating, !transitionInFlight, client.isRunning {
+            guard !captureInFlight else {
+                lastError = "Cannot start scan: capture in progress"
+                return
+            }
             transitionInFlight = true
             defer { transitionInFlight = false }
             lastError = ""
@@ -254,7 +265,37 @@ final class ScanCoordinator: ObservableObject {
             frameStatuses = []
             compositePending = 0
             nextFrameNumber = 1
+
+            let wanted = settings.withScanlightPort(lightPanel.scanlightPort)
+            // Reuse the running backend ONLY when it was started with exactly
+            // these settings. Otherwise restart it: scan settings / stock profile
+            // may have changed since calibration, and `positiveProfileJSON`,
+            // `ffcCalibration`, `cameraModel` are spawn-only args — a settings
+            // push (POST /api/settings) cannot carry them, so a stale reuse would
+            // scan with the wrong exposure recipe or silently skip auto-positive.
+            if backendSettings == wanted {
+                lightPanel.portOwner = .scanning
+                phase = .scanning
+                startCompositePolling()
+                return
+            }
+
+            // Restart the backend with the scan settings. Keep the port claimed
+            // (.scanning) across the restart so a manual Connect / calibration
+            // can't grab the serial port during the respawn window.
             lightPanel.portOwner = .scanning
+            await client.stop()
+            do {
+                try await client.start(settings: wanted)
+            } catch {
+                backendSettings = nil
+                lightPanel.portOwner = .idle
+                lightPanel.connect()
+                phase = .idle
+                lastError = "Failed to switch to scan: \(error.localizedDescription)"
+                return
+            }
+            backendSettings = wanted
             phase = .scanning
             startCompositePolling()
             return
@@ -287,15 +328,18 @@ final class ScanCoordinator: ObservableObject {
         lightPanel.disconnect()
 
         // Step 2: Spawn the orchestrator (it grabs the serial port).
+        let wanted = settings.withScanlightPort(lightPanel.scanlightPort)
         do {
-            try await client.start(settings: settings.withScanlightPort(lightPanel.scanlightPort))
+            try await client.start(settings: wanted)
         } catch {
             // Orchestrator failed to start — release ownership and reclaim the port.
+            backendSettings = nil
             lightPanel.portOwner = .idle
             lightPanel.connect()
             lastError = "Failed to start scan: \(error.localizedDescription)"
             return
         }
+        backendSettings = wanted
 
         // Step 3: Mark as scanning (portOwner already claimed in Step 1).
         phase = .scanning
@@ -329,6 +373,7 @@ final class ScanCoordinator: ObservableObject {
 
         // Step 3: Unlock the light panel (phase must be .idle before connect()).
         phase = .idle
+        backendSettings = nil
         lightPanel.portOwner = .idle
 
         // Step 4: Reclaim the serial port.
@@ -382,14 +427,17 @@ final class ScanCoordinator: ObservableObject {
         lightPanel.portOwner = .calibrating
         lightPanel.disconnect()
 
+        let wanted = settings.withScanlightPort(lightPanel.scanlightPort)
         do {
-            try await client.start(settings: settings.withScanlightPort(lightPanel.scanlightPort))
+            try await client.start(settings: wanted)
         } catch {
+            backendSettings = nil
             lightPanel.portOwner = .idle
             lightPanel.connect()
             lastError = "Failed to start calibration: \(error.localizedDescription)"
             return
         }
+        backendSettings = wanted
 
         phase = .calibrating
     }
@@ -403,6 +451,7 @@ final class ScanCoordinator: ObservableObject {
         await client.stop()
 
         phase = .idle
+        backendSettings = nil
         lightPanel.portOwner = .idle
         lightPanel.connect()
         if !lightPanel.isConnected {
@@ -473,6 +522,7 @@ final class ScanCoordinator: ObservableObject {
         // The orchestrator has already exited — no need to call client.stop().
         stopCompositePolling()
         phase = .idle
+        backendSettings = nil
         lightPanel.portOwner = .idle
         let noun = crashedPhase == .calibrating ? "calibration" : "scan"
         lastError = "Orchestrator crashed — \(noun) stopped. "
