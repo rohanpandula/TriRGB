@@ -93,8 +93,9 @@ phase2/   Imaging pipeline (Python, hardware-free + testable)
   batch-composite/  Batch compositing of a whole roll
 
 phase3/   Operator GUI
-  FilmScanner/      SwiftUI macOS app — drives the Python backend, hosts the
-                    guided calibration wizard and the scan/review workflow
+  FilmScanner/      SwiftUI macOS app — a workflow sidebar (Set up → Calibrate →
+                    Scan → Develop) over the Python backend, with an always-on
+                    readiness strip and the guided calibration wizard
 
 docs/     PROJECT brief, operator guide, automation contract, AX-ID reference
 scripts/  Calibration capture/inspection and diagnostics helpers
