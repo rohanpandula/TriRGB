@@ -209,7 +209,7 @@ surface and starts this backend; the Flask page remains a fallback.
   4. Set Scanlight G only. Sleep. Capture/wait as `_G.ARW`.
   5. Set Scanlight B only. Sleep. Capture/wait as `_B.ARW`.
   6. Set Scanlight off (or back to W for next-frame framing).
-  7. Verify all three files exist and are within plausible size range (40–120MB each). If not, surface a clear error and DO NOT advance the frame counter.
+  7. Verify all three files exist and are within plausible size range (40–200MB each; upper bound widened from 120MB after a real 121MB uncompressed a7CR capture). If not, surface a clear error and DO NOT advance the frame counter.
   8. On success, advance `frame_number`.
 - Secondary actions:
   - Retake current frame (overwrite `_R/_G/_B`).
@@ -273,11 +273,12 @@ Swift / SwiftUI macOS app. Apple Silicon target.
 
 - The Sony Camera Remote SDK bridge is still CLI-based. The app launches `triplet-capture`, which routes SDK mode through the verified `sony-capture` Wi-Fi path.
 - The Scanlight serial protocol is re-implemented in Swift (it's tiny — six host-to-device packets, simple framing).
-- Current tabs:
-  - **Light:** manual Scanlight serial control and shutter-pulse test surface.
-  - **Settings:** roll/output/trigger/composite/calibration settings. Default trigger is `manual`.
+- Current tabs (shipped names; original plan names in parentheses):
+  - **Session:** roll/session dashboard.
   - **Calibrate:** guided rig check, exposure calibration, FFC capture, and numeric checks.
   - **Scan:** starts/stops the Python orchestrator, captures/retakes frames, and polls composite status.
+  - **Develop:** in-app positive inversion / render-look surface (added in v1.2).
+  - **Set Up** (was **Light** + **Settings**): roll/output/trigger/composite/calibration settings plus manual Scanlight serial control and diagnostics. Default trigger is `manual`.
 - Future live-preview mode:
   - Scanlight set to white channel only (e.g., W=200, RGB=0).
   - A camera live-view bridge delivers frames for a Core Image invert/tone pipeline.

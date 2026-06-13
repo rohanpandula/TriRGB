@@ -155,10 +155,12 @@ Run these top to bottom. Each step verifies an assumption before the next one ru
 ### Step 0 — Choose camera path
 
 For production scanning today, start with IED manual capture unless you
-are deliberately testing the now-verified `sony-capture` CLI path. If
-testing SDK capture, use the default host-PC mode; do not use
-`--remote-transfer` on the a7CR unless you are specifically investigating
-the contents-list `36101` failure.
+are deliberately testing the now-verified `sony-capture` CLI path. SDK
+capture uses the default host-PC download mode. (The old `--remote-transfer`
+path — broken on the a7CR with contents-list error `36101` — was removed in
+the 2026-06-12 efficiency pass; the references to it below are historical.
+For roll-length SDK scanning, `sony-capture --persist` now holds one session
+open across all frames instead of reconnecting per capture.)
 
 ### Step 1 — Plug in only the Scanlight first
 

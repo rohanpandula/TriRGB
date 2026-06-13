@@ -106,8 +106,11 @@ triplet-capture \
   --roll-name Roll001 \
   --output-folder /Volumes/SSD/Scans \
   --trigger-mode manual \
-  --ied-inbox /Volumes/SSD/_ied_inbox
-# Opens web UI at http://127.0.0.1:8765
+  --ied-inbox /Volumes/SSD/_ied_inbox \
+  --inbox-stable-for-s 1.5          # lower than the 3.0 default for fast 5GHz Wi-Fi
+# Serves the fallback web UI at http://127.0.0.1:8765 (the --web-port default).
+# The Swift app instead launches with `--web-port 0 --port-file <path>` and reads
+# the bound port back from that file — see "triplet-capture HTTP API" below.
 
 # Hardware-pulse mode (IED tether + Scanlight 3.5mm shutter pulse):
 triplet-capture \
@@ -217,6 +220,58 @@ Full `selftest` example:
 ```json
 {"command":"selftest","ok":true,"pass_count":8,"step_count":8,"steps":[{"message":"fw=1 hw=1","name":"fw_version_request","ok":true},{"message":"(255,200,180)","name":"default_rgb_request","ok":true},...]}
 ```
+
+#### triplet-capture HTTP API (the machine contract the Swift app drives)
+
+`triplet-capture` serves a Flask app. The SwiftUI app spawns it as a child
+process and drives it entirely over HTTP; the browser page at `GET /` is a
+fallback UI.
+
+**Port discovery (do not hardcode 8765).** The CLI default is `--web-port
+8765`, but the Swift app launches it with `--web-port 0` (ephemeral) and reads
+the actual bound port back from the file named by `--port-file`. External
+automation should do the same: pass `--web-port 0 --port-file /tmp/tc.port`,
+wait for the file, and read the port from it. The literal `8765` is only valid
+when you launched the daemon yourself with that explicit port.
+
+**Routes** (all JSON; bodies are `application/json` unless noted):
+
+| Method | Path | Purpose | Notable response keys |
+|---|---|---|---|
+| GET | `/` | Fallback browser UI (HTML) | — |
+| GET | `/api/state` | Current settings + live status | `waiting_for_channel`, `ready_nonce`, all settings fields |
+| POST | `/api/settings` | Update settings (partial dict) | echoes updated settings |
+| POST | `/api/capture` | Run one triplet; `?retake=true` to overwrite | `TripletOutcome` (files, sizes, frame number) |
+| GET | `/api/composite-status` | Poll streaming-composite worker | per-frame composite job states |
+| GET | `/api/calibrate/progress` | Poll long calibration progress | recent scan-log events |
+| GET | `/api/calibrate/exposure-result` | Last exposure-calibration result | `CalibrationResult` JSON |
+| POST | `/api/calibrate/preview-light` | Light a channel for framing | `ok` |
+| POST | `/api/calibrate/exposure` | Run exposure auto-calibration (blocking) | `CalibrationResult` |
+| POST | `/api/calibrate/ffc` | Capture flat-field reference (blocking) | FFC result |
+| POST | `/api/calibrate/checks` | Run numeric self-consistency checks (blocking) | checks result |
+
+**`waiting_for_channel`** (top-level key on `GET /api/state`): `"R"`, `"G"`,
+`"B"`, or `null`. Non-null only during a capture, while the orchestrator is
+waiting for that channel's frame. In `manual`/`hw` mode this is the operator's
+cue to fire the IED for that channel; the Swift Scan tab renders it as a
+banner. `null` when idle or between channels.
+
+**Single-activity guard (409).** Captures and the three blocking calibrate
+routes (`exposure`, `ffc`, `checks`) are mutually exclusive: while one holds the
+activity, the others return **HTTP 409** with `{"error": "..."}`. This closes
+the camera/serial interleave hazard — do not retry on 409, wait for the current
+activity to finish (poll `/api/state` / `/api/calibrate/progress`).
+
+**Capture-relevant settings** (set via `POST /api/settings`, reported on
+`GET /api/state`, also CLI flags on `triplet-capture`):
+
+| Setting / flag | Default | Meaning |
+|---|---|---|
+| `trigger_mode` / `--trigger-mode` | `manual` | `manual` \| `hw` \| `sdk` |
+| `settle_ms` / `--settle-ms` | 50 | LED-settle wait before each channel |
+| `sony_capture_timeout_s` / `--capture-timeout-s` | 30 | Per-channel capture/inbox wait cap |
+| `inbox_stable_for_s` / `--inbox-stable-for-s` | 3.0 | Size-stable window before accepting an inbox RAW (lower for fast Wi-Fi) |
+| `sdk_persistent` | true | In `sdk` mode, reuse one `sony-capture --persist` session across the whole roll instead of spawning per channel |
 
 #### Python CLI exit codes (structured, not JSON)
 
