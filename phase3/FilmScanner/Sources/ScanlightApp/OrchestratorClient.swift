@@ -128,6 +128,10 @@ struct OrchestratorState: Codable {
     var shutterR: String? = nil
     var shutterG: String? = nil
     var shutterB: String? = nil
+    /// Set by the Python backend when a manual/hw triplet is in progress and the
+    /// operator must fire the IED for the named channel. Null/absent when idle.
+    /// Values: "R" | "G" | "B" | nil
+    var waitingForChannel: String? = nil
 }
 
 /// Sent to start() for CLI args and to updateSettings() as POST /api/settings body.
@@ -138,6 +142,7 @@ struct ScanSettings: Codable {
     var scanlightPort: String? = nil
     var triggerMode: String       // "manual" | "hw" | "sdk"
     var iedInbox: String?
+    var sonyTransport: String? = nil // "wifi" | "usb"; nil preserves existing Wi-Fi settings
     var sonyIpAddress: String? = nil
     var sonyMacAddress: String? = nil
     var sonyUser: String? = nil
@@ -156,6 +161,23 @@ struct ScanSettings: Codable {
     var shutterR: String? = nil
     var shutterG: String? = nil
     var shutterB: String? = nil
+}
+
+extension ScanSettings {
+    var sonyTransportMode: String {
+        let raw = (sonyTransport ?? "wifi")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return raw == "usb" ? "usb" : "wifi"
+    }
+
+    var usesSonyUSB: Bool {
+        sonyTransportMode == "usb"
+    }
+
+    var sonyTransportDisplayName: String {
+        usesSonyUSB ? "USB" : "Wi-Fi"
+    }
 }
 
 /// Result from a non-shooting Sony SDK connection probe.
@@ -328,6 +350,18 @@ final class OrchestratorClient: ObservableObject {
     private var process: Process?
     private let session: URLSession
     private static let calibrationRequestTimeout: TimeInterval = 30 * 60
+    /// Worst-case timeout for a manual/hw triplet capture: 3 channels ×
+    /// `backendPerChannelTimeoutS` each + 15s margin. The backend caps each
+    /// channel's wait at `sony_capture_timeout_s` (which subsumes settle +
+    /// inbox-stability), and the Swift settings model exposes no override, so
+    /// this constant is a true upper bound rather than an estimate. In manual/hw
+    /// mode the operator fires the IED three times, so the HTTP round-trip can
+    /// legitimately exceed the URLSession default (60s).
+    /// NOTE: `backendPerChannelTimeoutS` MUST track the Python default
+    /// `CaptureSettings.sony_capture_timeout_s`; if that default changes, change
+    /// this too (there is no settings-time handshake that carries it across).
+    private static let backendPerChannelTimeoutS: TimeInterval = 30
+    private static let captureRequestTimeout: TimeInterval = backendPerChannelTimeoutS * 3 + 15
     internal var sonyConnectionProbeOverride: ((ScanSettings) async -> SonyConnectionProbeResult)?
     internal static var sonyARPTableProvider: () -> String = {
         let proc = Process()
@@ -430,35 +464,69 @@ final class OrchestratorClient: ObservableObject {
                 settings: settingsWithResolvedSonyIP(settings),
                 timeoutSeconds: 10
             )
-            let result = try await Self.runSonyProbeProcess(
-                executableURL: command.executableURL,
-                arguments: command.arguments,
-                timeout: 15
+            let maxAttempts = 3
+            var lastFailure = SonyConnectionProbeResult(
+                success: false,
+                message: "Sony connection check did not run."
             )
 
-            if result.timedOut {
-                return SonyConnectionProbeResult(
-                    success: false,
-                    message: "Timed out connecting to the Sony camera."
+            for attempt in 1...maxAttempts {
+                let result = try await Self.runSonyProbeProcess(
+                    executableURL: command.executableURL,
+                    arguments: command.arguments,
+                    environment: command.environment,
+                    timeout: 15
                 )
-            }
 
-            let output = Self.conciseProcessOutput(stdout: result.stdout, stderr: result.stderr)
-            if result.exitCode == 0 {
-                let message = output.lowercased() == "connected"
-                    ? "Connected to Sony camera."
-                    : output
-                return SonyConnectionProbeResult(
-                    success: true,
-                    message: message.isEmpty ? "Connected to Sony camera." : message
-                )
+                if result.timedOut {
+                    lastFailure = SonyConnectionProbeResult(
+                        success: false,
+                        message: "Timed out connecting to the Sony camera."
+                    )
+                } else {
+                    let output = Self.conciseProcessOutput(stdout: result.stdout, stderr: result.stderr)
+                    if result.exitCode == 0 {
+                        let message = output.lowercased() == "connected"
+                            ? "Connected to Sony camera."
+                            : output
+                        return SonyConnectionProbeResult(
+                            success: true,
+                            message: message.isEmpty ? "Connected to Sony camera." : message
+                        )
+                    }
+
+                    lastFailure = SonyConnectionProbeResult(
+                        success: false,
+                        message: output.isEmpty
+                            ? "Sony connection failed (exit \(result.exitCode))."
+                            : "Sony connection failed (exit \(result.exitCode)): \(output)"
+                    )
+                }
+
+                if attempt < maxAttempts, Self.isTransientSonyConnectionFailure(lastFailure.message) {
+                    // Bug 8: Use a cancellation-propagating sleep so stop() returns
+                    // promptly instead of being delayed by the full retry interval.
+                    // If cancelled, exit the loop and return the last failure.
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(attempt) * 750_000_000)
+                    } catch {
+                        break  // Task cancelled — surface last failure immediately
+                    }
+                    continue
+                }
+
+                if attempt > 1, Self.isTransientSonyConnectionFailure(lastFailure.message) {
+                    return SonyConnectionProbeResult(
+                        success: false,
+                        message: "\(lastFailure.message) Retried \(attempt) times. If this keeps happening, leave only one active 10.0.0.x network interface enabled while checking the camera."
+                    )
+                }
+                return lastFailure
             }
 
             return SonyConnectionProbeResult(
                 success: false,
-                message: output.isEmpty
-                    ? "Sony connection failed (exit \(result.exitCode))."
-                    : "Sony connection failed (exit \(result.exitCode)): \(output)"
+                message: "\(lastFailure.message) Retried \(maxAttempts) times. If this keeps happening, leave only one active 10.0.0.x network interface enabled while checking the camera."
             )
         } catch PythonToolLocatorError.toolNotFound(let message) {
             return SonyConnectionProbeResult(success: false, message: message)
@@ -468,6 +536,28 @@ final class OrchestratorClient: ObservableObject {
                 message: "Could not run sony-capture: \(error.localizedDescription)"
             )
         }
+    }
+
+    private static func isTransientSonyConnectionFailure(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        return normalized.contains("no route to host")
+            || normalized.contains("network is unreachable")
+            || normalized.contains("host is down")
+            || normalized.contains("operation timed out")
+            || normalized.contains("timed out connecting")
+            || normalized.contains("connection timed out")
+    }
+
+    private static func sonyCaptureEnvironment(for settings: ScanSettings) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        if let user = settings.sonyUser, !user.isEmpty {
+            environment["SONY_USERNAME"] = user
+            environment["SONY_USER"] = user
+        }
+        if let password = settings.sonyPassword, !password.isEmpty {
+            environment["SONY_PW"] = password
+        }
+        return environment
     }
 
     /// Pull one Sony SDK live-view JPEG frame without firing the shutter.
@@ -491,6 +581,7 @@ final class OrchestratorClient: ObservableObject {
             let result = try await Self.runSonyProbeProcess(
                 executableURL: command.executableURL,
                 arguments: command.arguments,
+                environment: command.environment,
                 timeout: processTimeoutSeconds
             )
 
@@ -733,7 +824,56 @@ final class OrchestratorClient: ObservableObject {
                 try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
                 if !proc.isRunning { break }
             }
+            // Bug 3: The Python finally-block (scanlight.off()) never runs when the
+            // child is SIGKILLed — the firmware thermal protection is known-broken,
+            // so the LED would stay lit indefinitely. Fire a best-effort, non-blocking
+            // `scanlightctl off` to turn the light off from the Swift side.
+            // Swallow all errors: this is fire-and-forget insurance, not a hard requirement.
+            Task.detached(priority: .background) {
+                await Self.bestEffortScanlightOff()
+            }
         }
+    }
+
+    /// Fire `scanlightctl off` in a best-effort, non-blocking way after a SIGKILL
+    /// escalation. Tries the project-locator path first, falls back to
+    /// `python3 -m scanlight.cli off`. Swallows all errors and enforces a short
+    /// timeout so a missing binary can't stall the shutdown path.
+    private nonisolated static func bestEffortScanlightOff() async {
+        // Resolve `scanlightctl` via PythonToolLocator (mirrors how other CLI
+        // tools are resolved in this file). Fall back to the Python module form.
+        let candidates: [(executable: String, arguments: [String])] = {
+            var list: [(String, [String])] = []
+            if let url = try? PythonToolLocator.resolve("scanlightctl") {
+                list.append((url.path, ["off"]))
+            }
+            // Fallback: Python module form — works when scanlightctl is installed
+            // as a Python entry-point but the wrapper script isn't on PATH.
+            list.append(("/usr/bin/env", ["python3", "-m", "scanlight.cli", "off"]))
+            return list
+        }()
+
+        for (executable, arguments) in candidates {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: executable)
+            proc.arguments = arguments
+            proc.standardOutput = Pipe()
+            proc.standardError = Pipe()
+            do {
+                try proc.run()
+                // Wait up to 3 seconds; if it takes longer something is wrong
+                // and we should not block the caller further.
+                let deadline = Date(timeIntervalSinceNow: 3.0)
+                while proc.isRunning && Date() < deadline {
+                    try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                }
+                if proc.isRunning { proc.terminate() }
+                if proc.terminationStatus == 0 { return }  // success — done
+            } catch {
+                // Process didn't launch (binary not found etc.) — try next candidate.
+            }
+        }
+        // All candidates failed or errored — nothing more we can do.
     }
 
     /// Fetch the current orchestrator state.
@@ -832,6 +972,10 @@ final class OrchestratorClient: ObservableObject {
         let url = URL(string: urlStr)!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // Set an explicit timeout covering 3 channels × captureTimeoutS + margin.
+        // The URLSession default (60s) is less than a manual triplet in worst case
+        // (operator fires 3 IED shots with 30s timeout per channel = up to 90s).
+        request.timeoutInterval = Self.captureRequestTimeout
         // Empty body — retake is a query param only
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -1274,6 +1418,7 @@ final class OrchestratorClient: ObservableObject {
     // MARK: - Private helpers
 
     internal func settingsWithResolvedSonyIP(_ settings: ScanSettings) -> ScanSettings {
+        guard !settings.usesSonyUSB else { return settings }
         guard let mac = settings.sonyMacAddress?.trimmingCharacters(in: .whitespacesAndNewlines),
               !mac.isEmpty,
               let resolvedIP = Self.resolveSonyIPFromARP(macAddress: mac),
@@ -1345,10 +1490,10 @@ final class OrchestratorClient: ObservableObject {
             } else if let resolved = try? PythonToolLocator.resolve("sony-capture") {
                 args += ["--sony-capture", resolved.path]
             }
-            if let ip = settings.sonyIpAddress, !ip.isEmpty {
+            if !settings.usesSonyUSB, let ip = settings.sonyIpAddress, !ip.isEmpty {
                 args += ["--sony-ip-address", ip]
             }
-            if let mac = settings.sonyMacAddress, !mac.isEmpty {
+            if !settings.usesSonyUSB, let mac = settings.sonyMacAddress, !mac.isEmpty {
                 args += ["--sony-mac-address", mac]
             }
             if let user = settings.sonyUser, !user.isEmpty {
@@ -1388,7 +1533,7 @@ final class OrchestratorClient: ObservableObject {
     internal func buildSonyConnectionProbeCommand(
         settings: ScanSettings,
         timeoutSeconds: Int
-    ) throws -> (executableURL: URL, arguments: [String]) {
+    ) throws -> (executableURL: URL, arguments: [String], environment: [String: String]) {
         let executableURL: URL
         if let sonyCapturePath = settings.sonyCapturePath, !sonyCapturePath.isEmpty {
             executableURL = URL(fileURLWithPath: sonyCapturePath)
@@ -1400,26 +1545,20 @@ final class OrchestratorClient: ObservableObject {
             "--connect-only",
             "--timeout", "\(timeoutSeconds)",
         ]
-        if let ip = settings.sonyIpAddress, !ip.isEmpty {
+        if !settings.usesSonyUSB, let ip = settings.sonyIpAddress, !ip.isEmpty {
             args += ["--ip-address", ip]
         }
-        if let mac = settings.sonyMacAddress, !mac.isEmpty {
+        if !settings.usesSonyUSB, let mac = settings.sonyMacAddress, !mac.isEmpty {
             args += ["--mac-address", mac]
         }
-        if let user = settings.sonyUser, !user.isEmpty {
-            args += ["--user", user]
-        }
-        if let password = settings.sonyPassword, !password.isEmpty {
-            args += ["--password", password]
-        }
-        return (executableURL, args)
+        return (executableURL, args, Self.sonyCaptureEnvironment(for: settings))
     }
 
     internal func buildSonyLiveViewFrameCommand(
         settings: ScanSettings,
         outputURL: URL,
         timeoutSeconds: Int
-    ) throws -> (executableURL: URL, arguments: [String]) {
+    ) throws -> (executableURL: URL, arguments: [String], environment: [String: String]) {
         let executableURL: URL
         if let sonyCapturePath = settings.sonyCapturePath, !sonyCapturePath.isEmpty {
             executableURL = URL(fileURLWithPath: sonyCapturePath)
@@ -1431,19 +1570,13 @@ final class OrchestratorClient: ObservableObject {
             "--live-view-out", outputURL.path,
             "--timeout", "\(timeoutSeconds)",
         ]
-        if let ip = settings.sonyIpAddress, !ip.isEmpty {
+        if !settings.usesSonyUSB, let ip = settings.sonyIpAddress, !ip.isEmpty {
             args += ["--ip-address", ip]
         }
-        if let mac = settings.sonyMacAddress, !mac.isEmpty {
+        if !settings.usesSonyUSB, let mac = settings.sonyMacAddress, !mac.isEmpty {
             args += ["--mac-address", mac]
         }
-        if let user = settings.sonyUser, !user.isEmpty {
-            args += ["--user", user]
-        }
-        if let password = settings.sonyPassword, !password.isEmpty {
-            args += ["--password", password]
-        }
-        return (executableURL, args)
+        return (executableURL, args, Self.sonyCaptureEnvironment(for: settings))
     }
 
     internal func buildSonyLiveViewStreamCommand(
@@ -1451,7 +1584,7 @@ final class OrchestratorClient: ObservableObject {
         outputURL: URL,
         intervalMs: Int,
         timeoutSeconds: Int
-    ) throws -> (executableURL: URL, arguments: [String]) {
+    ) throws -> (executableURL: URL, arguments: [String], environment: [String: String]) {
         let executableURL: URL
         if let sonyCapturePath = settings.sonyCapturePath, !sonyCapturePath.isEmpty {
             executableURL = URL(fileURLWithPath: sonyCapturePath)
@@ -1464,19 +1597,13 @@ final class OrchestratorClient: ObservableObject {
             "--live-view-interval-ms", "\(intervalMs)",
             "--timeout", "\(timeoutSeconds)",
         ]
-        if let ip = settings.sonyIpAddress, !ip.isEmpty {
+        if !settings.usesSonyUSB, let ip = settings.sonyIpAddress, !ip.isEmpty {
             args += ["--ip-address", ip]
         }
-        if let mac = settings.sonyMacAddress, !mac.isEmpty {
+        if !settings.usesSonyUSB, let mac = settings.sonyMacAddress, !mac.isEmpty {
             args += ["--mac-address", mac]
         }
-        if let user = settings.sonyUser, !user.isEmpty {
-            args += ["--user", user]
-        }
-        if let password = settings.sonyPassword, !password.isEmpty {
-            args += ["--password", password]
-        }
-        return (executableURL, args)
+        return (executableURL, args, Self.sonyCaptureEnvironment(for: settings))
     }
 
     internal struct SonyProbeProcessResult {
@@ -1508,12 +1635,13 @@ final class OrchestratorClient: ObservableObject {
     internal nonisolated static func runSonyProbeProcess(
         executableURL: URL,
         arguments: [String],
+        environment: [String: String]? = nil,
         timeout: TimeInterval
     ) async throws -> SonyProbeProcessResult {
         let proc = Process()
         proc.executableURL = executableURL
         proc.arguments = arguments
-        proc.environment = ProcessInfo.processInfo.environment
+        proc.environment = environment ?? ProcessInfo.processInfo.environment
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()

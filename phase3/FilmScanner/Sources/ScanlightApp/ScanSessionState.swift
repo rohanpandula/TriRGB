@@ -39,6 +39,7 @@
 //   @MainActor final class ... : ObservableObject + @Published + Combine.
 //   NOT the Observable macro.
 
+import AppKit
 import Combine
 import Foundation
 
@@ -89,6 +90,8 @@ protocol OrchestratorClientProtocol: AnyObject {
     func stop() async
     func captureFrame(retake: Bool) async throws -> TripletOutcome
     func compositeStatus() async throws -> CompositeStatus
+    /// Fetch the current orchestrator state for channel-prompt polling (F1).
+    func fetchState() async throws -> OrchestratorState
 }
 
 // MARK: OrchestratorClient conformance
@@ -164,6 +167,12 @@ final class ScanCoordinator: ObservableObject {
     /// Next frame number the backend will shoot. Updated from capture outcomes.
     @Published private(set) var nextFrameNumber: Int = 1
 
+    /// The channel the operator must fire next in manual/hw mode (F1).
+    /// "R" | "G" | "B" while a triplet capture awaits the IED shot; nil when idle.
+    /// Sourced from GET /api/state `waiting_for_channel` and polled concurrently
+    /// with the captureFrame HTTP call so the UI updates during the blocking wait.
+    @Published private(set) var waitingForChannel: String? = nil
+
     // MARK: - Dependencies (injected via protocol)
 
     private let client: any OrchestratorClientProtocol
@@ -179,6 +188,10 @@ final class ScanCoordinator: ObservableObject {
     private var isRunningCancellable: AnyCancellable?
     /// Task for the 1s composite-status polling loop (non-nil while .scanning).
     private var compositePollingTask: Task<Void, Never>?
+    /// Task for the 1s channel-prompt polling loop (non-nil during captureInFlight).
+    /// Polls GET /api/state for `waiting_for_channel` so the banner updates while
+    /// the captureFrame HTTP call is blocked waiting for the operator (F1).
+    private var channelPromptTask: Task<Void, Never>?
 
     // MARK: - Init
 
@@ -303,8 +316,10 @@ final class ScanCoordinator: ObservableObject {
         transitionInFlight = true
         defer { transitionInFlight = false }
 
-        // Step 1: Cancel the composite polling loop.
+        // Step 1: Cancel the composite and channel-prompt polling loops.
         stopCompositePolling()
+        stopChannelPromptPolling()
+        waitingForChannel = nil
 
         // Step 2: Stop the orchestrator (releases the serial port on the Python side).
         await client.stop()
@@ -410,10 +425,22 @@ final class ScanCoordinator: ObservableObject {
     ///
     /// Updates frameStatuses with "captured" on success so the list shows
     /// immediate feedback before the composite-status poll catches up.
+    ///
+    /// Concurrently polls GET /api/state at 1s intervals while the capture HTTP
+    /// call is in flight, so `waitingForChannel` updates reach the UI during the
+    /// blocking wait for the operator to fire the IED (F1).
     func captureFrame(retake: Bool) async {
         guard phase == .scanning, !captureInFlight else { return }
         captureInFlight = true
-        defer { captureInFlight = false }
+        waitingForChannel = nil
+
+        // Start concurrent channel-prompt polling while the HTTP call blocks.
+        startChannelPromptPolling()
+        defer {
+            captureInFlight = false
+            stopChannelPromptPolling()
+            waitingForChannel = nil
+        }
 
         do {
             let outcome = try await client.captureFrame(retake: retake)
@@ -487,6 +514,41 @@ final class ScanCoordinator: ObservableObject {
         } catch {
             // Polling failure is non-fatal — we'll retry next second.
             // Don't overwrite lastError with transient network noise.
+        }
+    }
+
+    // MARK: - Private: channel-prompt polling (F1)
+
+    private func startChannelPromptPolling() {
+        channelPromptTask?.cancel()
+        channelPromptTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.pollWaitingForChannel()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1s
+            }
+        }
+    }
+
+    private func stopChannelPromptPolling() {
+        channelPromptTask?.cancel()
+        channelPromptTask = nil
+    }
+
+    /// Poll GET /api/state and update `waitingForChannel`.
+    /// Internal so tests can drive it directly.
+    @MainActor
+    internal func pollWaitingForChannel() async {
+        guard captureInFlight else { return }
+        do {
+            let state = try await client.fetchState()
+            let newChannel = state.waitingForChannel
+            // Sound on channel change (F1 optional: always-on for v1).
+            if newChannel != waitingForChannel, newChannel != nil {
+                NSSound.beep()
+            }
+            waitingForChannel = newChannel
+        } catch {
+            // Non-fatal — the poll loop retries next second.
         }
     }
 

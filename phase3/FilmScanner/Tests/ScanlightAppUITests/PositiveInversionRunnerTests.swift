@@ -1,8 +1,15 @@
 import AppKit
+import UniformTypeIdentifiers
 import XCTest
 @testable import ScanlightApp
 
 final class PositiveInversionRunnerTests: XCTestCase {
+    func testDevelopPickerAllowsFujiRAFInputs() {
+        let rafType = UTType(filenameExtension: "raf") ?? .data
+
+        XCTAssertTrue(PositiveInversionViewModel.allowedInputContentTypes.contains(rafType))
+    }
+
     func testTripletRunnerUsesPythonWithTiffDependencies() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("scanlight-positive-runner-\(UUID().uuidString)")
@@ -66,9 +73,10 @@ final class PositiveInversionRunnerTests: XCTestCase {
         for y in 0..<height {
             for x in 0..<width {
                 let idx = y * rep.bytesPerRow + x * 3
-                data[idx] = rgb.0
-                data[idx + 1] = rgb.1
-                data[idx + 2] = rgb.2
+                let texture = 0.85 + 0.3 * Double(x + y) / Double(width + height - 2)
+                data[idx] = scaledChannel(rgb.0, texture: texture)
+                data[idx + 1] = scaledChannel(rgb.1, texture: texture)
+                data[idx + 2] = scaledChannel(rgb.2, texture: texture)
             }
         }
 
@@ -77,5 +85,10 @@ final class PositiveInversionRunnerTests: XCTestCase {
             return
         }
         try tiff.write(to: url)
+    }
+
+    private func scaledChannel(_ value: UInt8, texture: Double) -> UInt8 {
+        let scaled = Int((Double(value) * texture).rounded())
+        return UInt8(max(0, min(255, scaled)))
     }
 }

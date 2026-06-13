@@ -445,7 +445,8 @@ private struct Step1RigCheckView: View {
     }
 
     private var sonyCredentialsSaved: Bool {
-        !(store.settings.sonyIpAddress ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        (store.settings.usesSonyUSB
+            || !(store.settings.sonyIpAddress ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             && !(store.settings.sonyUser ?? "").isEmpty
             && !(store.settings.sonyPassword ?? "").isEmpty
     }
@@ -479,6 +480,9 @@ private struct Step1RigCheckView: View {
     private var triggerSummary: String {
         switch store.settings.triggerMode {
         case "sdk":
+            if store.settings.usesSonyUSB {
+                return "SDK USB"
+            }
             let ip = store.settings.sonyIpAddress?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return ip.isEmpty ? "SDK" : "SDK \(ip)"
         case "hw":

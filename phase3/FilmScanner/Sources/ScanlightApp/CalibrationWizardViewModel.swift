@@ -551,7 +551,7 @@ final class CalibrationWizardViewModel: ObservableObject {
 
         if lower.contains("sony-capture") && lower.contains("exit 124") {
             return (
-                "Sony SDK capture timed out. Confirm the camera is in Wi-Fi PC Remote, " +
+                "Sony SDK capture timed out. Confirm the camera is in the configured SDK remote mode, " +
                 "then use Set Up > Check Camera."
             )
         }

@@ -25,6 +25,16 @@ final class PositiveInversionViewModel: ObservableObject {
     private let runningProcess = TripletProcessBox()
     private var activeTask: Task<Void, Never>?
 
+    nonisolated static var allowedInputContentTypes: [UTType] {
+        [
+            .tiff,
+            UTType(filenameExtension: "arw") ?? .data,
+            UTType(filenameExtension: "raf") ?? .data,
+            UTType(filenameExtension: "dng") ?? .data,
+            UTType(filenameExtension: "raw") ?? .data,
+        ]
+    }
+
     var canRun: Bool {
         selectedFiles.count == 3
             && outputFolder != nil
@@ -42,12 +52,7 @@ final class PositiveInversionViewModel: ObservableObject {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [
-            .tiff,
-            UTType(filenameExtension: "arw") ?? .data,
-            UTType(filenameExtension: "dng") ?? .data,
-            UTType(filenameExtension: "raw") ?? .data,
-        ]
+        panel.allowedContentTypes = Self.allowedInputContentTypes
         if panel.runModal() == .OK {
             selectedFiles = Array(panel.urls.prefix(3))
             if outputFolder == nil, let parent = selectedFiles.first?.deletingLastPathComponent() {
@@ -216,6 +221,7 @@ enum PositiveRenderLook: String, CaseIterable, Identifiable {
     case flat
     case standard
     case punchy
+    case filmic
 
     var id: String { rawValue }
 
@@ -224,6 +230,7 @@ enum PositiveRenderLook: String, CaseIterable, Identifiable {
         case .flat: return "Flat"
         case .standard: return "Standard"
         case .punchy: return "Punchy"
+        case .filmic: return "Filmic"
         }
     }
 
@@ -235,6 +242,8 @@ enum PositiveRenderLook: String, CaseIterable, Identifiable {
             return "Deeper automatic black/white points plus an S-curve."
         case .punchy:
             return "Strongest automatic curve for quick review."
+        case .filmic:
+            return "Filmic sigmoid curve for a finished review look."
         }
     }
 }
@@ -412,7 +421,7 @@ enum TripletPositiveRunner {
     ) async throws -> T {
         try await Task.detached(priority: .userInitiated) {
             let root = try repositoryRoot()
-            let python = try pythonExecutable()
+            let python = try pythonExecutableWithCache()  // F9: cached after first probe
             let pythonPath = [
                 root.appendingPathComponent("phase2/rgb-composite").path,
                 root.appendingPathComponent("phase2/c41-core").path,
@@ -583,6 +592,54 @@ enum TripletPositiveRunner {
         throw TripletPositiveRunnerError.pythonNotFound
     }
 
+    // MARK: - Python probe cache (F9)
+
+    /// Thread-safe lock for the probe cache.
+    private static let probeCacheLock = NSLock()
+    /// Resolved winning interpreter URL, cached after the first successful probe.
+    /// Nil means "not yet resolved or explicitly reset". The cache is per-session:
+    /// a different interpreter cannot appear at the same path during one run.
+    private static var cachedPythonExecutable: URL? = nil
+
+    /// Reset the cached probe result. Intended for tests that need to re-probe
+    /// (e.g. after injecting a stub python via SCANLIGHT_PYTHON override).
+    static func resetPythonExecutableCache() {
+        probeCacheLock.lock()
+        cachedPythonExecutable = nil
+        probeCacheLock.unlock()
+    }
+
+    /// Return the cached resolved Python URL without running a new probe, or nil
+    /// if no successful probe has completed yet.
+    static func cachedPythonURL() -> URL? {
+        probeCacheLock.lock(); defer { probeCacheLock.unlock() }
+        return cachedPythonExecutable
+    }
+
+    /// Resolve the Python executable, using the per-session cache so the import
+    /// probe runs at most once regardless of how many times pythonExecutable() is
+    /// called (e.g. on every render/preview click). F9.
+    private static func pythonExecutableWithCache() throws -> URL {
+        // Fast path: cache already populated.
+        probeCacheLock.lock()
+        if let cached = cachedPythonExecutable {
+            probeCacheLock.unlock()
+            return cached
+        }
+        probeCacheLock.unlock()
+
+        // Slow path: run the probe, then populate the cache.
+        let resolved = try pythonExecutable()
+        probeCacheLock.lock()
+        // Double-check: another concurrent call may have cached a result while we
+        // were probing. Both results are valid; keep whichever arrived first.
+        if cachedPythonExecutable == nil {
+            cachedPythonExecutable = resolved
+        }
+        probeCacheLock.unlock()
+        return resolved
+    }
+
     private static func pythonSupportsTripletStack(_ executable: URL) -> Bool {
         let process = Process()
         process.executableURL = executable
@@ -613,7 +670,7 @@ struct PositiveInversionView: View {
             VStack(alignment: .leading, spacing: Theme.Space.section) {
                 GroupBox(label: Text("Triplet Input")) {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
-                        Banner(kind: .info, text: "Choose the three files from one RGB-lit frame, named with _R, _G, _B suffixes (e.g. Frame001_R.ARW, or plain R/G/B). The channel is read from each filename, the matching channels are isolated, and a positive TIFF is written.")
+                        Banner(kind: .info, text: "Choose the three files from one RGB-lit frame. _R/_G/_B filename suffixes are preferred; generic camera names are auto-detected from RAW channel dominance when confidence is high. The matching channels are isolated and a positive TIFF is written.")
 
                         HStack(spacing: Theme.Space.md) {
                             Button("Choose Files...") {

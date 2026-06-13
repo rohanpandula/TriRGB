@@ -30,6 +30,7 @@ final class SettingsStore: ObservableObject {
         outputFolder: "",
         triggerMode: "manual",
         iedInbox: nil,
+        sonyTransport: "wifi",
         sonyIpAddress: nil,
         sonyMacAddress: nil,
         sonyUser: nil,
@@ -158,7 +159,7 @@ final class SettingsStore: ObservableObject {
         }
 
         if settings.triggerMode == "sdk" {
-            if settings.sonyIpAddress?.isEmpty ?? true {
+            if !settings.usesSonyUSB && (settings.sonyIpAddress?.isEmpty ?? true) {
                 errors["sonyIpAddress"] = "Sony camera IP address is required for SDK mode."
             }
             if settings.sonyUser?.isEmpty ?? true {

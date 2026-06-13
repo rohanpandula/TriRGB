@@ -25,12 +25,14 @@ final class SonyCameraConnection: ObservableObject {
     private let checkTimeout: TimeInterval
 
     private struct Signature: Equatable {
+        var transport: String
         var ip: String
         var mac: String
         var user: String
         var password: String
 
         init(_ settings: ScanSettings) {
+            transport = settings.sonyTransportMode
             ip = Self.clean(settings.sonyIpAddress)
             mac = Self.clean(settings.sonyMacAddress)
             user = Self.clean(settings.sonyUser)
@@ -154,7 +156,7 @@ final class SonyCameraConnection: ObservableObject {
         let signature = Signature(settings)
         if let lastSignature, lastSignature == signature,
            let lastResult, let lastResultAt {
-            let ip = signature.ip.isEmpty ? "unknown IP" : signature.ip
+            let ip = Self.connectionLabel(for: signature)
             phase = lastResult.success
                 ? .online(message: lastResult.message, ip: ip, verifiedAt: lastResultAt)
                 : .offline(message: lastResult.message)
@@ -197,12 +199,12 @@ final class SonyCameraConnection: ObservableObject {
         }
 
         let resolved = orchestratorClient.settingsWithResolvedSonyIP(store.settings)
-        if resolved.sonyIpAddress != store.settings.sonyIpAddress {
+        if !resolved.usesSonyUSB, resolved.sonyIpAddress != store.settings.sonyIpAddress {
             store.settings.sonyIpAddress = resolved.sonyIpAddress
         }
 
         let signature = Signature(store.settings)
-        NSLog("Scanlight Sony Check Camera started for %@", signature.ip.isEmpty ? "unknown IP" : signature.ip)
+        NSLog("Scanlight Sony Check Camera started for %@", Self.connectionLabel(for: signature))
         let result = await Self.runProbeWithTimeout(
             settings: store.settings,
             orchestratorClient: orchestratorClient,
@@ -213,7 +215,7 @@ final class SonyCameraConnection: ObservableObject {
         lastSignature = signature
         lastResult = result
         lastResultAt = checkedAt
-        let ip = signature.ip.isEmpty ? "unknown IP" : signature.ip
+        let ip = Self.connectionLabel(for: signature)
         phase = result.success
             ? .online(message: result.message, ip: ip, verifiedAt: checkedAt)
             : .offline(message: result.message)
@@ -234,7 +236,7 @@ final class SonyCameraConnection: ObservableObject {
 
     private static func missingFields(in settings: ScanSettings) -> [String] {
         var missing: [String] = []
-        if clean(settings.sonyIpAddress).isEmpty {
+        if !settings.usesSonyUSB && clean(settings.sonyIpAddress).isEmpty {
             missing.append("Sony IP")
         }
         if clean(settings.sonyUser).isEmpty {
@@ -244,6 +246,12 @@ final class SonyCameraConnection: ObservableObject {
             missing.append("Access Auth password")
         }
         return missing
+    }
+
+    private static func connectionLabel(for signature: Signature) -> String {
+        signature.transport == "usb"
+            ? "USB"
+            : (signature.ip.isEmpty ? "unknown IP" : signature.ip)
     }
 
     private static func clean(_ value: String?) -> String {
