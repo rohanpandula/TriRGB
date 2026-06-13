@@ -1057,6 +1057,43 @@ def test_persistent_capture_respawns_when_process_dies_during_shutter(tmp_path):
     assert int(counter.read_text()) == 2
 
 
+_FAKE_PERSIST_SLOW_SHUTTER = """#!/usr/bin/env python3
+import sys, time
+print("READY", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if line == "quit":
+        break
+    if line.startswith("shutter "):
+        time.sleep(2.0)                                  # exceed the test timeout
+        print("SHUTTER_OK %s" % line[len("shutter "):], flush=True)  # late reply
+"""
+
+
+def test_persistent_shutter_timeout_cleans_up_desynced_child(tmp_path):
+    # Audit #17: a shutter-apply TIMEOUT must tear down the child so a late
+    # SHUTTER_OK can't poison the next command's queue (mirrors the capture
+    # timeout path). _apply_shutter returns False AND clears _proc.
+    import os
+    from triplet_capture.sony_persist import PersistentSonyCapture
+
+    script = tmp_path / "fake_slow_shutter.py"
+    script.write_text(_FAKE_PERSIST_SLOW_SHUTTER)
+    script.chmod(0o755)
+
+    p = PersistentSonyCapture(str(script), [], env=dict(os.environ), ready_timeout_s=5)
+    try:
+        assert p._spawn() == 0, "fake process should reach READY"
+        proc = p._proc
+        assert proc is not None
+        # Short shutter timeout: the 2s-delayed SHUTTER_OK never arrives in time.
+        assert p._apply_shutter("1/100", timeout_s=0.5) is False, "slow shutter must time out"
+        assert p._proc is None, "timed-out shutter must tear down the desynced child"
+        assert proc.poll() is not None, "the desynced child must be terminated"
+    finally:
+        p.close()
+
+
 def test_sdk_runner_passes_sony_network_auth_args(tmp_path, monkeypatch):
     calls = []
 

@@ -383,6 +383,21 @@ def test_calibrate_preview_light_route_controls_white_light(app_and_orch):
     assert orch._scanlight.calls[-1] == ("off",)
 
 
+def test_preview_light_rejects_non_boolean_enabled(app_and_orch):
+    """Audit #17: this route drives the white preview LED; bool("false") is True,
+    so a loose cast would turn the light ON for any truthy non-bool. Require a
+    real JSON boolean and 400 anything else."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    for bad in ("false", "true", 1, 0, "on"):
+        r = client.post("/api/calibrate/preview-light", json={"enabled": bad, "level": 200})
+        assert r.status_code == 400, f"enabled={bad!r} should be rejected, got {r.status_code}"
+        assert "boolean" in (r.get_json() or {}).get("error", "")
+    # Real booleans still work (and the activity slot is released between calls).
+    assert client.post("/api/calibrate/preview-light", json={"enabled": True, "level": 100}).status_code == 200
+    assert client.post("/api/calibrate/preview-light", json={"enabled": False}).status_code == 200
+
+
 def test_calibrate_exposure_route_rebate_bounds(app_and_orch):
     """Out-of-range rebate params are rejected/clamped; non-int body returns 400 or is coerced (no 500 crash)."""
     app, _ = app_and_orch

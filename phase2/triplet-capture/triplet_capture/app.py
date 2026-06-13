@@ -199,7 +199,13 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             data, _err = _json_object_body()
             if _err is not None:
                 return _err
-            enabled = bool(data.get("enabled", False))
+            # Strict bool: this route drives the preview WHITE LED, and
+            # bool("false") is True — a loose cast would turn the light ON for any
+            # truthy non-bool. JSON booleans decode to Python bool; reject anything
+            # else (isinstance(1, bool) is False, so ints are rejected too).
+            enabled = data.get("enabled", False)
+            if not isinstance(enabled, bool):
+                return jsonify({"error": "enabled must be a boolean"}), 400
             try:
                 level = int(data.get("level", 200))
             except (TypeError, ValueError) as e:

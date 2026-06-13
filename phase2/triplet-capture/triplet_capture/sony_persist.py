@@ -362,8 +362,13 @@ class PersistentSonyCapture:
 
         Returns True on SHUTTER_OK (and records `_last_shutter`); False on
         SHUTTER_FAIL, timeout, or a dead process — the caller must then abort
-        rather than capture at the wrong exposure. Does not respawn (a dead
-        process here is handled by _do_capture's own retry on the next call).
+        rather than capture at the wrong exposure.
+
+        On TIMEOUT it tears down the (now-desynced) child so a late SHUTTER_OK
+        can't poison the next command's queue; _do_capture then sees the cleared
+        process and respawn-retries the capture once. On SHUTTER_FAIL the live
+        process is healthy and left running (the caller aborts; the orchestrator
+        closes the session on the nonzero result). Does not respawn itself.
         """
         proc = self._proc
         if proc is None or proc.poll() is not None:
@@ -388,6 +393,11 @@ class PersistentSonyCapture:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.error("sony-capture timed out applying shutter %s", speed)
+                # Kill the now-desynced child: a late SHUTTER_OK arriving after
+                # this timeout must not be misread by the next command's queue.
+                # Mirrors the capture-timeout cleanup in _do_capture. _do_capture
+                # sees the cleared process and respawn-retries the capture once.
+                self._cleanup_proc()
                 return False
             try:
                 line = self._stdout_q.get(timeout=min(remaining, 0.1))
