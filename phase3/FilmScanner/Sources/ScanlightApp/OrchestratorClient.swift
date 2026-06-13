@@ -184,6 +184,49 @@ extension ScanSettings {
 struct SonyConnectionProbeResult: Equatable {
     var success: Bool
     var message: String
+    /// The IP/MAC that actually connected — set when auto-discovery found the
+    /// camera at a different address than the saved one, so the caller can
+    /// persist it. nil when nothing changed.
+    var resolvedIP: String? = nil
+    var resolvedMAC: String? = nil
+}
+
+/// One camera surfaced by `sony-capture --list --json` (the SDK's USB + network
+/// enumeration). Used to auto-discover the camera instead of hard-coding IP/MAC.
+struct DiscoveredSonyCamera: Equatable, Decodable {
+    var model: String
+    var name: String
+    var connection: String
+    var ip: String
+    var mac: String
+
+    init(model: String = "", name: String = "", connection: String = "",
+         ip: String = "", mac: String = "") {
+        self.model = model
+        self.name = name
+        self.connection = connection
+        self.ip = ip
+        self.mac = mac
+    }
+
+    // Tolerant decoder: this parses external subprocess output, so a missing or
+    // wrong-typed field falls back to "" rather than failing the whole array.
+    private enum CodingKeys: String, CodingKey { case model, name, connection, ip, mac }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model = (try? c.decodeIfPresent(String.self, forKey: .model)) ?? ""
+        name = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? ""
+        connection = (try? c.decodeIfPresent(String.self, forKey: .connection)) ?? ""
+        ip = (try? c.decodeIfPresent(String.self, forKey: .ip)) ?? ""
+        mac = (try? c.decodeIfPresent(String.self, forKey: .mac)) ?? ""
+    }
+
+    /// True for a network (Wi-Fi PC Remote) camera — the SDK reports a non-empty
+    /// IP and connection "IP"/"Network"; USB cameras report "USB" and no IP.
+    var isNetwork: Bool {
+        let c = connection.lowercased()
+        return !ip.isEmpty || c.contains("ip") || c.contains("net") || c.contains("wi")
+    }
 }
 
 /// Result from a non-shooting Sony SDK live-view frame pull.
@@ -374,6 +417,8 @@ final class OrchestratorClient: ObservableObject {
     /// Margin (seconds) added on top of 3 × per-channel before the client gives up.
     private static let captureTimeoutMarginS: TimeInterval = 15
     internal var sonyConnectionProbeOverride: ((ScanSettings) async -> SonyConnectionProbeResult)?
+    /// Test seam for camera auto-discovery (`sony-capture --list --json`).
+    internal var sonyCameraDiscoveryOverride: (() async -> [DiscoveredSonyCamera])?
     internal static var sonyARPTableProvider: () -> String = {
         let proc = Process()
         let pipe = Pipe()
@@ -474,10 +519,30 @@ final class OrchestratorClient: ObservableObject {
     /// for each R/G/B capture, so this is a readiness check rather than a held
     /// connection.
     func checkSonyConnection(settings: ScanSettings) async -> SonyConnectionProbeResult {
-        if let sonyConnectionProbeOverride {
-            return await sonyConnectionProbeOverride(settingsWithResolvedSonyIP(settings))
+        let probe: (ScanSettings) async -> SonyConnectionProbeResult =
+            sonyConnectionProbeOverride ?? { await self.runConnectProbe(settings: $0) }
+        let discover: () async -> [DiscoveredSonyCamera]
+        if let override = sonyCameraDiscoveryOverride {
+            discover = override
+        } else if sonyConnectionProbeOverride != nil {
+            // Probe is overridden (test context) but discovery isn't — don't
+            // spawn the real `--list` subprocess; report no discovered cameras.
+            discover = { [] }
+        } else {
+            discover = { await self.discoverSonyCameras(settings: settings) }
         }
+        return await Self.resolveConnection(
+            settings: settings,
+            resolveIP: { self.settingsWithResolvedSonyIP($0) },
+            probe: probe,
+            discover: discover
+        )
+    }
 
+    /// The actual `sony-capture --connect-only` probe (with transient-failure
+    /// retries) against whatever IP/MAC the given settings carry. The
+    /// try-saved-IP-then-discover orchestration lives in `resolveConnection`.
+    private func runConnectProbe(settings: ScanSettings) async -> SonyConnectionProbeResult {
         do {
             let command = try buildSonyConnectionProbeCommand(
                 settings: settingsWithResolvedSonyIP(settings),
@@ -559,6 +624,127 @@ final class OrchestratorClient: ObservableObject {
                 message: "Could not run sony-capture: \(error.localizedDescription)"
             )
         }
+    }
+
+    /// Try the saved/ARP-resolved address first; if that fails on Wi-Fi, search
+    /// the LAN (SDK enumeration) and retry at the discovered address. Pure
+    /// orchestration over injected `probe` and `discover` closures so the
+    /// try → search → reconnect flow is unit-testable without hardware.
+    ///
+    /// On success the result carries `resolvedIP`/`resolvedMAC` so the caller
+    /// can persist the address that actually worked (handles DHCP IP changes).
+    internal static func resolveConnection(
+        settings: ScanSettings,
+        resolveIP: (ScanSettings) -> ScanSettings,
+        probe: (ScanSettings) async -> SonyConnectionProbeResult,
+        discover: () async -> [DiscoveredSonyCamera]
+    ) async -> SonyConnectionProbeResult {
+        let resolved = resolveIP(settings)
+        let triedIP = resolved.usesSonyUSB
+            ? ""
+            : (resolved.sonyIpAddress ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 1. Try the saved / ARP-resolved address (or USB enumeration).
+        var first = await probe(resolved)
+        if first.success {
+            if !resolved.usesSonyUSB {
+                first.resolvedIP = resolved.sonyIpAddress
+                first.resolvedMAC = resolved.sonyMacAddress
+            }
+            return first
+        }
+
+        // 2. USB has no network address to rediscover — the SDK already
+        //    enumerates the USB body, so a failure here is terminal.
+        if resolved.usesSonyUSB { return first }
+
+        // 3. Wi-Fi: the saved IP is stale (or empty). Search the LAN.
+        let cameras = await discover()
+        guard let cam = pickSonyCamera(cameras, preferMAC: settings.sonyMacAddress),
+              !cam.ip.isEmpty, cam.ip != triedIP else {
+            // No usable network camera. If one is plugged in over USB, the Wi-Fi
+            // path can't use it — point the operator at USB transport instead.
+            if cameras.contains(where: { !$0.isNetwork }) {
+                return SonyConnectionProbeResult(
+                    success: false,
+                    message: "A Sony camera was found on USB, but the trigger transport is set to Wi-Fi. Switch the Sony transport to USB to use it (no IP or Access Auth needed)."
+                )
+            }
+            return first   // nothing found — keep the original failure
+        }
+
+        var retrySettings = settings
+        retrySettings.sonyIpAddress = cam.ip
+        if !cam.mac.isEmpty { retrySettings.sonyMacAddress = cam.mac }
+        var retry = await probe(retrySettings)
+        if retry.success {
+            retry.resolvedIP = cam.ip
+            retry.resolvedMAC = cam.mac.isEmpty ? settings.sonyMacAddress : cam.mac
+            retry.message = "Found camera at \(cam.ip). \(retry.message)"
+        }
+        return retry
+    }
+
+    /// Pick the best discovered camera: prefer one whose MAC matches the saved
+    /// value, then the first network camera with an IP, then the first with any IP.
+    internal static func pickSonyCamera(
+        _ cameras: [DiscoveredSonyCamera],
+        preferMAC: String?
+    ) -> DiscoveredSonyCamera? {
+        guard !cameras.isEmpty else { return nil }
+        let normalizedPrefer = normalizeMAC(preferMAC ?? "")
+        if !normalizedPrefer.isEmpty,
+           let match = cameras.first(where: {
+               normalizeMAC($0.mac) == normalizedPrefer && !$0.ip.isEmpty
+           }) {
+            return match
+        }
+        if let network = cameras.first(where: { $0.isNetwork && !$0.ip.isEmpty }) {
+            return network
+        }
+        return cameras.first(where: { !$0.ip.isEmpty })
+    }
+
+    /// Run `sony-capture --list --json` and parse the SDK's USB + network
+    /// enumeration. Returns [] on any failure (missing binary, timeout, nonzero
+    /// exit, unparseable output) — discovery is best-effort.
+    func discoverSonyCameras(settings: ScanSettings) async -> [DiscoveredSonyCamera] {
+        if let override = sonyCameraDiscoveryOverride { return await override() }
+        let executableURL: URL
+        do {
+            if let path = settings.sonyCapturePath, !path.isEmpty {
+                executableURL = URL(fileURLWithPath: path)
+            } else {
+                executableURL = try PythonToolLocator.resolve("sony-capture")
+            }
+        } catch {
+            return []
+        }
+        guard let result = try? await Self.runSonyProbeProcess(
+            executableURL: executableURL,
+            arguments: ["--list", "--json"],
+            environment: Self.sonyCaptureEnvironment(for: settings),
+            timeout: 12
+        ), !result.timedOut, result.exitCode == 0 else {
+            return []
+        }
+        return Self.parseDiscoveredCameras(from: result.stdout)
+    }
+
+    /// Parse the `--list --json` array, tolerating leading/trailing SDK log noise
+    /// by slicing from the first `[` to the last `]`.
+    internal static func parseDiscoveredCameras(from output: String) -> [DiscoveredSonyCamera] {
+        guard let start = output.firstIndex(of: "["),
+              let end = output.lastIndex(of: "]"),
+              start <= end else {
+            return []
+        }
+        let slice = String(output[start...end])
+        guard let data = slice.data(using: .utf8),
+              let cameras = try? JSONDecoder().decode([DiscoveredSonyCamera].self, from: data) else {
+            return []
+        }
+        return cameras
     }
 
     private static func isTransientSonyConnectionFailure(_ message: String) -> Bool {

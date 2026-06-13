@@ -171,6 +171,7 @@ struct Args {
     std::string ip_address;   // dotted-decimal, e.g. "10.0.0.247"
     std::string mac_address;  // colon-hex, e.g. "10:32:2c:26:1a:3f"
     bool list_cameras = false;
+    bool list_json = false;    // emit `--list` results as a JSON array
     bool connect_only = false;
     bool status_only = false;
     bool list_capture_settings = false;
@@ -275,6 +276,8 @@ void print_usage() {
         "                     Falls back to env SONY_MAC.\n"
         "  --list             Enumerate SDK-visible cameras, print connection info,\n"
         "                     and exit without connecting or firing the shutter.\n"
+        "  --json             With --list, emit results as a JSON array (for the\n"
+        "                     app's auto-discovery) instead of human-readable lines.\n"
         "  --connect-only     Connect, complete Access Auth/fingerprint caching,\n"
         "                     then disconnect without firing the shutter.\n"
         "                     --probe is accepted as an alias.\n"
@@ -374,6 +377,8 @@ bool parse_args(int argc, char** argv, Args& a) {
             a.persist = true;
         } else if (arg == "--list" || arg == "--list-cameras") {
             a.list_cameras = true;
+        } else if (arg == "--json") {
+            a.list_json = true;
         } else if (arg == "--connect-only" || arg == "--probe") {
             a.connect_only = true;
         } else if (arg == "--status") {
@@ -500,7 +505,52 @@ void print_camera_info(const SDK::ICrCameraObjectInfo* info, CrInt32u index) {
         << "\n";
 }
 
-int list_cameras() {
+// Minimal JSON string escaping for the `--list --json` output. Camera
+// model/name/adapter strings are simple ASCII in practice, but escape the
+// JSON-significant characters (and any control bytes) so the Swift parser
+// always receives valid JSON.
+std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    std::ostringstream esc;
+                    esc << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(static_cast<unsigned char>(c));
+                    out += esc.str();
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
+}
+
+void print_camera_info_json(const SDK::ICrCameraObjectInfo* info, CrInt32u index, bool first) {
+    if (info == nullptr) return;
+    std::string ip = camera_text(info->GetIPAddressChar(), info->GetIPAddressCharSize());
+    if (ip.empty()) ip = ip_to_string(info->GetIPAddress());
+    std::cout
+        << (first ? "" : ",")
+        << "{\"index\":" << index
+        << ",\"model\":\"" << json_escape(camera_text(info->GetModel())) << "\""
+        << ",\"name\":\"" << json_escape(camera_text(info->GetName())) << "\""
+        << ",\"connection\":\"" << json_escape(camera_text(info->GetConnectionTypeName())) << "\""
+        << ",\"adapter\":\"" << json_escape(camera_text(info->GetAdaptorName())) << "\""
+        << ",\"ip\":\"" << json_escape(ip) << "\""
+        << ",\"mac\":\"" << json_escape(mac_to_string(info)) << "\""
+        << ",\"ssh\":" << (info->GetSSHsupport() == SDK::CrSSHsupport_ON ? "true" : "false")
+        << "}";
+}
+
+int list_cameras(bool json) {
     if (!SDK::Init(0)) {
         log_err("SDK::Init failed");
         return 1;
@@ -515,13 +565,19 @@ int list_cameras() {
         return 1;
     }
     if (enum_info == nullptr) {
-        std::cout << "no cameras found\n";
+        std::cout << (json ? "[]\n" : "no cameras found\n");
         SDK::Release();
         return 0;
     }
 
     const auto count = enum_info->GetCount();
-    if (count == 0) {
+    if (json) {
+        std::cout << "[";
+        for (CrInt32u i = 0; i < count; ++i) {
+            print_camera_info_json(enum_info->GetCameraObjectInfo(i), i, i == 0);
+        }
+        std::cout << "]\n";
+    } else if (count == 0) {
         std::cout << "no cameras found\n";
     } else {
         for (CrInt32u i = 0; i < count; ++i) {
@@ -1666,7 +1722,7 @@ int main(int argc, char** argv) {
     }
 
     if (args.list_cameras) {
-        return list_cameras();
+        return list_cameras(args.list_json);
     }
 
     const bool live_view_snapshot = !args.live_view_out.empty();
