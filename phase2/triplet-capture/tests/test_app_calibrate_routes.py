@@ -548,6 +548,24 @@ def test_calibrate_route_locked_returns_409(app_and_orch):
         orch.end_activity()
 
 
+@pytest.mark.parametrize("route", [
+    "/api/settings",
+    "/api/calibrate/preview-light",
+    "/api/calibrate/exposure",
+    "/api/calibrate/ffc",
+])
+@pytest.mark.parametrize("raw", ["[1, 2, 3]", "\"hello\"", "42", "false", "[]"])
+def test_routes_reject_non_object_json_body(app_and_orch, route, raw):
+    """codex#9: every POST route must reject a non-object JSON body (including
+    falsy [] / false / 0) with a 400, not crash to 500 or silently no-op."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    r = client.post(route, data=raw, content_type="application/json")
+    assert r.status_code == 400, (
+        f"{route} with body {raw!r}: expected 400, got {r.status_code}: {r.data}"
+    )
+
+
 def test_settings_post_non_object_body_returns_400(app_and_orch):
     """codex#7: a valid JSON list/string body has no .items(); the route must
     return 400, not let an AttributeError surface as 500."""

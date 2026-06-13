@@ -23,6 +23,25 @@ from scanlight import Scanlight
 from .orchestrator import CaptureSettings, Orchestrator
 
 
+def _json_object_body() -> tuple[Optional[dict], Optional[tuple]]:
+    """Parse the request body as a JSON object.
+
+    Returns ``(data, None)`` on success — an absent/null/unparseable body maps
+    to ``{}`` (a no-op for routes that have defaults). Returns
+    ``(None, (response, 400))`` when the body IS present but is a non-object
+    (JSON list / string / number / bool, including falsy `[]` / `false` / `0` /
+    `""`). Those would otherwise crash on ``.get()`` / ``.items()`` and surface as
+    a 500 (or get silently coerced to ``{}`` by a ``or {}`` idiom). One helper so
+    every route handles malformed top-level shapes the same way.
+    """
+    data = request.get_json(force=True, silent=True)
+    if data is None:
+        return {}, None
+    if not isinstance(data, dict):
+        return None, (jsonify({"error": "request body must be a JSON object"}), 400)
+    return data, None
+
+
 def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: str = "") -> Flask:
     """Build the Flask app around a pre-built Orchestrator.
 
@@ -54,11 +73,9 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
 
     @app.post("/api/settings")
     def post_settings():
-        data = request.get_json(force=True, silent=True) or {}
-        # A valid JSON list/string/number has no .items(); reject non-objects as
-        # a 400 client error rather than letting it surface as a 500.
-        if not isinstance(data, dict):
-            return jsonify({"error": "request body must be a JSON object"}), 400
+        data, _err = _json_object_body()
+        if _err is not None:
+            return _err
         # Claim the activity slot for the (brief) update so it cannot interleave
         # with a capture or a blocking calibration. Those hold the activity but
         # release Orchestrator._lock between single-channel captures, so mutating
@@ -167,7 +184,9 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             return jsonify({"error": "A capture or calibration is in progress — wait for it to finish."}), 409
 
         try:
-            data = request.get_json(force=True, silent=True) or {}
+            data, _err = _json_object_body()
+            if _err is not None:
+                return _err
             enabled = bool(data.get("enabled", False))
             try:
                 level = int(data.get("level", 200))
@@ -200,7 +219,9 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             }), 409
 
         try:
-            data = request.get_json(force=True, silent=True) or {}
+            data, _err = _json_object_body()
+            if _err is not None:
+                return _err
 
             # Parse + validate optional rebate coordinates (T-14-01)
             try:
@@ -310,7 +331,9 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
             return jsonify({"error": "A scan or calibration is in progress — wait for it to finish."}), 409
 
         try:
-            data = request.get_json(force=True, silent=True) or {}
+            data, _err = _json_object_body()
+            if _err is not None:
+                return _err
             try:
                 n_frames = int(data.get("n_frames", 8))
             except (ValueError, TypeError):

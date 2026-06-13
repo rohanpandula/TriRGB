@@ -162,6 +162,12 @@ class PersistentSonyCapture:
 
         Returns 0 on success, 127 if not found, 1 on FAIL / timeout.
         """
+        # Refuse to (re)spawn after close(). close() can land mid-capture (it
+        # kills the child while _do_capture waits), and the mid-capture-death
+        # respawn path would otherwise open a NEW SDK session / re-fire a capture
+        # after shutdown. Central guard covers every respawn site. (codex#9)
+        if self._closed:
+            return 1
         cmd = [self._binary, "--persist"] + self._cmd_extras
         logger.info("spawning persistent sony-capture: %s", " ".join(cmd))
 
