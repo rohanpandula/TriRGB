@@ -2029,24 +2029,24 @@ int main(int argc, char** argv) {
 
     if (!args.exposure_program.empty()) {
         if (!set_exposure_program_mode(handle, args.exposure_program)) {
-            cleanup();
-            return 1;
+            // In --persist mode emit the documented FAIL line before exiting so
+            // the client gets the protocol error, not a generic "exited before
+            // READY". fail_persist is a no-op print for single-shot mode.
+            return fail_persist("exposure-program-setup-failed");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
 
     if (!args.iso.empty()) {
         if (!set_iso_sensitivity(handle, args.iso)) {
-            cleanup();
-            return 1;
+            return fail_persist("iso-setup-failed");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
 
     if (!args.shutter_speed.empty()) {
         if (!set_shutter_speed(handle, args.shutter_speed)) {
-            cleanup();
-            return 1;
+            return fail_persist("shutter-setup-failed");
         }
         if (capture_setting_set_only) {
             exit_code = 0;

@@ -548,6 +548,17 @@ def test_calibrate_route_locked_returns_409(app_and_orch):
         orch.end_activity()
 
 
+def test_settings_post_non_object_body_returns_400(app_and_orch):
+    """codex#7: a valid JSON list/string body has no .items(); the route must
+    return 400, not let an AttributeError surface as 500."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    for raw in ("[1, 2, 3]", "\"hello\"", "42"):
+        r = client.post("/api/settings", data=raw, content_type="application/json")
+        assert r.status_code == 400, f"expected 400 for body {raw!r}, got {r.status_code}: {r.data}"
+        assert "error" in r.get_json()
+
+
 def test_settings_post_null_value_returns_400_not_500(app_and_orch):
     """codex#2: JSON null reaching int()/float() coercion is a client error (400),
     not an unhandled TypeError surfacing as a 500."""

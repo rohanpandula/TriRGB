@@ -55,6 +55,10 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
     @app.post("/api/settings")
     def post_settings():
         data = request.get_json(force=True, silent=True) or {}
+        # A valid JSON list/string/number has no .items(); reject non-objects as
+        # a 400 client error rather than letting it surface as a 500.
+        if not isinstance(data, dict):
+            return jsonify({"error": "request body must be a JSON object"}), 400
         # Claim the activity slot for the (brief) update so it cannot interleave
         # with a capture or a blocking calibration. Those hold the activity but
         # release Orchestrator._lock between single-channel captures, so mutating
