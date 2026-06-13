@@ -229,6 +229,9 @@ final class ScanCoordinator: ObservableObject {
     deinit {
         isRunningCancellable?.cancel()
         compositePollingTask?.cancel()
+        // Normal stop paths cancel this, but a deinit while a capture is in
+        // flight would otherwise leave the 1s prompt poll waking until exit.
+        channelPromptTask?.cancel()
     }
 
     // MARK: - Public transitions

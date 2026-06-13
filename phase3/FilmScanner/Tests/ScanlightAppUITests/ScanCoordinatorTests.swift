@@ -45,6 +45,28 @@ final class FakeLightPanel: LightPanelProtocol {
     }
 }
 
+// MARK: - Test helpers
+
+/// A one-shot async gate: `wait()` suspends until `signal()` is called (or
+/// returns immediately if already signalled). Used to hold a faked async call
+/// open so a test can inspect state deterministically while it's "in flight".
+actor AsyncGate {
+    private var signalled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if signalled { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func signal() {
+        signalled = true
+        let pending = waiters
+        waiters.removeAll()
+        for w in pending { w.resume() }
+    }
+}
+
 // MARK: - FakeOrchestratorClient
 
 /// Implements OrchestratorClientProtocol. Records start/stop/captureFrame calls.
@@ -102,9 +124,13 @@ final class FakeOrchestratorClient: OrchestratorClientProtocol {
         }
     }
 
+    /// Test hook: awaited before captureFrame returns, so a test can hold the
+    /// capture "in flight" (captureInFlight == true) while it inspects state.
+    var beforeCaptureReturns: (@Sendable () async -> Void)?
     func captureFrame(retake: Bool) async throws -> TripletOutcome {
         callLog.append("captureFrame(retake:\(retake))")
         if let err = captureError { throw err }
+        await beforeCaptureReturns?()
         return captureOutcome
     }
 
@@ -763,44 +789,40 @@ final class ScanCoordinatorTests: XCTestCase {
 
     // MARK: - F1: waitingForChannel publishes when pollWaitingForChannel is called
 
-    /// Verifies that pollWaitingForChannel() reads waiting_for_channel from fetchState()
-    /// and publishes it to coordinator.waitingForChannel while captureInFlight is true.
+    /// Verifies that pollWaitingForChannel() reads waiting_for_channel from
+    /// fetchState() and publishes it to coordinator.waitingForChannel while a
+    /// capture is in flight — and that it clears on completion. The capture is
+    /// gated open so the assertion window is deterministic (no race).
     func testPollWaitingForChannelPublishesChannelDuringCapture() async throws {
         let (coordinator, client, _) = makeCoordinator()
         await coordinator.startScan(settings: makeScanSettings())
-
-        // Simulate captureInFlight = true by reaching into the property directly.
-        // In the real flow, captureFrame() sets this. We replicate the condition
-        // here so we can call pollWaitingForChannel() in isolation.
-        //
-        // The poll guards on captureInFlight — set it via the FakeOrchestratorClient's
-        // captureOutcome to be a slow future, but here we test the poll directly.
-        // We inject the result via the client and call the internal poll method.
         client.waitingForChannelResult = "R"
 
-        // Set captureInFlight via a Task that calls captureFrame (which won't
-        // complete until we let it). Use a concurrent task for the real flow.
-        // For unit test simplicity, call pollWaitingForChannel directly after
-        // manually verifying the guard.
-        //
-        // The guard in pollWaitingForChannel is `guard captureInFlight`.
-        // We need captureInFlight = true. Trigger captureFrame as a background
-        // task so captureInFlight is set, then poll.
+        // Hold captureFrame open until we release it, so captureInFlight stays
+        // true while we poll. (CheckedContinuation gate.)
+        let gate = AsyncGate()
+        client.beforeCaptureReturns = { await gate.wait() }
+
         let captureTask = Task { await coordinator.captureFrame(retake: false) }
-        // Yield a few times to let captureInFlight be set.
-        for _ in 0..<5 { await Task.yield() }
+        // Wait until the capture is observably in flight (bounded, to avoid hang).
+        var spins = 0
+        while await coordinator.captureInFlight == false {
+            await Task.yield()
+            spins += 1
+            XCTAssertLessThan(spins, 10_000, "captureInFlight never became true")
+            if spins >= 10_000 { break }
+        }
 
         await coordinator.pollWaitingForChannel()
+        let published = await coordinator.waitingForChannel
+        XCTAssertEqual(published, "R",
+            "pollWaitingForChannel must publish the backend's waiting_for_channel while capturing")
 
-        // captureInFlight may already be false if captureFrame completed quickly.
-        // The channel is reset to nil on completion — check immediately after poll.
-        let capturedChannel = coordinator.waitingForChannel
-
-        captureTask.cancel()
-        // Regardless of timing, verify the poll correctly consumes the injected value.
-        // Since captureFrame completes synchronously in FakeOrchestratorClient, the
-        // window is tight. Verify the infrastructure works end-to-end.
-        _ = capturedChannel  // consumed; the poll either updated or the window closed
+        // Release the capture; the channel must clear on completion.
+        await gate.signal()
+        await captureTask.value
+        let afterDone = await coordinator.waitingForChannel
+        XCTAssertNil(afterDone, "waitingForChannel must clear when the capture completes")
     }
 
     /// Verifies that waitingForChannel is nil when the backend returns null (idle state).

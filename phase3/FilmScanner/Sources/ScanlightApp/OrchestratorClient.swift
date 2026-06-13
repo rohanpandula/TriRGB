@@ -350,18 +350,22 @@ final class OrchestratorClient: ObservableObject {
     private var process: Process?
     private let session: URLSession
     private static let calibrationRequestTimeout: TimeInterval = 30 * 60
-    /// Worst-case timeout for a manual/hw triplet capture: 3 channels ×
-    /// `backendPerChannelTimeoutS` each + 15s margin. The backend caps each
-    /// channel's wait at `sony_capture_timeout_s` (which subsumes settle +
-    /// inbox-stability), and the Swift settings model exposes no override, so
-    /// this constant is a true upper bound rather than an estimate. In manual/hw
-    /// mode the operator fires the IED three times, so the HTTP round-trip can
-    /// legitimately exceed the URLSession default (60s).
-    /// NOTE: `backendPerChannelTimeoutS` MUST track the Python default
-    /// `CaptureSettings.sony_capture_timeout_s`; if that default changes, change
-    /// this too (there is no settings-time handshake that carries it across).
-    private static let backendPerChannelTimeoutS: TimeInterval = 30
-    private static let captureRequestTimeout: TimeInterval = backendPerChannelTimeoutS * 3 + 15
+    /// Per-channel backend capture-wait caps, in seconds. These MUST match what
+    /// the daemon actually uses per `trigger_mode`:
+    ///  - sdk: the app launches the backend with `--capture-timeout-s 60`
+    ///    (`sdkBackendCaptureTimeoutS` is the single source of truth for that
+    ///    arg AND the client timeout — see start()).
+    ///  - manual/hw: the app passes no override, so the backend uses its default
+    ///    `CaptureSettings.sony_capture_timeout_s` (30s); track it here.
+    static let sdkBackendCaptureTimeoutS: TimeInterval = 60
+    static let defaultBackendCaptureTimeoutS: TimeInterval = 30
+    /// The per-channel backend timeout for the currently-launched mode; set in
+    /// start() from the trigger mode. captureFrame derives its HTTP timeout from
+    /// this (× 3 channels + margin) so an SDK triplet (3 × 60s) can't be killed
+    /// client-side before the backend finishes. Internal for test injection.
+    var activePerChannelCaptureTimeoutS: TimeInterval = OrchestratorClient.defaultBackendCaptureTimeoutS
+    /// Margin (seconds) added on top of 3 × per-channel before the client gives up.
+    private static let captureTimeoutMarginS: TimeInterval = 15
     internal var sonyConnectionProbeOverride: ((ScanSettings) async -> SonyConnectionProbeResult)?
     internal static var sonyARPTableProvider: () -> String = {
         let proc = Process()
@@ -653,6 +657,13 @@ final class OrchestratorClient: ObservableObject {
         childExitStatus = nil
         stderrData = Data()
         stopping = false
+
+        // Record the per-channel backend capture timeout for this launch so
+        // captureFrame's HTTP timeout covers the real worst case for this mode
+        // (SDK uses 60s/channel; manual/hw use the backend default 30s).
+        activePerChannelCaptureTimeoutS = settings.triggerMode == "sdk"
+            ? Self.sdkBackendCaptureTimeoutS
+            : Self.defaultBackendCaptureTimeoutS
 
         // Bump the launch token. Every async callback/cleanup below captures this
         // value and no-ops if a newer launch has superseded it — so a slow callback
@@ -972,10 +983,11 @@ final class OrchestratorClient: ObservableObject {
         let url = URL(string: urlStr)!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        // Set an explicit timeout covering 3 channels × captureTimeoutS + margin.
-        // The URLSession default (60s) is less than a manual triplet in worst case
-        // (operator fires 3 IED shots with 30s timeout per channel = up to 90s).
-        request.timeoutInterval = Self.captureRequestTimeout
+        // Explicit timeout covering 3 channels × the launched mode's per-channel
+        // backend timeout + margin. The URLSession default (60s) is far less than
+        // a real triplet — SDK is 3 × 60s, manual is 3 IED fires at 30s each — so
+        // without this the client would abort while the backend is still capturing.
+        request.timeoutInterval = activePerChannelCaptureTimeoutS * 3 + Self.captureTimeoutMarginS
         // Empty body — retake is a query param only
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
@@ -1484,7 +1496,7 @@ final class OrchestratorClient: ObservableObject {
             args += ["--ied-inbox", inbox]
         }
         if settings.triggerMode == "sdk" {
-            args += ["--capture-timeout-s", "60"]
+            args += ["--capture-timeout-s", String(Int(Self.sdkBackendCaptureTimeoutS))]
             if let sonyCapture = settings.sonyCapturePath, !sonyCapture.isEmpty {
                 args += ["--sony-capture", sonyCapture]
             } else if let resolved = try? PythonToolLocator.resolve("sony-capture") {

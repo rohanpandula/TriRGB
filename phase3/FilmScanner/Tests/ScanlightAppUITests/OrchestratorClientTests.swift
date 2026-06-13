@@ -1409,6 +1409,29 @@ final class OrchestratorClientTests: XCTestCase {
         )
     }
 
+    // MARK: - P1: SDK mode uses 60s/channel, so the client timeout must cover 3×60s
+
+    /// Regression: SDK mode launches the backend with `--capture-timeout-s 60`,
+    /// so a three-channel SDK triplet can run ~180s. The client timeout must be
+    /// derived from that per-channel value (not the 30s manual default), or the
+    /// app aborts while the backend is still capturing.
+    func testCaptureFrameSdkModeTimeoutCovers3x60s() async throws {
+        StubURLProtocol.routes["/api/capture"] = (makeTripletJSON(), 200)
+
+        let client = OrchestratorClient(session: makeStubSession())
+        client.webPort = 9999
+        // Simulate a launched SDK session (start() sets this from triggerMode).
+        client.activePerChannelCaptureTimeoutS = OrchestratorClient.sdkBackendCaptureTimeoutS
+
+        _ = try await client.captureFrame(retake: false)
+
+        let timeout = StubURLProtocol.lastRequest?.timeoutInterval ?? 0
+        XCTAssertGreaterThanOrEqual(
+            timeout, 195.0,
+            "SDK captureFrame timeout must cover 3 × 60s backend per-channel + margin; got \(timeout)s"
+        )
+    }
+
     // MARK: - F1: OrchestratorState decodes waiting_for_channel
 
     func testFetchStateDecodesWaitingForChannelWhenPresent() async throws {
