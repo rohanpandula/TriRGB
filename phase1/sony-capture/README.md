@@ -92,7 +92,7 @@ sony-capture --live-view-stream-out PATH [--ip-address IP [--mac-address MAC]]
 
 `--persist` keeps one SDK session alive across multiple captures, eliminating per-capture SDK init + Wi-Fi reconnect overhead (~5–11 min/roll saved).
 
-**Invocation:** all connection flags (`--ip-address`, `--mac-address`, env credentials, etc.) work identically. On successful connect + SetSaveInfo, the process prints `READY\n` to stdout and flushes.
+**Invocation:** all connection flags (`--ip-address`, `--mac-address`, env credentials, etc.) work identically. On a successful **connect** (plus any startup exposure/ISO/shutter setup), the process prints `READY\n` to stdout and flushes. `READY` signals connection only — it is **not** a save-path preflight: `SetSaveInfo` runs per capture (inside each `capture` command, so the SDK temp path is always current), so a bad output path surfaces as a `CAPTURE_FAIL`, not at `READY`.
 
 **stdin commands → stdout responses** (all lines newline-terminated, stdout flushed immediately):
 

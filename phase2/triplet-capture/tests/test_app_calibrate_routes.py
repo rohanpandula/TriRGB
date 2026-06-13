@@ -566,6 +566,23 @@ def test_routes_reject_non_object_json_body(app_and_orch, route, raw):
     )
 
 
+def test_routes_reject_malformed_json_body(app_and_orch):
+    """codex#12: a non-empty but INVALID/truncated JSON body must be 400, not
+    silently treated as {} (which would run hardware ops with defaults and hide
+    client/request corruption). A truly absent body stays a 200 no-op."""
+    app, _ = app_and_orch
+    client = app.test_client()
+    for route in ("/api/settings", "/api/calibrate/preview-light",
+                  "/api/calibrate/exposure", "/api/calibrate/ffc"):
+        r = client.post(route, data='{"level_r": 12', content_type="application/json")  # truncated
+        assert r.status_code == 400, (
+            f"{route}: expected 400 for malformed JSON, got {r.status_code}: {r.data}"
+        )
+    # An absent body is still accepted as an empty no-op on /api/settings.
+    r2 = client.post("/api/settings", data="", content_type="application/json")
+    assert r2.status_code == 200, f"empty body should be a 200 no-op, got {r2.status_code}: {r2.data}"
+
+
 def test_settings_post_non_object_body_returns_400(app_and_orch):
     """codex#7: a valid JSON list/string body has no .items(); the route must
     return 400, not let an AttributeError surface as 500."""

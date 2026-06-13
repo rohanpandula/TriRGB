@@ -26,16 +26,21 @@ from .orchestrator import CaptureSettings, Orchestrator
 def _json_object_body() -> tuple[Optional[dict], Optional[tuple]]:
     """Parse the request body as a JSON object.
 
-    Returns ``(data, None)`` on success — an absent/null/unparseable body maps
-    to ``{}`` (a no-op for routes that have defaults). Returns
-    ``(None, (response, 400))`` when the body IS present but is a non-object
-    (JSON list / string / number / bool, including falsy `[]` / `false` / `0` /
-    `""`). Those would otherwise crash on ``.get()`` / ``.items()`` and surface as
-    a 500 (or get silently coerced to ``{}`` by a ``or {}`` idiom). One helper so
-    every route handles malformed top-level shapes the same way.
+    Returns ``(data, None)`` on success. An ABSENT body maps to ``{}`` (a no-op
+    for routes that have defaults). Returns ``(None, (response, 400))`` when the
+    body is present but MALFORMED (invalid/truncated JSON — which would otherwise
+    run hardware ops with silent defaults and hide client corruption) or is a
+    non-object (JSON list / string / number / bool, including falsy `[]` /
+    `false` / `0` / `""`, which would crash on ``.get()`` / ``.items()``). One
+    helper so every route handles malformed top-level shapes the same way.
     """
     data = request.get_json(force=True, silent=True)
     if data is None:
+        # get_json returns None for both an absent body AND invalid JSON. A
+        # non-empty raw body that failed to parse is malformed → 400; a truly
+        # empty body is absent → {} (no-op).
+        if request.get_data() and request.get_data().strip():
+            return None, (jsonify({"error": "request body is not valid JSON"}), 400)
         return {}, None
     if not isinstance(data, dict):
         return None, (jsonify({"error": "request body must be a JSON object"}), 400)
