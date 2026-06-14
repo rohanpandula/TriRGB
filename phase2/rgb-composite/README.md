@@ -39,9 +39,23 @@ rgb-composite \
 ```
 
 Optional:
-- `--no-sidecar` — don't write the `.colorspace.txt` sidecar (TIFF tags still embedded).
+- `--no-sidecar` — don't write the `.colorspace.txt` sidecar (the embedded ICC profile + TIFF tags remain).
 
 Exit codes: `0` success, `1` on any failure (including dimension mismatch — meaning the film moved between captures).
+
+## Color profile
+
+Every image output carries an **embedded ICC profile** (`rgb_composite.icc`,
+built from the ProPhoto primaries in `dng.py`) so viewers color-manage it
+instead of falling back to sRGB:
+
+- **Linear composite** (TIFF) → linear ProPhoto-RGB, D50. The DNG variant
+  instead carries full DNG colorimetry tags (`ColorMatrix1`/`ForwardMatrix1`/…).
+- **Rendered positive + preview** (`triplet_positive`) → ProPhoto primaries
+  with a 2.2 display gamma. 2.2 (not the standard ROMM 1.8) matches the tone the
+  untagged preview already showed, so tagging corrects only the previously-wrong
+  primaries and leaves tone essentially unchanged. The preview PNG and the
+  exported positive share one profile, so on-screen matches the file (WYSIWYG).
 
 ## The demosaic parameters (locked)
 
@@ -96,6 +110,6 @@ Tests patch `demosaic_linear` to return synthetic 16-bit arrays — no actual RA
 - The output is NOT inverted (a regression that would visually plausible).
 - Dimension mismatch raises with a clear error.
 - The locked rawpy parameters match PROJECT.md exactly.
-- Sidecar + embedded metadata are written.
+- Sidecar, embedded ICC profile, and metadata tags are written.
 
 When real ARW samples become available, add an integration test that runs end-to-end. The unit tests guarantee correctness of everything *except* the rawpy invocation itself.

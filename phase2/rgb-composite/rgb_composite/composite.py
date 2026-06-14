@@ -36,6 +36,7 @@ logger = logging.getLogger("rgb_composite")
 from c41_core.contracts import BaseRegionDescriptor, InversionParams
 
 from .dng import write_linear_dng
+from .icc import PROPHOTO_G22_ICC, PROPHOTO_LINEAR_ICC
 from .ffc import (
     CalibrationError,
     FFCMaps,
@@ -108,8 +109,20 @@ def _select_channel(arr: np.ndarray, ch: int) -> np.ndarray:
     return arr[..., ch]
 
 
-def _write_tiff(out_path: Path, composite: np.ndarray, description: str) -> None:
-    """Write a 16-bit linear RGB TIFF with colorspace metadata embedded."""
+def _write_tiff(
+    out_path: Path,
+    composite: np.ndarray,
+    description: str,
+    *,
+    icc: bytes = PROPHOTO_LINEAR_ICC,
+    colorspace_label: str = "linear ProPhoto-RGB",
+) -> None:
+    """Write a 16-bit RGB TIFF with an embedded ICC profile.
+
+    ``icc`` defaults to the linear ProPhoto profile, correct for the archival
+    composite. Callers writing a rendered (gamma-curved) positive pass the
+    2.2-display profile so viewers color-manage it instead of assuming sRGB.
+    """
     tifffile.imwrite(
         out_path,
         composite,
@@ -118,7 +131,8 @@ def _write_tiff(out_path: Path, composite: np.ndarray, description: str) -> None
         predictor=True,
         description=description,
         software="rgb-composite",
-        metadata={"colorspace": "linear ProPhoto-RGB"},
+        iccprofile=icc,
+        metadata={"colorspace": colorspace_label},
     )
 
 
@@ -139,6 +153,7 @@ def _write_sidecar(
         "gamma: 1.0\n"
         "white_point: D50\n"
         "primaries: ProPhoto-RGB (Romm RGB)\n"
+        "icc: embedded (linear ProPhoto-RGB, D50)\n"
         "inversion: NOT INVERTED — invert downstream in FilmLab or NLP\n"
         f"source: {description}\n"
     )
@@ -159,6 +174,7 @@ def _write_positive_sidecar(
     body = (
         "colorspace: rendered positive RGB from linear ProPhoto-RGB composite\n"
         "bit_depth: 16\n"
+        "icc: embedded (ProPhoto-RGB primaries, 2.2 display, D50)\n"
         "inversion: AUTO POSITIVE\n"
         "model: density (-log transmission/base)\n"
         f"source_negative: {source_path.name}\n"
@@ -844,7 +860,13 @@ def composite_triplet(
             f"auto-positive render from {primary.name}; d-min balanced from "
             f"base region x={descriptor.x} y={descriptor.y} w={descriptor.w} h={descriptor.h}"
         )
-        _write_tiff(positive_path, positive, positive_description)
+        _write_tiff(
+            positive_path,
+            positive,
+            positive_description,
+            icc=PROPHOTO_G22_ICC,
+            colorspace_label="rendered positive ProPhoto-RGB (2.2 display)",
+        )
         if write_sidecar:
             _write_positive_sidecar(
                 positive_path,
