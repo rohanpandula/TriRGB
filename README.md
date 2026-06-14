@@ -6,7 +6,8 @@ TriRGB is a Mac-driven workflow for **trichromatic narrowband-RGB film scanning*
 it photographs a color negative as three sequential exposures — one each under
 narrowband **red (665 nm)**, **green (525 nm)**, and **blue (455 nm)** light —
 then composites the matching channel from each into a single 16-bit linear
-ProPhoto-RGB TIFF (or Linear DNG) that inverts cleanly in
+ProPhoto-RGB TIFF (or Linear DNG) — **color-managed** so it opens with correct
+color in any profile-aware app — that inverts cleanly in
 [Negative Lab Pro](https://www.negativelabpro.com/) or
 [FilmLab](https://www.filmlabapp.com/).
 
@@ -87,7 +88,8 @@ phase1/   Hardware control (plug-in-day primitives)
 phase2/   Imaging pipeline (Python, hardware-free + testable)
   c41-core/         Versioned data contracts shared across the pipeline
   rgb-composite/    Channel extraction, flat-field correction, rebate detection,
-                    linear inversion, and numeric QA checks
+                    linear inversion, color-managed output (embedded ICC
+                    profiles), and numeric QA checks
   triplet-capture/  Capture orchestrator + Flask backend; per-roll exposure &
                     flat-field calibration
   batch-composite/  Batch compositing of a whole roll
@@ -162,7 +164,9 @@ The short version of a session:
    for the whole roll** (no per-frame reconnect). RAWs auto-download and are
    named by roll/frame.
 4. **Composite** — the backend merges each triplet into a 16-bit linear
-   TIFF/DNG.
+   TIFF/DNG. Each output carries an embedded color profile (ICC on the TIFF,
+   DNG colorimetry tags) so it reads with correct color — not assumed sRGB —
+   in Lightroom, NLP, Preview, and the in-app Develop preview.
 5. **Invert** — import to Negative Lab Pro / FilmLab and apply a linear
    inversion.
 
