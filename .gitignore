@@ -29,3 +29,6 @@ DerivedData/
 
 # Agent harness — local Claude Code state (settings.local.json, locks, worktrees)
 .claude/
+
+# Planning (gsd internal — kept local, not published)
+.planning/
