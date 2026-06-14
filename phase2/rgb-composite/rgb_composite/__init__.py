@@ -23,6 +23,11 @@ from .dng import (
     read_linear_dng_tags,
     write_linear_dng,
 )
+from .icc import (
+    PROPHOTO_G22_ICC,
+    PROPHOTO_LINEAR_ICC,
+    build_prophoto_icc,
+)
 from .ffc import (
     CalibrationError,
     FFCMaps,
@@ -60,6 +65,10 @@ __all__ = [
     "write_linear_dng",
     "read_linear_dng_tags",
     "build_dng_extratags",
+    # icc
+    "build_prophoto_icc",
+    "PROPHOTO_LINEAR_ICC",
+    "PROPHOTO_G22_ICC",
     # ffc
     "load_ffc_maps",
     "compute_ffc_map",

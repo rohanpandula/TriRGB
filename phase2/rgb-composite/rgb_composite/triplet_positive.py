@@ -34,6 +34,7 @@ from .composite import (
     demosaic_linear,
     hd_sigmoid_tone,
 )
+from .icc import PROPHOTO_G22_ICC, PROPHOTO_LINEAR_ICC
 
 
 CHANNEL_NAMES = ("R", "G", "B")
@@ -502,7 +503,10 @@ def render_triplet_preview(
     stride = max(1, int(np.ceil(max(full_w, full_h) / max_dim)))
     preview = positive[::stride, ::stride, :]
     preview8 = np.rint(preview.astype(np.float32) / 257.0).clip(0, 255).astype(np.uint8)
-    Image.fromarray(preview8).save(preview_path)
+    # Embed the ProPhoto (2.2 display) profile so macOS/NSImage color-manages
+    # the preview instead of falling back to sRGB. Same profile the positive
+    # TIFF carries, so the on-screen preview matches the export (WYSIWYG).
+    Image.fromarray(preview8).save(preview_path, icc_profile=PROPHOTO_G22_ICC)
 
     return TripletPreviewResult(
         preview_path=str(preview_path),
@@ -596,6 +600,7 @@ def render_triplet_positive(
         compression="zlib",
         predictor=True,
         description="channel-isolated RGB negative composite from imported triplet",
+        iccprofile=PROPHOTO_LINEAR_ICC,
         metadata=None,
     )
     tifffile.imwrite(
@@ -605,6 +610,7 @@ def render_triplet_positive(
         compression="zlib",
         predictor=True,
         description="auto positive render from channel-isolated RGB triplet",
+        iccprofile=PROPHOTO_G22_ICC,
         metadata=None,
     )
 
