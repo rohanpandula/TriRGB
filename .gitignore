@@ -32,3 +32,6 @@ DerivedData/
 
 # Planning (gsd internal — kept local, not published)
 .planning/
+
+# Generated app iconset (regenerate with phase3/FilmScanner/Resources/make_icon.py)
+*.iconset/
