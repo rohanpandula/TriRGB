@@ -101,7 +101,9 @@ public:
         // type == None means a captured image; SettingFile types are unrelated.
         if (type != SDK::CrDownloadSettingFileType_None) return;
         std::lock_guard<std::mutex> lk(mtx_);
-        downloaded_filename_ = filename ? reinterpret_cast<const char*>(filename) : "";
+        std::string name = filename ? reinterpret_cast<const char*>(filename) : "";
+        downloaded_filename_ = name;          // last file (back-compat)
+        downloaded_files_.push_back(name);    // all files (PSMS delivers 4)
         downloaded_ = true;
         cv_.notify_all();
     }
@@ -128,6 +130,19 @@ public:
         return true;
     }
 
+    // Wait for up to `n` downloaded files (Pixel-Shift Multi Shooting delivers 4
+    // sub-frames per release). Returns as soon as n have arrived, or on
+    // timeout/disconnect/error with whatever accumulated so far.
+    bool wait_downloaded_n(size_t n, std::chrono::seconds timeout,
+                           std::vector<std::string>& out) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait_for(lk, timeout, [this, n] {
+            return downloaded_files_.size() >= n || disconnected_ || last_error_ != 0;
+        });
+        out = downloaded_files_;
+        return !out.empty();
+    }
+
     CrInt32u last_error() {
         std::lock_guard<std::mutex> lk(mtx_);
         return last_error_;
@@ -140,6 +155,7 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         downloaded_ = false;
         downloaded_filename_.clear();
+        downloaded_files_.clear();
         last_error_ = 0;
     }
 
@@ -150,6 +166,7 @@ private:
     std::atomic<bool> disconnected_{false};
     bool downloaded_ = false;
     std::string downloaded_filename_;
+    std::vector<std::string> downloaded_files_;
     std::atomic<CrInt32u> last_error_{0};
 };
 
@@ -177,6 +194,8 @@ struct Args {
     bool list_capture_settings = false;
     bool list_shutter_speeds = false;
     bool persist = false;          // persistent session mode (task 4)
+    bool no_s1 = false;            // skip S1 (AF half-press): MF rigs / PSMS release
+    int expect_files = 1;          // files to wait for per capture (PSMS 4-shot = 4)
 };
 
 std::string default_fingerprint_cache_path() {
@@ -375,6 +394,11 @@ bool parse_args(int argc, char** argv, Args& a) {
             }
         } else if (arg == "--persist") {
             a.persist = true;
+        } else if (arg == "--no-s1" || arg == "--release-only") {
+            a.no_s1 = true;
+        } else if (arg == "--expect-files") {
+            if (i + 1 >= argc) { log_err("--expect-files requires a value"); return false; }
+            a.expect_files = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--list" || arg == "--list-cameras") {
             a.list_cameras = true;
         } else if (arg == "--json") {
@@ -799,21 +823,31 @@ bool write_binary_file(const fs::path& path, const char* bytes, CrInt32u size, s
 //   is conservative dead-time. MF/manual-exposure rigs can drop to 0ms since
 //   wait_downloaded already blocks until the file arrives.
 bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
+                                 bool skip_s1_arg,
                                  int s1_settle_ms = 500,
                                  int post_release_ms = 1000) {
+    // DIAGNOSTIC (env-gated): SONY_SKIP_S1 bypasses the S1 (AF half-press) lock
+    // and issues a bare Release. Used to test whether a tethered release fires a
+    // Pixel-Shift Multi Shooting burst on bodies that reject S1 while in PSMS.
+    // Default (env unset) is unchanged behavior.
+    const bool skip_s1 = skip_s1_arg || (std::getenv("SONY_SKIP_S1") != nullptr);
+
     SDK::CrDeviceProperty s1;
     s1.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_S1);
     s1.SetValueType(SDK::CrDataType::CrDataType_UInt16);
     s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
-    auto s1_lock_err = SDK::SetDeviceProperty(handle, &s1);
-    if (CR_FAILED(s1_lock_err)) {
-        log_err("SetDeviceProperty(S1 locked) failed (CrError "
-                + std::to_string(static_cast<unsigned>(s1_lock_err)) + ")");
-        return false;
+    if (!skip_s1) {
+        auto s1_lock_err = SDK::SetDeviceProperty(handle, &s1);
+        if (CR_FAILED(s1_lock_err)) {
+            log_err("SetDeviceProperty(S1 locked) failed (CrError "
+                    + std::to_string(static_cast<unsigned>(s1_lock_err)) + ")");
+            return false;
+        }
+        if (s1_settle_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(s1_settle_ms));
+    } else {
+        log_err("skipping S1 half-press — release-only (--no-s1 / SONY_SKIP_S1)");
     }
-
-    if (s1_settle_ms > 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(s1_settle_ms));
 
     const auto rc_down = SDK::SendCommand(
         handle, SDK::CrCommandId_Release, SDK::CrCommandParam_Down);
@@ -833,20 +867,24 @@ bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
                 + std::to_string(static_cast<unsigned>(first_err)) + ")");
         // Best-effort S1 unlock so a failed shutter doesn't strand the body in a
         // locked state.
-        s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
-        SDK::SetDeviceProperty(handle, &s1);
+        if (!skip_s1) {
+            s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+            SDK::SetDeviceProperty(handle, &s1);
+        }
         return false;
     }
     std::cerr << kExposureCompleteMarker << std::endl;
 
-    if (post_release_ms > 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(post_release_ms));
-    s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
-    auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
-    if (CR_FAILED(s1_unlock_err)) {
-        log_err("SetDeviceProperty(S1 unlocked) failed (CrError "
-                + std::to_string(static_cast<unsigned>(s1_unlock_err)) + ")");
-        return false;
+    if (!skip_s1) {
+        if (post_release_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(post_release_ms));
+        s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+        auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
+        if (CR_FAILED(s1_unlock_err)) {
+            log_err("SetDeviceProperty(S1 unlocked) failed (CrError "
+                    + std::to_string(static_cast<unsigned>(s1_unlock_err)) + ")");
+            return false;
+        }
     }
     return true;
 }
@@ -2200,7 +2238,8 @@ int main(int argc, char** argv) {
         const fs::path& capture_out_path,
         int timeout_s,
         int s1_settle_ms,
-        int post_release_ms
+        int post_release_ms,
+        int expect_files
     ) -> bool {
         constexpr int kImageSaveAutoStartNo = -1;
         std::string tmp_path_str = capture_tmp_dir.string();
@@ -2220,12 +2259,13 @@ int main(int argc, char** argv) {
         // uses for Access Auth bodies. trigger_full_shutter_press now emits the
         // exposure-complete marker itself, the moment Release-Up succeeds —
         // before its post-release dead-time — so the LED-off hook fires sooner.
-        if (!trigger_full_shutter_press(handle, s1_settle_ms, post_release_ms)) {
+        if (!trigger_full_shutter_press(handle, args.no_s1, s1_settle_ms, post_release_ms)) {
             return false;
         }
 
-        std::string downloaded_filename;
-        if (!cb.wait_downloaded(std::chrono::seconds(timeout_s), downloaded_filename)) {
+        std::vector<std::string> downloaded;
+        if (!cb.wait_downloaded_n(static_cast<size_t>(expect_files),
+                                  std::chrono::seconds(timeout_s), downloaded)) {
             const auto err = cb.last_error();
             if (err != 0) {
                 log_err("camera reported error before host-PC download completed (CrError "
@@ -2236,36 +2276,48 @@ int main(int argc, char** argv) {
             return false;
         }
 
-        fs::path src;
-        if (!downloaded_filename.empty()) {
-            const fs::path reported(downloaded_filename);
-            const fs::path tmp_reported = capture_tmp_dir / reported.filename();
-            if (reported.is_absolute() && fs::exists(reported)) {
-                src = reported;
-            } else if (fs::exists(tmp_reported)) {
-                src = tmp_reported;
-            }
+        // The SDK auto-saves every delivered frame into the fresh per-capture
+        // scratch dir (prefix "frame"). A normal capture leaves 1 file; a 4-shot
+        // Pixel-Shift burst leaves 4. Move them all out: the first onto the
+        // requested out-path, any extras as <stem>_<k><ext> beside it.
+        std::vector<fs::path> files;
+        std::error_code it_ec;
+        for (const auto& e : fs::directory_iterator(capture_tmp_dir, it_ec)) {
+            if (e.is_regular_file()) files.push_back(e.path());
         }
-        if (src.empty()) {
-            if (auto found = find_one_file(capture_tmp_dir)) {
-                src = fs::absolute(*found);
-            } else {
-                log_err("host-PC download completed but no file found in "
-                        + capture_tmp_dir.string());
-                return false;
-            }
+        std::sort(files.begin(), files.end());
+        if (files.empty()) {
+            log_err("host-PC download completed but no file found in "
+                    + capture_tmp_dir.string());
+            return false;
         }
 
-        src = fs::absolute(src);
-        if (src != capture_out_path) {
-            std::error_code rename_ec;
-            fs::rename(src, capture_out_path, rename_ec);
-            if (rename_ec) {
-                log_err("rename " + src.string() + " -> " + capture_out_path.string()
-                        + " failed: " + rename_ec.message());
-                return false;
+        int moved = 0;
+        for (size_t k = 0; k < files.size(); ++k) {
+            fs::path dest;
+            if (k == 0) {
+                dest = capture_out_path;
+            } else {
+                const std::string stem = capture_out_path.stem().string();
+                const std::string ext = capture_out_path.extension().string();
+                dest = capture_out_path.parent_path()
+                       / (stem + "_" + std::to_string(k + 1) + ext);
             }
+            const fs::path src = fs::absolute(files[k]);
+            if (src != dest) {
+                std::error_code rename_ec;
+                fs::rename(src, dest, rename_ec);
+                if (rename_ec) {
+                    log_err("rename " + src.string() + " -> " + dest.string()
+                            + " failed: " + rename_ec.message());
+                    continue;
+                }
+            }
+            ++moved;
         }
+        if (moved == 0) return false;
+        if (expect_files > 1 || moved > 1)
+            log_err("downloaded " + std::to_string(moved) + " frame(s)");
         return true;
     };
 
@@ -2361,7 +2413,8 @@ int main(int argc, char** argv) {
 
                 const bool ok = do_capture(
                     cap_tmp_dir, cap_out_path,
-                    args.timeout_s, args.s1_settle_ms, args.post_release_ms);
+                    args.timeout_s, args.s1_settle_ms, args.post_release_ms,
+                    args.expect_files);
 
                 // Clean up per-capture scratch dir regardless of success.
                 std::error_code rm_ec;
@@ -2389,7 +2442,8 @@ int main(int argc, char** argv) {
     // Single-shot mode (original behavior).
     // -------------------------------------------------------------------------
     if (!do_capture(tmp_dir, out_path,
-                    args.timeout_s, args.s1_settle_ms, args.post_release_ms)) {
+                    args.timeout_s, args.s1_settle_ms, args.post_release_ms,
+                    args.expect_files)) {
         cleanup();
         return 1;
     }
