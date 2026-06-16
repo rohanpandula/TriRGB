@@ -847,7 +847,8 @@ bool write_binary_file(const fs::path& path, const char* bytes, CrInt32u size, s
 bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
                                  bool skip_s1_arg,
                                  int s1_settle_ms = 500,
-                                 int post_release_ms = 1000) {
+                                 int post_release_ms = 1000,
+                                 int exposure_hold_ms = 0) {
     // DIAGNOSTIC (env-gated): SONY_SKIP_S1 bypasses the S1 (AF half-press) lock
     // and issues a bare Release. Used to test whether a tethered release fires a
     // Pixel-Shift Multi Shooting burst on bodies that reject S1 while in PSMS.
@@ -877,12 +878,14 @@ bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
     const auto rc_up = SDK::SendCommand(
         handle, SDK::CrCommandId_Release, SDK::CrCommandParam_Up);
 
-    // The exposure is physically complete the instant Release-Up is sent: the
-    // sensor has the frame and the LED is no longer needed. On success, emit the
-    // exposure-complete marker HERE — before the post-release dead-time and the
-    // S1 unlock — so the caller's LED-off hook fires ~post_release_ms sooner
-    // (1000ms per channel by default). Previously this marker waited until the
-    // whole function returned, keeping the LED lit through that dead-time.
+    // Release has been sent; the sensor now integrates for the shutter duration.
+    // The exposure is NOT complete at Release-Up — assuming so darkened every
+    // non-trivial exposure, because the caller's LED-off hook (fired by the
+    // marker below) killed the light mid-integration. Hold for the configured
+    // exposure duration + a release-latency margin (exposure_hold_ms) so the
+    // marker fires at exposure END: after the light is actually needed, still
+    // before the lengthy host download. exposure_hold_ms==0 keeps the legacy
+    // immediate marker (shutter duration unknown).
     if (CR_FAILED(rc_down) || CR_FAILED(rc_up)) {
         const auto first_err = CR_FAILED(rc_down) ? rc_down : rc_up;
         log_err("SendCommand(Release) failed (CrError "
@@ -895,6 +898,10 @@ bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
         }
         return false;
     }
+
+    if (exposure_hold_ms > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(exposure_hold_ms));
+
     std::cerr << kExposureCompleteMarker << std::endl;
 
     if (!skip_s1) {
@@ -2378,11 +2385,34 @@ int main(int argc, char** argv) {
             return false;
         }
 
+        // Read the configured shutter so the LED stays lit for the WHOLE sensor
+        // integration. trigger_full_shutter_press delays the exposure-complete
+        // marker (which drives the caller's LED-off hook) by this much, so the
+        // light can't be cut mid-exposure. 400ms floor covers release-processing
+        // latency; on the rare read failure that floor still protects fast/
+        // moderate shutters.
+        int exposure_hold_ms = 400;
+        {
+            CrInt32u ss_code = SDK::CrDeviceProperty_ShutterSpeed;
+            SDK::CrDeviceProperty* ss_props = nullptr;
+            CrInt32 ss_count = 0;
+            const auto ss_err =
+                SDK::GetSelectDeviceProperties(handle, 1, &ss_code, &ss_props, &ss_count);
+            if (!CR_FAILED(ss_err) && ss_props != nullptr && ss_count > 0) {
+                double secs = 0.0;
+                if (shutter_value_seconds(ss_props[0].GetCurrentValue(), /*is64=*/false, secs)
+                    && secs > 0.0)
+                    exposure_hold_ms = static_cast<int>(secs * 1000.0) + 400;
+            }
+            if (ss_props != nullptr) SDK::ReleaseDeviceProperties(handle, ss_props);
+        }
+
         // Trigger the shutter using the same S1-lock + Release sequence SonShell
-        // uses for Access Auth bodies. trigger_full_shutter_press now emits the
-        // exposure-complete marker itself, the moment Release-Up succeeds —
-        // before its post-release dead-time — so the LED-off hook fires sooner.
-        if (!trigger_full_shutter_press(handle, args.no_s1, s1_settle_ms, post_release_ms)) {
+        // uses for Access Auth bodies. The exposure-complete marker (LED-off
+        // signal) is emitted after exposure_hold_ms so the LED covers the full
+        // exposure, then before the post-release dead-time and host download.
+        if (!trigger_full_shutter_press(handle, args.no_s1, s1_settle_ms,
+                                        post_release_ms, exposure_hold_ms)) {
             return false;
         }
 
