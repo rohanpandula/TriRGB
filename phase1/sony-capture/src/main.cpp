@@ -101,7 +101,9 @@ public:
         // type == None means a captured image; SettingFile types are unrelated.
         if (type != SDK::CrDownloadSettingFileType_None) return;
         std::lock_guard<std::mutex> lk(mtx_);
-        downloaded_filename_ = filename ? reinterpret_cast<const char*>(filename) : "";
+        std::string name = filename ? reinterpret_cast<const char*>(filename) : "";
+        downloaded_filename_ = name;          // last file (back-compat)
+        downloaded_files_.push_back(name);    // all files (PSMS delivers 4)
         downloaded_ = true;
         cv_.notify_all();
     }
@@ -128,6 +130,41 @@ public:
         return true;
     }
 
+    // Wait for up to `n` downloaded files (Pixel-Shift Multi Shooting delivers 4
+    // sub-frames per release). Returns as soon as n have arrived, or on
+    // timeout/disconnect/error with whatever accumulated so far.
+    bool wait_downloaded_n(size_t n, std::chrono::seconds timeout,
+                           std::vector<std::string>& out) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait_for(lk, timeout, [this, n] {
+            return downloaded_files_.size() >= n || disconnected_ || last_error_ != 0;
+        });
+        out = downloaded_files_;
+        return !out.empty();
+    }
+
+    // Drain trailing same-shot downloads. A RAW+JPEG body delivers the companion
+    // JPEG as a SECOND file shortly after the RAW; wait_downloaded_n() returns as
+    // soon as the requested count arrives, so the still-in-flight companion would
+    // otherwise be orphaned when the per-capture temp dir is removed — which
+    // stalls the NEXT capture's download pipeline. Block until no new file has
+    // arrived for `quiet`, bounded by `max_wait`. Returns the final file list.
+    void drain_downloads(std::chrono::milliseconds quiet,
+                         std::chrono::milliseconds max_wait,
+                         std::vector<std::string>& out) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        const auto deadline = std::chrono::steady_clock::now() + max_wait;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const size_t before = downloaded_files_.size();
+            const bool grew = cv_.wait_for(lk, quiet, [this, before] {
+                return downloaded_files_.size() > before
+                       || disconnected_ || last_error_ != 0;
+            });
+            if (!grew || disconnected_ || last_error_ != 0) break;
+        }
+        out = downloaded_files_;
+    }
+
     CrInt32u last_error() {
         std::lock_guard<std::mutex> lk(mtx_);
         return last_error_;
@@ -140,6 +177,7 @@ public:
         std::lock_guard<std::mutex> lk(mtx_);
         downloaded_ = false;
         downloaded_filename_.clear();
+        downloaded_files_.clear();
         last_error_ = 0;
     }
 
@@ -150,6 +188,7 @@ private:
     std::atomic<bool> disconnected_{false};
     bool downloaded_ = false;
     std::string downloaded_filename_;
+    std::vector<std::string> downloaded_files_;
     std::atomic<CrInt32u> last_error_{0};
 };
 
@@ -177,6 +216,8 @@ struct Args {
     bool list_capture_settings = false;
     bool list_shutter_speeds = false;
     bool persist = false;          // persistent session mode (task 4)
+    bool no_s1 = false;            // skip S1 (AF half-press): MF rigs / PSMS release
+    int expect_files = 1;          // files to wait for per capture (PSMS 4-shot = 4)
 };
 
 std::string default_fingerprint_cache_path() {
@@ -375,6 +416,11 @@ bool parse_args(int argc, char** argv, Args& a) {
             }
         } else if (arg == "--persist") {
             a.persist = true;
+        } else if (arg == "--no-s1" || arg == "--release-only") {
+            a.no_s1 = true;
+        } else if (arg == "--expect-files") {
+            if (i + 1 >= argc) { log_err("--expect-files requires a value"); return false; }
+            a.expect_files = std::max(1, std::atoi(argv[++i]));
         } else if (arg == "--list" || arg == "--list-cameras") {
             a.list_cameras = true;
         } else if (arg == "--json") {
@@ -799,21 +845,32 @@ bool write_binary_file(const fs::path& path, const char* bytes, CrInt32u size, s
 //   is conservative dead-time. MF/manual-exposure rigs can drop to 0ms since
 //   wait_downloaded already blocks until the file arrives.
 bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
+                                 bool skip_s1_arg,
                                  int s1_settle_ms = 500,
-                                 int post_release_ms = 1000) {
+                                 int post_release_ms = 1000,
+                                 int exposure_hold_ms = 0) {
+    // DIAGNOSTIC (env-gated): SONY_SKIP_S1 bypasses the S1 (AF half-press) lock
+    // and issues a bare Release. Used to test whether a tethered release fires a
+    // Pixel-Shift Multi Shooting burst on bodies that reject S1 while in PSMS.
+    // Default (env unset) is unchanged behavior.
+    const bool skip_s1 = skip_s1_arg || (std::getenv("SONY_SKIP_S1") != nullptr);
+
     SDK::CrDeviceProperty s1;
     s1.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_S1);
     s1.SetValueType(SDK::CrDataType::CrDataType_UInt16);
     s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Locked);
-    auto s1_lock_err = SDK::SetDeviceProperty(handle, &s1);
-    if (CR_FAILED(s1_lock_err)) {
-        log_err("SetDeviceProperty(S1 locked) failed (CrError "
-                + std::to_string(static_cast<unsigned>(s1_lock_err)) + ")");
-        return false;
+    if (!skip_s1) {
+        auto s1_lock_err = SDK::SetDeviceProperty(handle, &s1);
+        if (CR_FAILED(s1_lock_err)) {
+            log_err("SetDeviceProperty(S1 locked) failed (CrError "
+                    + std::to_string(static_cast<unsigned>(s1_lock_err)) + ")");
+            return false;
+        }
+        if (s1_settle_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(s1_settle_ms));
+    } else {
+        log_err("skipping S1 half-press — release-only (--no-s1 / SONY_SKIP_S1)");
     }
-
-    if (s1_settle_ms > 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(s1_settle_ms));
 
     const auto rc_down = SDK::SendCommand(
         handle, SDK::CrCommandId_Release, SDK::CrCommandParam_Down);
@@ -821,32 +878,42 @@ bool trigger_full_shutter_press(SDK::CrDeviceHandle handle,
     const auto rc_up = SDK::SendCommand(
         handle, SDK::CrCommandId_Release, SDK::CrCommandParam_Up);
 
-    // The exposure is physically complete the instant Release-Up is sent: the
-    // sensor has the frame and the LED is no longer needed. On success, emit the
-    // exposure-complete marker HERE — before the post-release dead-time and the
-    // S1 unlock — so the caller's LED-off hook fires ~post_release_ms sooner
-    // (1000ms per channel by default). Previously this marker waited until the
-    // whole function returned, keeping the LED lit through that dead-time.
+    // Release has been sent; the sensor now integrates for the shutter duration.
+    // The exposure is NOT complete at Release-Up — assuming so darkened every
+    // non-trivial exposure, because the caller's LED-off hook (fired by the
+    // marker below) killed the light mid-integration. Hold for the configured
+    // exposure duration + a release-latency margin (exposure_hold_ms) so the
+    // marker fires at exposure END: after the light is actually needed, still
+    // before the lengthy host download. exposure_hold_ms==0 keeps the legacy
+    // immediate marker (shutter duration unknown).
     if (CR_FAILED(rc_down) || CR_FAILED(rc_up)) {
         const auto first_err = CR_FAILED(rc_down) ? rc_down : rc_up;
         log_err("SendCommand(Release) failed (CrError "
                 + std::to_string(static_cast<unsigned>(first_err)) + ")");
         // Best-effort S1 unlock so a failed shutter doesn't strand the body in a
         // locked state.
-        s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
-        SDK::SetDeviceProperty(handle, &s1);
+        if (!skip_s1) {
+            s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+            SDK::SetDeviceProperty(handle, &s1);
+        }
         return false;
     }
+
+    if (exposure_hold_ms > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(exposure_hold_ms));
+
     std::cerr << kExposureCompleteMarker << std::endl;
 
-    if (post_release_ms > 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(post_release_ms));
-    s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
-    auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
-    if (CR_FAILED(s1_unlock_err)) {
-        log_err("SetDeviceProperty(S1 unlocked) failed (CrError "
-                + std::to_string(static_cast<unsigned>(s1_unlock_err)) + ")");
-        return false;
+    if (!skip_s1) {
+        if (post_release_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(post_release_ms));
+        s1.SetCurrentValue(SDK::CrLockIndicator::CrLockIndicator_Unlocked);
+        auto s1_unlock_err = SDK::SetDeviceProperty(handle, &s1);
+        if (CR_FAILED(s1_unlock_err)) {
+            log_err("SetDeviceProperty(S1 unlocked) failed (CrError "
+                    + std::to_string(static_cast<unsigned>(s1_unlock_err)) + ")");
+            return false;
+        }
     }
     return true;
 }
@@ -1389,6 +1456,33 @@ bool property_candidate_contains(
     return std::find(values.begin(), values.end(), wanted) != values.end();
 }
 
+// After SDK::Connect's OnConnected callback fires, the device-property cache is
+// still being populated asynchronously: for the first ~1-3s every
+// GetSelectDeviceProperties call returns CrError_Api_InvalidCalled (0x8402).
+// This is the root cause behind the "camera did not expose a writable
+// shutter-speed property" and one-shot --status "unavailable err=33794" reports
+// — the reads simply raced the cache. Poll a stable probe property
+// (ExposureProgramMode is always present on a connected body, in every exposure
+// mode) until it reads back cleanly so callers can rely on property GET/SET the
+// moment this returns. Returns false on timeout; capture itself is a pure SET
+// path and does not depend on the cache, so callers may proceed regardless.
+bool wait_properties_ready(SDK::CrDeviceHandle handle,
+                           std::chrono::milliseconds timeout) {
+    CrInt32u probe = SDK::CrDeviceProperty_ExposureProgramMode;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        SDK::CrDeviceProperty* props = nullptr;
+        CrInt32 count = 0;
+        const SDK::CrError err =
+            SDK::GetSelectDeviceProperties(handle, 1, &probe, &props, &count);
+        const bool ok = !CR_FAILED(err) && props != nullptr && count > 0;
+        if (props != nullptr) SDK::ReleaseDeviceProperties(handle, props);
+        if (ok) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+}
+
 bool set_exposure_program_mode(SDK::CrDeviceHandle handle, const std::string& requested) {
     CrInt16u selected = 0;
     if (!parse_exposure_program_mode(requested, selected)) {
@@ -1430,6 +1524,62 @@ bool set_exposure_program_mode(SDK::CrDeviceHandle handle, const std::string& re
     }
 
     std::cout << "exposure_program=" << format_exposure_program_mode(selected) << "\n";
+    return true;
+}
+
+// Set where the body saves stills. For tethered scanning we want HostPC only:
+// "host-pc-and-memory-card" makes every shot also flush ~60MB RAW (+JPEG) to the
+// SD card, and that buffer flush stalls the NEXT capture's host download on
+// back-to-back triplet captures. Accepts host-pc / card / both.
+bool set_still_destination(SDK::CrDeviceHandle handle, const std::string& requested,
+                           bool announce = true) {
+    std::string r = requested;
+    std::transform(r.begin(), r.end(), r.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    CrInt16u selected = 0;
+    if (r == "host-pc" || r == "host" || r == "pc" || r == "hostpc")
+        selected = SDK::CrStillImageStoreDestination_HostPC;
+    else if (r == "card" || r == "memory-card" || r == "memorycard" || r == "sd")
+        selected = SDK::CrStillImageStoreDestination_MemoryCard;
+    else if (r == "both" || r == "host-pc-and-memory-card")
+        selected = SDK::CrStillImageStoreDestination_HostPCAndMemoryCard;
+    else {
+        log_err("invalid still-image destination: " + requested
+                + " (expected host-pc, card, or both)");
+        return false;
+    }
+
+    SDK::CrDeviceProperty* props = nullptr;
+    CrInt32 count = 0;
+    if (!get_select_property(handle, SDK::CrDeviceProperty_StillImageStoreDestination,
+                             props, count)) {
+        log_err("camera did not expose still-image store destination");
+        return false;
+    }
+    const bool writable = props[0].IsSetEnableCurrentValue();
+    const auto current = static_cast<CrInt16u>(props[0].GetCurrentValue());
+    SDK::ReleaseDeviceProperties(handle, props);
+
+    if (current == selected) {
+        if (announce) std::cout << "still_destination=" << requested << "\n";
+        return true;  // already set — no-op
+    }
+    if (!writable) {
+        log_err("still-image store destination is not writable over the Sony SDK");
+        return false;
+    }
+
+    SDK::CrDeviceProperty prop;
+    prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_StillImageStoreDestination);
+    prop.SetCurrentValue(selected);
+    prop.SetValueType(SDK::CrDataType::CrDataType_UInt16);
+    auto rc = SDK::SetDeviceProperty(handle, &prop);
+    if (CR_FAILED(rc)) {
+        log_err("SetDeviceProperty(StillImageStoreDestination) failed (CrError "
+                + std::to_string(static_cast<unsigned>(rc)) + ")");
+        return false;
+    }
+    if (announce) std::cout << "still_destination=" << requested << "\n";
     return true;
 }
 
@@ -1730,8 +1880,14 @@ int main(int argc, char** argv) {
     const bool live_view_mode = live_view_snapshot || live_view_stream;
     const bool has_capture_setting_setter =
         !args.exposure_program.empty() || !args.iso.empty() || !args.shutter_speed.empty();
+    // NOTE: --persist is excluded. In persist mode a setter flag (--iso /
+    // --exposure-program / --shutter-speed) is a STARTUP setting to apply and
+    // then keep the session alive for stdin commands — NOT a "set one property
+    // and exit" invocation. Without this guard, `--persist --iso ...` (no --out)
+    // applied the setting and returned 0 before ever emitting READY, so the
+    // orchestrator (which always passes --iso) could never drive the session.
     const bool capture_setting_set_only = has_capture_setting_setter && args.out.empty()
-        && !args.connect_only && !args.status_only
+        && !args.connect_only && !args.status_only && !args.persist
         && !args.list_capture_settings && !args.list_shutter_speeds && !live_view_mode;
     // In --persist mode, out-paths arrive per-capture via stdin, not up front.
     const bool needs_capture_output = !args.connect_only && !args.status_only
@@ -2090,6 +2246,18 @@ int main(int argc, char** argv) {
     // cam_info points into its storage.
     if (enum_info) enum_info->Release();
 
+    // Block until the SDK device-property cache is populated. OnConnected fires
+    // before the cache is ready, so without this gate the first property GET/SET
+    // (CLI setters below, --status, or the --persist `shutter`/`status` commands)
+    // races the SDK and fails with CrError_Api_InvalidCalled (0x8402). In
+    // --persist mode this runs before READY is emitted, so a client that waits
+    // for READY can immediately and reliably set the shutter. Capture is a pure
+    // SET path independent of the cache, so a timeout only warns, never aborts.
+    if (!wait_properties_ready(handle, std::chrono::milliseconds(15000))) {
+        log_err("warning: device-property cache not ready after 15s; property "
+                "reads/sets may fail (CrError 0x8402)");
+    }
+
     if (!args.exposure_program.empty()) {
         if (!set_exposure_program_mode(handle, args.exposure_program)) {
             // In --persist mode emit the documented FAIL line before exiting so
@@ -2200,7 +2368,8 @@ int main(int argc, char** argv) {
         const fs::path& capture_out_path,
         int timeout_s,
         int s1_settle_ms,
-        int post_release_ms
+        int post_release_ms,
+        int expect_files
     ) -> bool {
         constexpr int kImageSaveAutoStartNo = -1;
         std::string tmp_path_str = capture_tmp_dir.string();
@@ -2216,16 +2385,40 @@ int main(int argc, char** argv) {
             return false;
         }
 
+        // Read the configured shutter so the LED stays lit for the WHOLE sensor
+        // integration. trigger_full_shutter_press delays the exposure-complete
+        // marker (which drives the caller's LED-off hook) by this much, so the
+        // light can't be cut mid-exposure. 400ms floor covers release-processing
+        // latency; on the rare read failure that floor still protects fast/
+        // moderate shutters.
+        int exposure_hold_ms = 400;
+        {
+            CrInt32u ss_code = SDK::CrDeviceProperty_ShutterSpeed;
+            SDK::CrDeviceProperty* ss_props = nullptr;
+            CrInt32 ss_count = 0;
+            const auto ss_err =
+                SDK::GetSelectDeviceProperties(handle, 1, &ss_code, &ss_props, &ss_count);
+            if (!CR_FAILED(ss_err) && ss_props != nullptr && ss_count > 0) {
+                double secs = 0.0;
+                if (shutter_value_seconds(ss_props[0].GetCurrentValue(), /*is64=*/false, secs)
+                    && secs > 0.0)
+                    exposure_hold_ms = static_cast<int>(secs * 1000.0) + 400;
+            }
+            if (ss_props != nullptr) SDK::ReleaseDeviceProperties(handle, ss_props);
+        }
+
         // Trigger the shutter using the same S1-lock + Release sequence SonShell
-        // uses for Access Auth bodies. trigger_full_shutter_press now emits the
-        // exposure-complete marker itself, the moment Release-Up succeeds —
-        // before its post-release dead-time — so the LED-off hook fires sooner.
-        if (!trigger_full_shutter_press(handle, s1_settle_ms, post_release_ms)) {
+        // uses for Access Auth bodies. The exposure-complete marker (LED-off
+        // signal) is emitted after exposure_hold_ms so the LED covers the full
+        // exposure, then before the post-release dead-time and host download.
+        if (!trigger_full_shutter_press(handle, args.no_s1, s1_settle_ms,
+                                        post_release_ms, exposure_hold_ms)) {
             return false;
         }
 
-        std::string downloaded_filename;
-        if (!cb.wait_downloaded(std::chrono::seconds(timeout_s), downloaded_filename)) {
+        std::vector<std::string> downloaded;
+        if (!cb.wait_downloaded_n(static_cast<size_t>(expect_files),
+                                  std::chrono::seconds(timeout_s), downloaded)) {
             const auto err = cb.last_error();
             if (err != 0) {
                 log_err("camera reported error before host-PC download completed (CrError "
@@ -2236,36 +2429,83 @@ int main(int argc, char** argv) {
             return false;
         }
 
-        fs::path src;
-        if (!downloaded_filename.empty()) {
-            const fs::path reported(downloaded_filename);
-            const fs::path tmp_reported = capture_tmp_dir / reported.filename();
-            if (reported.is_absolute() && fs::exists(reported)) {
-                src = reported;
-            } else if (fs::exists(tmp_reported)) {
-                src = tmp_reported;
-            }
+        // Let any trailing same-shot file (the JPEG half of a RAW+JPEG capture)
+        // finish landing in THIS temp dir before we snapshot and remove it. The
+        // grace window is short and ends as soon as downloads go quiet, so it
+        // adds negligible latency to RAW-only bodies and to PSMS bursts (which
+        // have already delivered their frames by the time we get here).
+        {
+            std::vector<std::string> drained;
+            cb.drain_downloads(std::chrono::milliseconds(1200),
+                               std::chrono::milliseconds(8000), drained);
         }
-        if (src.empty()) {
-            if (auto found = find_one_file(capture_tmp_dir)) {
-                src = fs::absolute(*found);
-            } else {
-                log_err("host-PC download completed but no file found in "
-                        + capture_tmp_dir.string());
-                return false;
+
+        // The SDK auto-saves every delivered frame into the fresh per-capture
+        // scratch dir (prefix "frame"). A normal capture leaves 1 RAW (a
+        // RAW+JPEG body also leaves a companion JPEG); a 4-shot Pixel-Shift burst
+        // leaves 4 RAWs. Keep the RAW frame(s) — first onto the requested
+        // out-path, any extras as <stem>_<k><ext> — and drop companion
+        // JPEG/HEIF files so each capture yields exactly the requested raw(s).
+        std::vector<fs::path> all_files;
+        std::error_code it_ec;
+        for (const auto& e : fs::directory_iterator(capture_tmp_dir, it_ec)) {
+            if (e.is_regular_file()) all_files.push_back(e.path());
+        }
+        std::sort(all_files.begin(), all_files.end());
+        if (all_files.empty()) {
+            log_err("host-PC download completed but no file found in "
+                    + capture_tmp_dir.string());
+            return false;
+        }
+
+        // Partition into RAW (.ARW) frames and companion files. If the body
+        // somehow delivered no .ARW (e.g. JPEG-only configuration), fall back to
+        // keeping every file so we never silently discard the only image.
+        auto is_raw = [](const fs::path& p) {
+            std::string ext = p.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            return ext == ".arw";
+        };
+        std::vector<fs::path> files;
+        std::vector<fs::path> companions;
+        for (const auto& f : all_files) {
+            (is_raw(f) ? files : companions).push_back(f);
+        }
+        if (files.empty()) files.swap(all_files);  // no RAW → keep everything
+        else {
+            for (const auto& c : companions) {
+                std::error_code rm_ec;
+                fs::remove(c, rm_ec);
             }
         }
 
-        src = fs::absolute(src);
-        if (src != capture_out_path) {
-            std::error_code rename_ec;
-            fs::rename(src, capture_out_path, rename_ec);
-            if (rename_ec) {
-                log_err("rename " + src.string() + " -> " + capture_out_path.string()
-                        + " failed: " + rename_ec.message());
-                return false;
+        int moved = 0;
+        for (size_t k = 0; k < files.size(); ++k) {
+            fs::path dest;
+            if (k == 0) {
+                dest = capture_out_path;
+            } else {
+                const std::string stem = capture_out_path.stem().string();
+                const std::string ext = capture_out_path.extension().string();
+                dest = capture_out_path.parent_path()
+                       / (stem + "_" + std::to_string(k + 1) + ext);
             }
+            const fs::path src = fs::absolute(files[k]);
+            if (src != dest) {
+                std::error_code rename_ec;
+                fs::rename(src, dest, rename_ec);
+                if (rename_ec) {
+                    log_err("rename " + src.string() + " -> " + dest.string()
+                            + " failed: " + rename_ec.message());
+                    continue;
+                }
+            }
+            ++moved;
         }
+        if (moved == 0) return false;
+        if (expect_files > 1 || moved > 1)
+            log_err("downloaded " + std::to_string(moved) + " frame(s)");
         return true;
     };
 
@@ -2275,6 +2515,10 @@ int main(int argc, char** argv) {
     // Protocol (all lines newline-terminated, stdout flushed after each):
     //   stdin command             stdout response
     //   ─────────────────────     ──────────────────────────────────────
+    //   status                  → <property=value writable=...> lines, then
+    //                             STATUS_END (live diagnostic; one-shot --status
+    //                             can't read props without a held session)
+    //   dest <host-pc|card|both>→ DEST_OK <value> / DEST_FAIL <value>
     //   shutter <speed>         → SHUTTER_OK <speed>
     //                           → SHUTTER_FAIL <speed>
     //   capture <abs-out-path>  → CAPTURE_OK <abs-out-path>
@@ -2308,6 +2552,32 @@ int main(int argc, char** argv) {
 
             if (line == "quit") {
                 break;
+            }
+
+            if (line == "status") {
+                // Live property dump on the connected handle. Unlike one-shot
+                // --status (which fails with CrError 33794 because property reads
+                // require an established session), this works because --persist
+                // already holds the connection. Terminated by STATUS_END so the
+                // orchestrator knows when the (variable-length) dump is complete.
+                print_camera_status(handle);
+                std::cout << "STATUS_END" << std::endl;
+                continue;
+            }
+
+            if (line.rfind("dest ", 0) == 0) {
+                // Set the still-image store destination mid-session. The scanner
+                // sends `dest host-pc` once after READY so back-to-back triplet
+                // captures don't stall on SD-card buffer flushes.
+                const std::string d = line.substr(5);
+                if (d.empty()) {
+                    std::cout << "DEST_FAIL missing-value" << std::endl;
+                } else if (set_still_destination(handle, d, /*announce=*/false)) {
+                    std::cout << "DEST_OK " << d << std::endl;
+                } else {
+                    std::cout << "DEST_FAIL " << d << std::endl;
+                }
+                continue;
             }
 
             if (line.rfind("shutter ", 0) == 0) {
@@ -2361,7 +2631,8 @@ int main(int argc, char** argv) {
 
                 const bool ok = do_capture(
                     cap_tmp_dir, cap_out_path,
-                    args.timeout_s, args.s1_settle_ms, args.post_release_ms);
+                    args.timeout_s, args.s1_settle_ms, args.post_release_ms,
+                    args.expect_files);
 
                 // Clean up per-capture scratch dir regardless of success.
                 std::error_code rm_ec;
@@ -2389,7 +2660,8 @@ int main(int argc, char** argv) {
     // Single-shot mode (original behavior).
     // -------------------------------------------------------------------------
     if (!do_capture(tmp_dir, out_path,
-                    args.timeout_s, args.s1_settle_ms, args.post_release_ms)) {
+                    args.timeout_s, args.s1_settle_ms, args.post_release_ms,
+                    args.expect_files)) {
         cleanup();
         return 1;
     }
