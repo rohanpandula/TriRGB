@@ -855,6 +855,58 @@ def test_persistent_session_extras_have_no_startup_shutter(tmp_path, monkeypatch
     assert "--shutter-speed" not in captured["extras"]
 
 
+def test_persistent_session_passes_no_s1_and_store_destination(tmp_path, monkeypatch):
+    # The MF rig needs --no-s1 (S1 fails with CrError 33794 on a manual lens) and
+    # host-pc-only saves (SD-card flushes stall back-to-back triplet captures).
+    import triplet_capture.orchestrator as orch_mod
+
+    captured = {}
+
+    class _RecordingPersist:
+        def __init__(self, binary, extras, env, **kwargs):
+            captured["extras"] = list(extras)
+            captured["kwargs"] = kwargs
+
+        def capture(self, out_path, *, timeout_s, shutter=None):  # pragma: no cover
+            return 0
+
+        def close(self):  # pragma: no cover - unused
+            pass
+
+    monkeypatch.setattr(orch_mod, "PersistentSonyCapture", _RecordingPersist)
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+    )
+    Orchestrator(FakeScanlight(), s)._get_or_create_persistent_session()
+    assert "--no-s1" in captured["extras"]
+    assert captured["kwargs"].get("store_destination") == "host-pc"
+
+
+def test_persistent_session_omits_no_s1_when_disabled(tmp_path, monkeypatch):
+    # An autofocus lens can opt back into the S1 AF-lock by setting sony_no_s1.
+    import triplet_capture.orchestrator as orch_mod
+
+    captured = {}
+
+    class _RecordingPersist:
+        def __init__(self, binary, extras, env, **kwargs):
+            captured["extras"] = list(extras)
+
+        def capture(self, out_path, *, timeout_s, shutter=None):  # pragma: no cover
+            return 0
+
+        def close(self):  # pragma: no cover - unused
+            pass
+
+    monkeypatch.setattr(orch_mod, "PersistentSonyCapture", _RecordingPersist)
+    s = CaptureSettings(
+        output_folder=tmp_path, trigger_mode="sdk", sdk_persistent=True,
+        sony_no_s1=False,
+    )
+    Orchestrator(FakeScanlight(), s)._get_or_create_persistent_session()
+    assert "--no-s1" not in captured["extras"]
+
+
 def test_persistent_runner_forwards_channel_shutter(tmp_path, monkeypatch):
     # _persistent_runner must pass the per-channel shutter to session.capture.
     import triplet_capture.orchestrator as orch_mod
@@ -950,6 +1002,63 @@ def test_persistent_capture_applies_per_channel_shutter_protocol(tmp_path):
 # Fake whose FIRST spawn dies while processing the `shutter` command (reads the
 # line, then exits without responding) — exercises the respawn-during-shutter
 # path. A spawn-counter sidecar makes the second spawn behave normally.
+_FAKE_PERSIST_SCRIPT_DEST = """#!/usr/bin/env python3
+import sys
+logp = None
+for i, a in enumerate(sys.argv):
+    if a == "--log":
+        logp = sys.argv[i + 1]
+logf = open(logp, "a") if logp else None
+print("READY", flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if line == "quit":
+        break
+    if line.startswith("dest "):
+        d = line[len("dest "):]
+        if logf:
+            logf.write("dest %s\\n" % d); logf.flush()
+        print("DEST_OK %s" % d, flush=True)
+    elif line.startswith("capture "):
+        path = line[len("capture "):]
+        if logf:
+            logf.write("capture %s\\n" % path); logf.flush()
+        try:
+            open(path, "wb").close()
+        except Exception:
+            pass
+        print("CAPTURE_OK %s" % path, flush=True)
+    else:
+        print("ERR unknown-command", flush=True)
+"""
+
+
+def test_persistent_capture_sends_store_destination_after_ready(tmp_path):
+    # store_destination must be applied once, right after READY and BEFORE the
+    # first capture, so the very first frame already saves to host-PC only.
+    import os
+    from triplet_capture.sony_persist import PersistentSonyCapture
+
+    script = tmp_path / "fake_persist_dest.py"
+    script.write_text(_FAKE_PERSIST_SCRIPT_DEST)
+    script.chmod(0o755)
+    log = tmp_path / "cmds.log"
+
+    p = PersistentSonyCapture(
+        str(script), ["--log", str(log)], env=dict(os.environ),
+        store_destination="host-pc",
+    )
+    try:
+        assert p.capture(tmp_path / "R.ARW", timeout_s=5) == 0
+    finally:
+        p.close()
+
+    cmds = log.read_text().splitlines()
+    assert cmds[0] == "dest host-pc"           # sent first, before any capture
+    assert cmds.count("dest host-pc") == 1     # exactly once per spawn
+    assert "capture %s" % (tmp_path / "R.ARW") in cmds
+
+
 _FAKE_PERSIST_DIES_DURING_SHUTTER = """#!/usr/bin/env python3
 import sys
 cpath = None
@@ -1122,6 +1231,7 @@ def test_sdk_runner_passes_sony_network_auth_args(tmp_path, monkeypatch):
         "/bin/sony-capture",
         "--out", str(tmp_path / "out.ARW"),
         "--timeout", "12",
+        "--no-s1",
         "--ip-address", "10.0.0.247",
         "--mac-address", "10:32:2C:26:1A:3F",
         "--iso", "100or125",

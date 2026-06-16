@@ -78,12 +78,17 @@ class PersistentSonyCapture:
         kill_timeout_s: float = _DEFAULT_KILL_TIMEOUT_S,
         on_exposure_complete: Optional[Callable[[], None]] = None,
         popen_factory: Optional[Callable[..., "subprocess.Popen[str]"]] = None,
+        store_destination: Optional[str] = None,
     ) -> None:
         self._binary = binary
         self._cmd_extras = list(cmd_extras)
         self._env = env
         self._ready_timeout_s = ready_timeout_s
         self._kill_timeout_s = kill_timeout_s
+        # Still-image store destination (host-pc/card/both) applied via the
+        # persist `dest` command once after each (re)spawn. None = leave the
+        # camera's current setting untouched (the default for direct/test use).
+        self._store_destination = store_destination
         # Called once per capture when the SONY_EXPOSURE_COMPLETE_MARKER appears
         # on stderr (to turn the LED off early).  Must be non-blocking; called
         # from the stderr drain thread.
@@ -233,6 +238,10 @@ class PersistentSonyCapture:
             line = line.strip()
             if line == "READY":
                 logger.info("sony-capture persistent session ready")
+                # Apply the store destination once per (re)spawn so back-to-back
+                # captures don't stall on SD-card flushes. Best-effort: a failure
+                # is logged but does not fail the session.
+                self._apply_store_destination()
                 return 0
             if line.startswith("FAIL"):
                 reason = line[4:].strip()
@@ -356,6 +365,63 @@ class PersistentSonyCapture:
                 logger.error("CAPTURE_FAIL: %s", reason)
                 return 1
             logger.debug("sony-capture mid-capture stdout: %s", line)
+
+    def _apply_store_destination(self, *, timeout_s: float = 10.0) -> None:
+        """Send `dest <store_destination>` once after READY (best-effort).
+
+        Tethered scanning wants host-PC-only saves; saving also to the SD card
+        stalls back-to-back captures on the card's buffer flush. A failure here is
+        non-fatal — capture still works (just possibly also to card) — so this
+        logs and returns rather than failing the session. No-op when
+        store_destination is None (direct/test construction).
+        """
+        if not self._store_destination:
+            return
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+
+        # Drain stale lines so we read this command's response, not a prior one.
+        while not self._stdout_q.empty():
+            try:
+                self._stdout_q.get_nowait()
+            except queue.Empty:
+                break
+
+        try:
+            proc.stdin.write(f"dest {self._store_destination}\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            logger.warning("dest stdin write failed (process died?): %s", exc)
+            return
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "sony-capture did not confirm dest %s within %gs (continuing)",
+                    self._store_destination, timeout_s,
+                )
+                return
+            try:
+                line = self._stdout_q.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                if proc.poll() is not None:
+                    return
+                continue
+            line = line.strip()
+            if line.startswith("DEST_OK"):
+                logger.info(
+                    "sony-capture store destination set: %s", self._store_destination
+                )
+                return
+            if line.startswith("DEST_FAIL"):
+                logger.warning(
+                    "sony-capture rejected dest %s: %s", self._store_destination, line
+                )
+                return
+            logger.debug("sony-capture pre-DEST stdout: %s", line)
 
     def _apply_shutter(self, speed: str, *, timeout_s: float = 10.0) -> bool:
         """Apply `speed` to the live session via the `shutter` command.

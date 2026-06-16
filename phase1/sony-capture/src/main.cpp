@@ -143,6 +143,28 @@ public:
         return !out.empty();
     }
 
+    // Drain trailing same-shot downloads. A RAW+JPEG body delivers the companion
+    // JPEG as a SECOND file shortly after the RAW; wait_downloaded_n() returns as
+    // soon as the requested count arrives, so the still-in-flight companion would
+    // otherwise be orphaned when the per-capture temp dir is removed — which
+    // stalls the NEXT capture's download pipeline. Block until no new file has
+    // arrived for `quiet`, bounded by `max_wait`. Returns the final file list.
+    void drain_downloads(std::chrono::milliseconds quiet,
+                         std::chrono::milliseconds max_wait,
+                         std::vector<std::string>& out) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        const auto deadline = std::chrono::steady_clock::now() + max_wait;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const size_t before = downloaded_files_.size();
+            const bool grew = cv_.wait_for(lk, quiet, [this, before] {
+                return downloaded_files_.size() > before
+                       || disconnected_ || last_error_ != 0;
+            });
+            if (!grew || disconnected_ || last_error_ != 0) break;
+        }
+        out = downloaded_files_;
+    }
+
     CrInt32u last_error() {
         std::lock_guard<std::mutex> lk(mtx_);
         return last_error_;
@@ -1427,6 +1449,33 @@ bool property_candidate_contains(
     return std::find(values.begin(), values.end(), wanted) != values.end();
 }
 
+// After SDK::Connect's OnConnected callback fires, the device-property cache is
+// still being populated asynchronously: for the first ~1-3s every
+// GetSelectDeviceProperties call returns CrError_Api_InvalidCalled (0x8402).
+// This is the root cause behind the "camera did not expose a writable
+// shutter-speed property" and one-shot --status "unavailable err=33794" reports
+// — the reads simply raced the cache. Poll a stable probe property
+// (ExposureProgramMode is always present on a connected body, in every exposure
+// mode) until it reads back cleanly so callers can rely on property GET/SET the
+// moment this returns. Returns false on timeout; capture itself is a pure SET
+// path and does not depend on the cache, so callers may proceed regardless.
+bool wait_properties_ready(SDK::CrDeviceHandle handle,
+                           std::chrono::milliseconds timeout) {
+    CrInt32u probe = SDK::CrDeviceProperty_ExposureProgramMode;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        SDK::CrDeviceProperty* props = nullptr;
+        CrInt32 count = 0;
+        const SDK::CrError err =
+            SDK::GetSelectDeviceProperties(handle, 1, &probe, &props, &count);
+        const bool ok = !CR_FAILED(err) && props != nullptr && count > 0;
+        if (props != nullptr) SDK::ReleaseDeviceProperties(handle, props);
+        if (ok) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+}
+
 bool set_exposure_program_mode(SDK::CrDeviceHandle handle, const std::string& requested) {
     CrInt16u selected = 0;
     if (!parse_exposure_program_mode(requested, selected)) {
@@ -1468,6 +1517,62 @@ bool set_exposure_program_mode(SDK::CrDeviceHandle handle, const std::string& re
     }
 
     std::cout << "exposure_program=" << format_exposure_program_mode(selected) << "\n";
+    return true;
+}
+
+// Set where the body saves stills. For tethered scanning we want HostPC only:
+// "host-pc-and-memory-card" makes every shot also flush ~60MB RAW (+JPEG) to the
+// SD card, and that buffer flush stalls the NEXT capture's host download on
+// back-to-back triplet captures. Accepts host-pc / card / both.
+bool set_still_destination(SDK::CrDeviceHandle handle, const std::string& requested,
+                           bool announce = true) {
+    std::string r = requested;
+    std::transform(r.begin(), r.end(), r.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    CrInt16u selected = 0;
+    if (r == "host-pc" || r == "host" || r == "pc" || r == "hostpc")
+        selected = SDK::CrStillImageStoreDestination_HostPC;
+    else if (r == "card" || r == "memory-card" || r == "memorycard" || r == "sd")
+        selected = SDK::CrStillImageStoreDestination_MemoryCard;
+    else if (r == "both" || r == "host-pc-and-memory-card")
+        selected = SDK::CrStillImageStoreDestination_HostPCAndMemoryCard;
+    else {
+        log_err("invalid still-image destination: " + requested
+                + " (expected host-pc, card, or both)");
+        return false;
+    }
+
+    SDK::CrDeviceProperty* props = nullptr;
+    CrInt32 count = 0;
+    if (!get_select_property(handle, SDK::CrDeviceProperty_StillImageStoreDestination,
+                             props, count)) {
+        log_err("camera did not expose still-image store destination");
+        return false;
+    }
+    const bool writable = props[0].IsSetEnableCurrentValue();
+    const auto current = static_cast<CrInt16u>(props[0].GetCurrentValue());
+    SDK::ReleaseDeviceProperties(handle, props);
+
+    if (current == selected) {
+        if (announce) std::cout << "still_destination=" << requested << "\n";
+        return true;  // already set — no-op
+    }
+    if (!writable) {
+        log_err("still-image store destination is not writable over the Sony SDK");
+        return false;
+    }
+
+    SDK::CrDeviceProperty prop;
+    prop.SetCode(SDK::CrDevicePropertyCode::CrDeviceProperty_StillImageStoreDestination);
+    prop.SetCurrentValue(selected);
+    prop.SetValueType(SDK::CrDataType::CrDataType_UInt16);
+    auto rc = SDK::SetDeviceProperty(handle, &prop);
+    if (CR_FAILED(rc)) {
+        log_err("SetDeviceProperty(StillImageStoreDestination) failed (CrError "
+                + std::to_string(static_cast<unsigned>(rc)) + ")");
+        return false;
+    }
+    if (announce) std::cout << "still_destination=" << requested << "\n";
     return true;
 }
 
@@ -1768,8 +1873,14 @@ int main(int argc, char** argv) {
     const bool live_view_mode = live_view_snapshot || live_view_stream;
     const bool has_capture_setting_setter =
         !args.exposure_program.empty() || !args.iso.empty() || !args.shutter_speed.empty();
+    // NOTE: --persist is excluded. In persist mode a setter flag (--iso /
+    // --exposure-program / --shutter-speed) is a STARTUP setting to apply and
+    // then keep the session alive for stdin commands — NOT a "set one property
+    // and exit" invocation. Without this guard, `--persist --iso ...` (no --out)
+    // applied the setting and returned 0 before ever emitting READY, so the
+    // orchestrator (which always passes --iso) could never drive the session.
     const bool capture_setting_set_only = has_capture_setting_setter && args.out.empty()
-        && !args.connect_only && !args.status_only
+        && !args.connect_only && !args.status_only && !args.persist
         && !args.list_capture_settings && !args.list_shutter_speeds && !live_view_mode;
     // In --persist mode, out-paths arrive per-capture via stdin, not up front.
     const bool needs_capture_output = !args.connect_only && !args.status_only
@@ -2128,6 +2239,18 @@ int main(int argc, char** argv) {
     // cam_info points into its storage.
     if (enum_info) enum_info->Release();
 
+    // Block until the SDK device-property cache is populated. OnConnected fires
+    // before the cache is ready, so without this gate the first property GET/SET
+    // (CLI setters below, --status, or the --persist `shutter`/`status` commands)
+    // races the SDK and fails with CrError_Api_InvalidCalled (0x8402). In
+    // --persist mode this runs before READY is emitted, so a client that waits
+    // for READY can immediately and reliably set the shutter. Capture is a pure
+    // SET path independent of the cache, so a timeout only warns, never aborts.
+    if (!wait_properties_ready(handle, std::chrono::milliseconds(15000))) {
+        log_err("warning: device-property cache not ready after 15s; property "
+                "reads/sets may fail (CrError 0x8402)");
+    }
+
     if (!args.exposure_program.empty()) {
         if (!set_exposure_program_mode(handle, args.exposure_program)) {
             // In --persist mode emit the documented FAIL line before exiting so
@@ -2276,20 +2399,55 @@ int main(int argc, char** argv) {
             return false;
         }
 
+        // Let any trailing same-shot file (the JPEG half of a RAW+JPEG capture)
+        // finish landing in THIS temp dir before we snapshot and remove it. The
+        // grace window is short and ends as soon as downloads go quiet, so it
+        // adds negligible latency to RAW-only bodies and to PSMS bursts (which
+        // have already delivered their frames by the time we get here).
+        {
+            std::vector<std::string> drained;
+            cb.drain_downloads(std::chrono::milliseconds(1200),
+                               std::chrono::milliseconds(8000), drained);
+        }
+
         // The SDK auto-saves every delivered frame into the fresh per-capture
-        // scratch dir (prefix "frame"). A normal capture leaves 1 file; a 4-shot
-        // Pixel-Shift burst leaves 4. Move them all out: the first onto the
-        // requested out-path, any extras as <stem>_<k><ext> beside it.
-        std::vector<fs::path> files;
+        // scratch dir (prefix "frame"). A normal capture leaves 1 RAW (a
+        // RAW+JPEG body also leaves a companion JPEG); a 4-shot Pixel-Shift burst
+        // leaves 4 RAWs. Keep the RAW frame(s) — first onto the requested
+        // out-path, any extras as <stem>_<k><ext> — and drop companion
+        // JPEG/HEIF files so each capture yields exactly the requested raw(s).
+        std::vector<fs::path> all_files;
         std::error_code it_ec;
         for (const auto& e : fs::directory_iterator(capture_tmp_dir, it_ec)) {
-            if (e.is_regular_file()) files.push_back(e.path());
+            if (e.is_regular_file()) all_files.push_back(e.path());
         }
-        std::sort(files.begin(), files.end());
-        if (files.empty()) {
+        std::sort(all_files.begin(), all_files.end());
+        if (all_files.empty()) {
             log_err("host-PC download completed but no file found in "
                     + capture_tmp_dir.string());
             return false;
+        }
+
+        // Partition into RAW (.ARW) frames and companion files. If the body
+        // somehow delivered no .ARW (e.g. JPEG-only configuration), fall back to
+        // keeping every file so we never silently discard the only image.
+        auto is_raw = [](const fs::path& p) {
+            std::string ext = p.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            return ext == ".arw";
+        };
+        std::vector<fs::path> files;
+        std::vector<fs::path> companions;
+        for (const auto& f : all_files) {
+            (is_raw(f) ? files : companions).push_back(f);
+        }
+        if (files.empty()) files.swap(all_files);  // no RAW → keep everything
+        else {
+            for (const auto& c : companions) {
+                std::error_code rm_ec;
+                fs::remove(c, rm_ec);
+            }
         }
 
         int moved = 0;
@@ -2327,6 +2485,10 @@ int main(int argc, char** argv) {
     // Protocol (all lines newline-terminated, stdout flushed after each):
     //   stdin command             stdout response
     //   ─────────────────────     ──────────────────────────────────────
+    //   status                  → <property=value writable=...> lines, then
+    //                             STATUS_END (live diagnostic; one-shot --status
+    //                             can't read props without a held session)
+    //   dest <host-pc|card|both>→ DEST_OK <value> / DEST_FAIL <value>
     //   shutter <speed>         → SHUTTER_OK <speed>
     //                           → SHUTTER_FAIL <speed>
     //   capture <abs-out-path>  → CAPTURE_OK <abs-out-path>
@@ -2360,6 +2522,32 @@ int main(int argc, char** argv) {
 
             if (line == "quit") {
                 break;
+            }
+
+            if (line == "status") {
+                // Live property dump on the connected handle. Unlike one-shot
+                // --status (which fails with CrError 33794 because property reads
+                // require an established session), this works because --persist
+                // already holds the connection. Terminated by STATUS_END so the
+                // orchestrator knows when the (variable-length) dump is complete.
+                print_camera_status(handle);
+                std::cout << "STATUS_END" << std::endl;
+                continue;
+            }
+
+            if (line.rfind("dest ", 0) == 0) {
+                // Set the still-image store destination mid-session. The scanner
+                // sends `dest host-pc` once after READY so back-to-back triplet
+                // captures don't stall on SD-card buffer flushes.
+                const std::string d = line.substr(5);
+                if (d.empty()) {
+                    std::cout << "DEST_FAIL missing-value" << std::endl;
+                } else if (set_still_destination(handle, d, /*announce=*/false)) {
+                    std::cout << "DEST_OK " << d << std::endl;
+                } else {
+                    std::cout << "DEST_FAIL " << d << std::endl;
+                }
+                continue;
             }
 
             if (line.rfind("shutter ", 0) == 0) {

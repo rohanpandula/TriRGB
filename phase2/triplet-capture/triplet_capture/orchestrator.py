@@ -107,6 +107,16 @@ class CaptureSettings:
     sony_user: Optional[str] = None
     sony_password: Optional[str] = None
     sony_iso: Optional[str] = "100or125"
+    # Skip the S1 (AF half-press) lock and fire a bare Release. REQUIRED for the
+    # manual-focus macro lens on this rig: S1 fails with CrError 33794 on a MF
+    # lens (and is pointless without AF). Maps to sony-capture --no-s1. Set False
+    # only for an autofocus lens that should AF-lock before each frame.
+    sony_no_s1: bool = True
+    # Where the body saves stills. "host-pc" (default) is required for reliable
+    # back-to-back triplet capture: also saving to the SD card ("both") makes each
+    # shot flush ~60 MB to the card, and that buffer stalls the next capture's
+    # host download. Maps to the persist `dest` command. host-pc / card / both.
+    sony_store_destination: str = "host-pc"
     shutter_r: Optional[str] = None
     shutter_g: Optional[str] = None
     shutter_b: Optional[str] = None
@@ -407,6 +417,9 @@ class Orchestrator:
             # over the `shutter` command, so changing shutter_r/g/b only affects
             # the next capture, no session rebuild needed.
             "sony_iso", "sony_capture_timeout_s",
+            # --no-s1 is a startup arg; store-destination is sent once after READY.
+            # Both are baked into the session, so a change must rebuild it.
+            "sony_no_s1", "sony_store_destination",
         })
         with self._lock:
             if "roll_name" in kwargs and "frame_number" not in kwargs:
@@ -903,6 +916,8 @@ class Orchestrator:
                 "--out", str(out_path),
                 "--timeout", str(timeout_s),
             ]
+            if s.sony_no_s1:
+                cmd += ["--no-s1"]
             if s.sony_ip_address:
                 cmd += ["--ip-address", s.sony_ip_address]
             if s.sony_mac_address:
@@ -1028,6 +1043,8 @@ class Orchestrator:
         import shutil as _shutil
         binary = _shutil.which(s.sony_capture_path) or s.sony_capture_path
         extras: list[str] = ["--timeout", str(s.sony_capture_timeout_s)]
+        if s.sony_no_s1:
+            extras += ["--no-s1"]
         if s.sony_ip_address:
             extras += ["--ip-address", s.sony_ip_address]
         if s.sony_mac_address:
@@ -1050,6 +1067,7 @@ class Orchestrator:
             extras,
             self._sony_capture_env(),
             on_exposure_complete=on_exposure_complete,
+            store_destination=s.sony_store_destination,
         )
         self._persistent_session = session
         return session
