@@ -1578,7 +1578,11 @@ private struct Step3FlatFieldView: View {
         switch word {
         case "CLEAN":
             return (Theme.State.success, "CLEAN")
-        case "ACCEPTABLE":
+        // "OK with FFC" is the backend's middle PASS tier (classify(): moderate
+        // vignette / borderline uniformity, exit 0 — usable WITH flat-field
+        // correction). It was falling through to the red FAIL default, which made
+        // a perfectly good flat field read as a failure. Render it like ACCEPTABLE.
+        case "ACCEPTABLE", "OK WITH FFC":
             return (Theme.State.warning, "ACCEPTABLE")
         default:
             return (Theme.State.danger, "FAIL")
