@@ -132,6 +132,32 @@ def test_capture_flats_returns_flat_field_result(settings):
     assert restored == result
 
 
+def test_capture_flats_writes_cal_dir(settings, tmp_path):
+    """With cal_dir_out, capture_flats persists R/G/B.ARW (the layout
+    rgb_composite.load_ffc_maps consumes) and reports the dir as flat_data_path —
+    so the app saves it as ffcCalibration and scans actually apply the flat.
+    Regression for the gap where the wizard flat was inspected then discarded."""
+    runner, _ = make_runner()
+    cal_dir = tmp_path / "ffc_cal"
+
+    _stack, result = capture_flats(
+        scanlight=FakeScanlight(),
+        settings=settings,
+        black_levels=_make_black_levels(),
+        n_frames=2,
+        cal_dir_out=str(cal_dir),
+        sony_capture_runner=runner,
+        sleep=lambda _: None,
+        demosaic_fn=fake_demosaic,
+    )
+
+    # The three channel flats exist in the layout load_ffc_maps expects.
+    for ch in ("R", "G", "B"):
+        assert (cal_dir / f"{ch}.ARW").is_file(), f"missing {ch}.ARW"
+    # The reported path IS the cal dir — what the app stores as ffcCalibration.
+    assert result.flat_data_path == str(cal_dir)
+
+
 def test_capture_flats_does_not_pollute_roll_output_folder(settings):
     """F2: flat captures must NOT land in the roll's output folder.
 

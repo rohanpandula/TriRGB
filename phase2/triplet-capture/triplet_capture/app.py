@@ -464,11 +464,17 @@ def create_app(orchestrator: Orchestrator, composite_worker=None, ready_nonce: s
                     sys.modules["rgb_composite.ffc"] = _ffc_mod
                     _ffc_spec.loader.exec_module(_ffc_mod)
 
+                # Persist the flat as a reusable FFC cal dir next to the roll so
+                # the saved ffcCalibration path is one the scan composite can
+                # actually read (load_ffc_maps wants R.ARW/G.ARW/B.ARW). Without
+                # this the flat was captured, inspected, and discarded.
+                ffc_cal_dir = orch.settings.output_folder / "ffc_cal"
                 flat_stack, meta = capture_flats(
                     orch._scanlight,
                     orch.settings,
                     black_levels,
                     n_frames=n_frames,
+                    cal_dir_out=str(ffc_cal_dir),
                     sleep=app.config["CAL_WARMUP_SLEEP"],
                     # Reuse the MAIN orchestrator's runner (orch._runner), not
                     # orch._explicit_runner (None in production). In SDK mode that

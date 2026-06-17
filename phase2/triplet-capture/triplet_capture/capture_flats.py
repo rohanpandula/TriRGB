@@ -22,6 +22,7 @@ Design notes
 """
 from __future__ import annotations
 
+import logging
 import shutil
 import tempfile
 import time
@@ -33,6 +34,8 @@ import numpy as np
 
 from c41_core import ChannelCalibration, FlatFieldResult
 from .orchestrator import Orchestrator, CaptureSettings
+
+logger = logging.getLogger("triplet-capture.flats")
 
 
 def _cv(channel_hw: np.ndarray) -> float:
@@ -58,6 +61,7 @@ def capture_flats(
     warmup_s: float = 5.0,
     working_brightness: Optional[int] = None,
     flat_data_path: str = "",
+    cal_dir_out: str = "",
     sony_capture_runner: Optional[Callable[[str, Path, int], int]] = None,
     sleep: Callable[[float], None] = time.sleep,
     demosaic_fn: Optional[Callable[[Path], np.ndarray]] = None,
@@ -161,6 +165,23 @@ def capture_flats(
             if not result.success:
                 raise RuntimeError(f"flat capture {i} failed: {result.error}")
 
+            # Persist the first frame's R/G/B flats as a reusable FFC cal dir
+            # (R.ARW/G.ARW/B.ARW) BEFORE the temp dir is removed in `finally`.
+            # This is the exact layout rgb_composite.load_ffc_maps consumes, so
+            # the scan path applies THIS flat via `ffc_calibration_dir`. Without
+            # it, the wizard flat was inspected and then discarded, so scans ran
+            # with no flat-field correction. A failure here is non-fatal: fall
+            # back to "not saved" so the inspection still returns.
+            if cal_dir_out and i == 0:
+                try:
+                    cdir = Path(cal_dir_out)
+                    cdir.mkdir(parents=True, exist_ok=True)
+                    for ch in ("R", "G", "B"):
+                        shutil.copy2(result.files[ch], cdir / f"{ch}.ARW")
+                except (OSError, KeyError) as exc:
+                    logger.warning("could not persist FFC cal dir %s: %s", cal_dir_out, exc)
+                    cal_dir_out = ""
+
             # Accumulate the full HxWx3 frame for the flat_stack primary output.
             # Demosaic each channel file; note all three channels of a given frame
             # are demosaiced from separate R/G/B exposures, so we collect them into
@@ -221,9 +242,12 @@ def capture_flats(
     if flat_data_path:
         np.save(flat_data_path, flat_stack)
 
-    # 10. Build FlatFieldResult metadata record.
+    # 10. Build FlatFieldResult metadata record. Prefer the persisted cal dir as
+    # the reported path: that's what the app stores as `ffcCalibration` and what
+    # the scan composite reads via `ffc_calibration_dir`. (`flat_data_path` is
+    # the optional .npy flat-stack for direct library callers.)
     result_meta = FlatFieldResult(
-        flat_data_path=flat_data_path,
+        flat_data_path=cal_dir_out or flat_data_path,
         n_frames_averaged=n_frames,
         warmup_s=warmup_s,
         black_level_r=float(black_levels[0].black_level),
